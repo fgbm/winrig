@@ -67,7 +67,7 @@ rand = "0.10"
 # Кроссплатформенные каталоги конфигурации и состояния (ADR-0009).
 # `directories` отвергнут cargo-deny: тянет MPL-2.0 `option-ext`.
 platform-dirs = "0.3"
-hkdf = "0.12"
+hkdf = "0.13"
 
 [lints.rust]
 unsafe_code = "forbid"

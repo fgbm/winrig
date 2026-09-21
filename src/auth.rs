@@ -18,7 +18,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use hkdf::hmac::{Hmac, Mac};
+use hkdf::hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
@@ -93,7 +93,7 @@ impl BoundProfile {
 }
 
 fn token_mac(token: &str) -> [u8; 32] {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(b"winrig-profile-token-check")
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(b"winrig-profile-token-check")
         .expect("HMAC accepts any key length");
     mac.update(token.as_bytes());
     mac.finalize().into_bytes().into()

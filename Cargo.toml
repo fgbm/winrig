@@ -48,7 +48,7 @@ thiserror = "2"
 # dyn-compatible async trait for the transport seam.
 async-trait = "0.1"
 # SHA-256 for the rejected-password digest (DR-4).
-sha2 = "0.10"
+sha2 = "0.11"
 # Base64 for chunked file writes: the payload rides inside a PowerShell string
 # and the WinRS command line is ~8191 chars (ADR-0013).
 base64 = "0.23"
@@ -67,7 +67,7 @@ rand = "0.10"
 # Кроссплатформенные каталоги конфигурации и состояния (ADR-0009).
 # `directories` отвергнут cargo-deny: тянет MPL-2.0 `option-ext`.
 platform-dirs = "0.3"
-hkdf = "0.12"
+hkdf = "0.13"
 
 [lints.rust]
 unsafe_code = "forbid"

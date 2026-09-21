@@ -5,118 +5,118 @@
 [![License: MIT](https://img.shields.io/github/license/fgbm/winrig)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.98%2B-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 
-**A Windows MCP server for remote administration over WinRM/NTLM, written in Rust.** Diagnose, inspect, and manage any AD-joined Windows host from Cursor, Claude Code, Codex, opencode, or any MCP (Model Context Protocol) client. The AD password is entered once through `winrig setup`, stored only as authenticated ciphertext under a key that stays with the client, and never written to a client config in plaintext.
+**MCP-сервер для удалённого администрирования Windows-хостов по WinRM/NTLM, написанный на Rust.** Диагностируйте, изучайте и администрируйте любой Windows-хост, введённый в домен AD, из Cursor, Claude Code, Codex, opencode или любого клиента MCP (Model Context Protocol). Пароль AD вводится один раз через `winrig setup`, хранится только аутентифицированным шифртекстом под ключом, который остаётся у клиента, и никогда не записывается в конфиг клиента открытым текстом.
 
-`winrig` is the Rust successor of the Python `win-mcp-server`. It keeps the same domain rules, module boundaries and tool contracts, but ships as a single static binary with no container and no interpreter, running either as an HTTP service (`winrig serve`) or as a local stdio process (`winrig stdio`).
+`winrig` — преемник Python-проекта `win-mcp-server` на Rust. Он сохраняет те же доменные правила, границы модулей и контракты инструментов, но поставляется одним статическим бинарём без контейнера и интерпретатора, работая либо как HTTP-сервис (`winrig serve`), либо как локальный stdio-процесс (`winrig stdio`).
 
-- **Low memory, one binary**: one release binary, no runtime, no container. Resident memory stays around 11 MiB after startup and repeated requests on the development machine (`VmRSS` from `/proc`).
-- **37 tools**, plus `write_file` once the operator enables it: filesystem, services, registry, event logs, certificates, processes, network, scheduled tasks, and more. These are the tools ported so far; the Python `win-mcp-server` had file-transfer (copy/move/rename/archive), `invoke_http_request` and SFTP tools that are not yet ported.
-- **One profile per process**: `winrig setup` writes an encrypted profile; the token it prints is the only key and is shown once. A second process on the same profile refuses to start and points to the HTTP mode.
-- **Two secrets, one per request**: a request is authenticated either by `WINRIG_AUTH_TOKEN` (header path with `X-AD-User`) or by the profile token, which fixes the identity and ignores `X-AD-*`.
-- **No secrets on disk**: no credentials in config files or logs. Only authenticated ciphertext lives in the profile file.
+- **Мало памяти, один бинарь**: один release-бинарь, без runtime, без контейнера. Резидентная память держится около 11 МиБ после старта и повторных запросов на машине разработки (`VmRSS` из `/proc`).
+- **37 инструментов** плюс `write_file`, когда оператор его включит: файловая система, службы, реестр, журналы событий, сертификаты, процессы, сеть, запланированные задачи и прочее. Это портированные на сегодня инструменты; в Python-версии `win-mcp-server` были передача файлов (копирование/перемещение/переименование/архивы), `invoke_http_request` и инструменты SFTP, которые пока не портированы.
+- **Один процесс на профиль**: `winrig setup` создаёт шифрованный профиль; напечатанный токен — единственный ключ, и показывается он один раз. Второй процесс на том же профиле отказывает в старте и указывает на HTTP-режим.
+- **Два секрета, по одному на запрос**: запрос аутентифицируется либо `WINRIG_AUTH_TOKEN` (путь по заголовкам с `X-AD-User`), либо токеном профиля, который задаёт идентичность и заставляет игнорировать `X-AD-*`.
+- **Никаких секретов на диске**: ни учётных данных в конфигах, ни в журналах. В файле профиля лежит только аутентифицированный шифртекст.
 
-## Why Rust
+## Почему Rust
 
-- One release binary, `cargo build --release`; no Docker, no Python, no pip.
-- Memory is bounded and small; one long command cannot stall another request because the transport is async.
-- The WinRM/NTLM client, MCP protocol and HTTP stack are mature crates, so the project carries domain logic, not protocol plumbing. See `docs/adr/0007-rust-stack.md`.
+- Один release-бинарь, `cargo build --release`; без Docker, без Python, без pip.
+- Память ограничена и мала; одна длинная команда не может заблокировать другой запрос, потому что транспорт асинхронный.
+- Клиент WinRM/NTLM, протокол MCP и HTTP-стек — зрелые крейты, поэтому проект несёт доменную логику, а не протокольную обвязку. См. `docs/adr/0007-rust-stack.md`.
 
-## Tools
+## Инструменты
 
-### Session
+### Сессия
 
-| Tool | Description |
+| Инструмент | Описание |
 |------|-------------|
-| `connect` | Open a WinRM session to a Windows host and return a `session_id` (HTTP 5985 or HTTPS 5986 via `use_ssl`) |
-| `disconnect` | Close an active WinRM session |
-| `list_sessions` | List active WinRM sessions with usage details |
+| `connect` | Открыть WinRM-сессию к Windows-хосту и вернуть `session_id` (HTTP 5985 или HTTPS 5986 через `use_ssl`) |
+| `disconnect` | Закрыть активную WinRM-сессию |
+| `list_sessions` | Список активных WinRM-сессий с деталями использования |
 
-### Filesystem (read-only)
+### Файловая система (только чтение)
 
-| Tool | Description |
+| Инструмент | Описание |
 |------|-------------|
-| `list_directory` | List files and directories at a path |
-| `find_files` | Recursively find files by wildcard pattern |
-| `read_file` | Read file contents as numbered lines |
-| `search_file_content` | Grep-like text search in a file or across a directory |
-| `file_info` | JSON metadata for a file or directory |
-| `compare_files` | Line-by-line diff of two files |
+| `list_directory` | Список файлов и каталогов по пути |
+| `find_files` | Рекурсивный поиск файлов по шаблону |
+| `read_file` | Чтение содержимого файла с нумерацией строк |
+| `search_file_content` | Текстовый поиск в файле или по каталогу, аналог grep |
+| `file_info` | Метаданные файла или каталога в JSON |
+| `compare_files` | Построчный diff двух файлов |
 
-### System diagnostics (read-only)
+### Диагностика системы (только чтение)
 
-| Tool | Description |
+| Инструмент | Описание |
 |------|-------------|
-| `get_event_log` | Windows Event Log: crashes, service failures, auth errors |
-| `get_services` | Services summary or full JSON detail per service |
-| `list_processes` | Processes sorted by CPU, memory, or handles |
-| `get_system_info` | OS version, uptime, RAM, CPU count, domain, timezone |
-| `get_disk_space` | Disk space for all fixed drives |
-| `get_perf_snapshot` | Locale-independent CPU, memory, disk I/O, network snapshot |
-| `get_registry` | Read a registry key or value (read-only) |
-| `get_certificates` | Personal store certificates sorted by days until expiry |
-| `get_network_config` | Per-NIC IP, gateway, and DNS configuration |
-| `test_network` | ICMP ping or TCP port test from the remote host |
+| `get_event_log` | Журнал событий Windows: падения, отказы служб, ошибки аутентификации |
+| `get_services` | Сводка служб или полные детали по каждой службе в JSON |
+| `list_processes` | Процессы с сортировкой по CPU, памяти или дескрипторам |
+| `get_system_info` | Версия ОС, uptime, RAM, число CPU, домен, часовой пояс |
+| `get_disk_space` | Место на всех фиксированных дисках |
+| `get_perf_snapshot` | Снимок CPU, памяти, дискового I/O и сети, не зависящий от локали |
+| `get_registry` | Чтение ключа или значения реестра (только чтение) |
+| `get_certificates` | Сертификаты личного хранилища с сортировкой по дням до истечения |
+| `get_network_config` | IP, шлюз и DNS по каждому сетевому адаптеру |
+| `test_network` | ICMP-пинг или проверка TCP-порта с удалённого хоста |
 
-### Identity & configuration (read-only)
+### Идентичность и конфигурация (только чтение)
 
-| Tool | Description |
+| Инструмент | Описание |
 |------|-------------|
-| `get_environment_variables` | Environment variables by scope |
-| `get_scheduled_tasks` | Scheduled tasks with last/next run and result |
-| `get_local_users` | Local user accounts with status and last logon |
-| `get_user_groups` | Local group memberships |
-| `get_security_context` | Current session identity, groups, privileges |
-| `get_permissions` | File/folder ACL entries |
+| `get_environment_variables` | Переменные окружения по областям |
+| `get_scheduled_tasks` | Запланированные задачи с последним/следующим запуском и результатом |
+| `get_local_users` | Локальные учётные записи со статусом и последним входом |
+| `get_user_groups` | Членство в локальных группах |
+| `get_security_context` | Идентичность текущей сессии, группы, привилегии |
+| `get_permissions` | Записи ACL для файлов и каталогов |
 
-### Network & software (read-only)
+### Сеть и ПО (только чтение)
 
-| Tool | Description |
+| Инструмент | Описание |
 |------|-------------|
-| `get_tcp_connections` | Active TCP connections with owning process |
-| `get_dns_cache` | Local DNS client cache |
-| `get_installed_software` | Installed software from 64-bit and 32-bit uninstall keys |
-| `resolve_dns_name` | DNS resolution chain from the remote server |
+| `get_tcp_connections` | Активные TCP-соединения с процессом-владельцем |
+| `get_dns_cache` | Локальный кэш DNS-клиента |
+| `get_installed_software` | Установленное ПО из 64- и 32-битных ключей удаления |
+| `resolve_dns_name` | Цепочка разрешения DNS с удалённого сервера |
 
-### Active Directory — decided, not built yet
+### Active Directory — решено, но не построено
 
-None of these exist in the binary today: the section records a decision (ADR-0014, slices W19–W21), not a capability. It is here because the absence itself misleads — an agent that sees WinRM and a domain-joined host assumes the directory is reachable, and it is not.
+Ни одного из этих инструментов в бинаре сегодня нет: раздел фиксирует решение (ADR-0014, срезы W19–W21), а не возможность. Он здесь потому, что само отсутствие вводит в заблуждение: агент, видящий WinRM и хост в домене, предполагает, что каталог доступен, а он не доступен.
 
-Why it is not: NTLM gives the remote host a network logon with no delegatable credentials, so a directory query from an ordinary member server is a second hop to a domain controller and fails with `An operations error occurred`. `run_command` will not change that — it runs in the same session with the same token. The route that works needs no delegation at all: **connect to the domain controller itself**, where the query is local. Only `get_security_context` touches AD today, and only because domain groups sit in the session token.
+Почему так: NTLM даёт удалённому хосту network logon без делегируемых учётных данных, поэтому запрос к каталогу с рядового сервера — второй хоп к контроллеру домена, и он отказывает с `An operations error occurred`. `run_command` это не изменит — он исполняется в той же сессии с тем же токеном. Маршрут, который работает, делегирования не требует вовсе: **подключиться к самому контроллеру домена**, где запрос локален. Сегодня AD касается только `get_security_context`, и лишь потому, что доменные группы лежат в токене сессии.
 
-Planned for slice W19, read-only, queried through `System.DirectoryServices` rather than the RSAT cmdlets (those talk to ADWS and need the module and the service):
+Планируется в срезе W19, только чтение, опрос через `System.DirectoryServices`, а не командлетами RSAT (те ходят в ADWS и требуют установленного модуля и запущенной службы):
 
-| Tool | Description |
+| Инструмент | Описание |
 |------|-------------|
-| `get_ad_object` | One user, group, or computer: account state, password dates, last logon, DN, OU |
-| `get_ad_membership` | Membership in both directions, optionally nested |
-| `find_ad_objects` | Search by name or `sAMAccountName`, capped |
-| `get_ad_domain_info` | Domain, forest, functional levels, FSMO roles, DCs, trusts, sites, password policy and PSOs |
-| `get_ad_health` | Replication partners and lag, NTDS/DNS/ADWS/W32Time services, SYSVOL state |
-| `get_ad_stale_objects` | Dormant users or computers by `lastLogonTimestamp` and `pwdLastSet` |
+| `get_ad_object` | Один пользователь, группа или компьютер: состояние учётной записи, сроки пароля, последний вход, DN, OU |
+| `get_ad_membership` | Членство в обе стороны, при необходимости вложенное |
+| `find_ad_objects` | Поиск по имени или `sAMAccountName` с потолком результатов |
+| `get_ad_domain_info` | Домен, лес, уровни функционирования, роли FSMO, контроллеры, доверия, сайты, парольная политика и PSO |
+| `get_ad_health` | Партнёры репликации и отставание, службы NTDS/DNS/ADWS/W32Time, состояние SYSVOL |
+| `get_ad_stale_objects` | Залежавшиеся пользователи и компьютеры по `lastLogonTimestamp` и `pwdLastSet` |
 
-Writing to the directory (slices W20–W21) is decided in the same ADR and deliberately left out of the first wave: it will be off by default behind `WINRIG_ALLOW_AD_WRITE`, will confirm every call with the object's DN, will refuse protected objects and built-in groups before touching the network, will take one explicitly named object per call and never a filter, and will accept an attribute only if it passes `WINRIG_AD_WRITABLE_ATTRIBUTES`. Neither variable is read by the current binary. Changing the topology of a domain or forest — seizing FSMO roles, metadata cleanup, forcing replication — and deleting directory objects are not planned at all.
+Запись в каталог (срезы W20–W21) решена в том же ADR и намеренно оставлена за пределами первой волны: она будет выключена по умолчанию за `WINRIG_ALLOW_AD_WRITE`, будет подтверждать каждый вызов с DN объекта, будет отвергать защищённые объекты и встроенные группы до обращения к сети, будет принимать ровно один явно названный объект на вызов и никогда фильтр, и примет атрибут только если он проходит `WINRIG_AD_WRITABLE_ATTRIBUTES`. Текущий бинарь не читает ни одну из этих переменных. Изменение топологии домена или леса — захват ролей FSMO, чистка метаданных, принудительная репликация — и удаление объектов каталога не планируются вовсе.
 
-### Write operations (all require user confirmation)
+### Модифицирующие операции (все требуют подтверждения)
 
-| Tool | Description |
+| Инструмент | Описание |
 |------|-------------|
-| `restart_service` / `stop_service` / `start_service` | Manage services with before/after state |
-| `kill_process` | Force-terminate a process by PID |
-| `set_registry` | Set a registry value showing old vs new |
-| `delete_file` / `delete_directory` | Delete with a confirmation prompt; protected paths refused |
-| `flush_dns` | Clear the DNS client cache |
-| `write_file` | Write a file, replacing it as a whole. **Off by default**: set `WINRIG_ALLOW_FILE_WRITE=true`, or the tool is not advertised and cannot be called |
+| `restart_service` / `stop_service` / `start_service` | Управление службами с состоянием до и после |
+| `kill_process` | Принудительное завершение процесса по PID |
+| `set_registry` | Запись значения реестра с показом старого и нового |
+| `delete_file` / `delete_directory` | Удаление с запросом подтверждения; защищённые пути отвергаются |
+| `flush_dns` | Очистка кэша DNS-клиента |
+| `write_file` | Запись файла с заменой целиком. **Выключен по умолчанию**: задайте `WINRIG_ALLOW_FILE_WRITE=true`, иначе инструмент не объявляется и вызвать его нельзя |
 
-`write_file` refuses protected paths with the same list that guards deletion, and refuses an existing file unless `overwrite` is set. Content travels in ~2 KB chunks because the WinRS command line is limited to about 8191 characters, so it suits configuration files and scripts rather than large payloads; `WINRIG_MAX_WRITE_BYTES` (64 KiB by default) caps the rest. Chunks land in a temporary file next to the target, and the target is replaced by a rename, so a failure part-way leaves the existing file untouched.
+`write_file` отвергает защищённые пути тем же списком, что охраняет удаление, и отвергает существующий файл, если не задан `overwrite`. Содержимое идёт кусками по ~2 КБ, потому что командная строка WinRS ограничена примерно 8191 символом; поэтому инструмент годится для конфигов и скриптов, а не для больших объёмов, а остаток ограничивает `WINRIG_MAX_WRITE_BYTES` (по умолчанию 64 КиБ). Куски ложатся во временный файл рядом с целью, а цель заменяется переименованием, поэтому сбой на середине оставляет существующий файл нетронутым.
 
-That chunk limit applies to the command line, not to output. A script too long for one command is written with `write_file` and then run by path — the command stays short however long the script is.
+Это ограничение на длину относится к командной строке, а не к выводу. Скрипт, не влезающий в одну команду, записывается `write_file` и затем запускается по пути — команда остаётся короткой, каким бы длинным ни был скрипт.
 
-## Install
+## Установка
 
-Prebuilt binaries are attached to every release for Linux, macOS and Windows, with a `sha256` checksum beside each archive. Linux binaries are statically linked (musl), so they carry no glibc version requirement.
+К каждому релизу приложены готовые бинари для Linux, macOS и Windows, рядом с каждым архивом — контрольная сумма `sha256`. Linux-бинари слинкованы статически (musl), поэтому не несут требования к версии glibc.
 
 ```bash
-# Change the version and target to match your platform.
+# Замените версию и таргет на свою платформу.
 curl -LO https://github.com/fgbm/winrig/releases/latest/download/winrig-v0.1.0-x86_64-unknown-linux-musl.tar.gz
 curl -LO https://github.com/fgbm/winrig/releases/latest/download/winrig-v0.1.0-x86_64-unknown-linux-musl.sha256
 sha256sum -c winrig-v0.1.0-x86_64-unknown-linux-musl.sha256
@@ -124,59 +124,59 @@ tar xzf winrig-v0.1.0-x86_64-unknown-linux-musl.tar.gz
 install -m 0755 winrig ~/.local/bin/winrig
 ```
 
-Archives are named `winrig-v<version>-<target>`, where the target is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, `aarch64-apple-darwin` or `x86_64-pc-windows-msvc`. On macOS the `aarch64` archive is for Apple Silicon and `x86_64` for Intel; `tar` and `unzip` both work, as the archive carries `LICENSE` and `README.md` next to the binary.
+Архивы называются `winrig-v<версия>-<таргет>`, где таргет — один из `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, `aarch64-apple-darwin` или `x86_64-pc-windows-msvc`. На macOS архив `aarch64` — для Apple Silicon, `x86_64` — для Intel; подходят и `tar`, и `unzip`, потому что в архиве рядом с бинарём лежат `LICENSE` и `README.md`.
 
-To build from source instead, see [Quick Start](#quick-start).
+Чтобы собрать из исходников, см. [Быстрый старт](#быстрый-старт).
 
-## Quick Start
+## Быстрый старт
 
-Build once:
+Соберите один раз:
 
 ```bash
 cargo build --release
 ```
 
-Create an encrypted profile. The password is read without echo, and the token is printed exactly once:
+Создайте шифрованный профиль. Пароль читается без эха, токен печатается ровно один раз:
 
 ```bash
 ./target/release/winrig setup corp --user 'DOMAIN\your-ad-username'
 ```
 
-The command prints the access token and a JSON definition of the MCP server. Either paste that definition into your client, or let `setup` write it for you (the config is updated in place, other entries are untouched):
+Команда печатает токен доступа и JSON-определение MCP-сервера. Либо вставьте определение в клиент вручную, либо дайте `setup` записать его за вас (конфиг обновляется на месте, чужие записи не трогаются):
 
 ```bash
 ./target/release/winrig setup corp --user 'DOMAIN\your-ad-username' --write-config opencode --scope global
 ./target/release/winrig setup corp --user 'DOMAIN\your-ad-username' --write-config claude-code --scope project
 ```
 
-`--write-config` requires a scope. Pass `--scope global` for the user-wide config or `--scope project` for the current repository; without the flag `setup` asks in the terminal, and in a non-interactive run (script, CI) it refuses and points you to `--scope`.
+`--write-config` требует уровень. Передайте `--scope global` для пользовательского конфига или `--scope project` для текущего репозитория; без флага `setup` спрашивает в терминале, а в неинтерактивном запуске (скрипт, CI) отказывает и указывает на `--scope`.
 
-The entry is named after the one that already serves this profile, so re-running `setup` updates it in place instead of adding a second one. That matters: two entries on one profile start two processes, the second one loses the profile lock and exits, and the client reports only `MCP error -32000: Connection closed`. When no entry serves the profile yet the name is `winrig`; `--server-name` sets it explicitly.
+Запись называется так же, как та, что уже обслуживает этот профиль, поэтому повторный `setup` обновляет её на месте, а не добавляет вторую. Это важно: две записи на один профиль поднимают два процесса, второй теряет блокировку профиля и выходит, а клиент сообщает лишь `MCP error -32000: Connection closed`. Когда профиль ещё никем не обслуживается, имя — `winrig`; `--server-name` задаёт его явно.
 
-Supported clients: `opencode`, `claude-code`, `codex`, `cursor`. Project scope finds the nearest ancestor directory containing `.git` (falling back to the current directory) and writes to `<root>/opencode.json`, `<root>/.mcp.json`, `<root>/.codex/config.toml` or `<root>/.cursor/mcp.json`; global scope keeps the user-wide paths. For opencode the token is written to a separate `0600` file and referenced as `{file:...}` so it never sits inside the config; at project scope that file lives in `WINRIG_STATE_DIR`, not in the repository. For the other three the token is written into the client config as a value; at project scope that file is usually committed, so `setup` prints a warning and `winrig` sets the file to `0600` on Unix.
+Поддерживаемые клиенты: `opencode`, `claude-code`, `codex`, `cursor`. Project-уровень находит ближайший каталог-предок с `.git` (с откатом к текущему каталогу) и пишет в `<root>/opencode.json`, `<root>/.mcp.json`, `<root>/.codex/config.toml` или `<root>/.cursor/mcp.json`; global-уровень сохраняет пользовательские пути. Для opencode токен пишется в отдельный файл `0600` и подставляется ссылкой `{file:...}`, поэтому он никогда не лежит внутри конфига; на project-уровне этот файл живёт в `WINRIG_STATE_DIR`, а не в репозитории. Для остальных трёх токен пишется в конфиг клиента значением; на project-уровне такой файл обычно коммитится, поэтому `setup` печатает предупреждение, а `winrig` выставляет файлу `0600` на Unix.
 
-Run the server in one of two modes:
+Запустите сервер в одном из двух режимов:
 
 ```bash
-# Local stdio process for one client (token comes from the client environment)
-WINRIG_TOKEN='<token from setup>' ./target/release/winrig stdio --profile corp
+# Локальный stdio-процесс для одного клиента (токен приходит из окружения клиента)
+WINRIG_TOKEN='<токен из setup>' ./target/release/winrig stdio --profile corp
 
-# HTTP service on 127.0.0.1:8005/mcp for several projects
-WINRIG_TOKEN='<token from setup>' ./target/release/winrig serve --profile corp
+# HTTP-сервис на 127.0.0.1:8005/mcp для нескольких проектов
+WINRIG_TOKEN='<токен из setup>' ./target/release/winrig serve --profile corp
 
-# Override the address from the command line (wins over the environment)
+# Переопределить адрес из командной строки (важнее окружения)
 ./target/release/winrig serve --profile corp --port 9000 --host 0.0.0.0
 
-# Supply the secrets as arguments instead of the environment (wins over env)
-./target/release/winrig serve --profile corp --token '<token from setup>'
-./target/release/winrig serve --auth-token '<shared secret>'
+# Передать секреты аргументами вместо окружения (важнее окружения)
+./target/release/winrig serve --profile corp --token '<токен из setup>'
+./target/release/winrig serve --auth-token '<общий секрет>'
 ```
 
-The `--token` and `--auth-token` flags override `WINRIG_TOKEN` and `WINRIG_AUTH_TOKEN`. A secret passed as an argument is visible in the process list, so prefer the environment or the client config where possible.
+Флаги `--token` и `--auth-token` перекрывают `WINRIG_TOKEN` и `WINRIG_AUTH_TOKEN`. Секрет, переданный аргументом, виден в списке процессов, поэтому предпочитайте окружение или конфиг клиента, где это возможно.
 
-The server definition printed and written by `setup` includes `WINRIG_TOKEN`, `WINRIG_PROFILE_DIR` and `WINRIG_STATE_DIR`, so a client finds the profile even when the directories are not the standard ones.
+Определение сервера, которое печатает и записывает `setup`, включает `WINRIG_TOKEN`, `WINRIG_PROFILE_DIR` и `WINRIG_STATE_DIR`, поэтому клиент находит профиль даже при нестандартных каталогах.
 
-To keep the header path instead of a profile, set a shared secret and skip the profile:
+Чтобы оставить путь по заголовкам вместо профиля, задайте общий секрет и обойдитесь без профиля:
 
 ```bash
 echo "WINRIG_AUTH_TOKEN=$(openssl rand -base64 32)" >> .env
@@ -184,72 +184,72 @@ set -a; . ./.env; set +a
 ./target/release/winrig serve
 ```
 
-In HTTP mode the default bind is `127.0.0.1:8005`; the endpoint is `/mcp`. At least one secret is required — the server refuses to start with neither a profile token nor `WINRIG_AUTH_TOKEN`.
+В HTTP-режиме привязка по умолчанию — `127.0.0.1:8005`, эндпоинт — `/mcp`. Нужен хотя бы один секрет: сервер отказывает в старте, если нет ни токена профиля, ни `WINRIG_AUTH_TOKEN`.
 
-## Profiles
+## Профили
 
 ```bash
-winrig setup corp --user 'DOMAIN\user'   # create; prints the token once
-winrig setup corp --user 'DOMAIN\user' --overwrite   # replace an existing profile
-winrig list                              # table: NAME, USER, PATH; never secrets
-winrig list --json                       # same data as JSON
-winrig rotate corp                       # re-encrypt under a fresh token
-winrig forget corp                       # delete the profile (idempotent)
+winrig setup corp --user 'DOMAIN\user'   # создать; печатает токен один раз
+winrig setup corp --user 'DOMAIN\user' --overwrite   # заменить существующий профиль
+winrig list                              # таблица: NAME, USER, PATH; секретов нет
+winrig list --json                       # те же данные в JSON
+winrig rotate corp                       # перешифровать под свежим токеном
+winrig forget corp                       # удалить профиль (идемпотентно)
 ```
 
-The profile file is `corp.json` inside the profile directory, holding a format version, the canonical account name, an HKDF-SHA256 salt, an XChaCha20-Poly1305 nonce and ciphertext; the account name is bound as associated data. The file is `0600` inside a `0700` directory on Unix; wider permissions produce a warning, not a refusal. A wrong token and a corrupt file are reported differently in the journal but both answer the client with 401. If `WINRIG_AUTH_TOKEN` happens to be the profile token, startup refuses.
+Файл профиля — `corp.json` в каталоге профилей: версия формата, каноническое имя учётной записи, соль HKDF-SHA256, nonce XChaCha20-Poly1305 и шифртекст; имя учётной записи связано как associated data. На Unix файл `0600` внутри каталога `0700`; более широкие права дают предупреждение, а не отказ. Неверный токен и повреждённый файл различаются в журнале, но клиенту оба отвечают 401. Если `WINRIG_AUTH_TOKEN` совпал с токеном профиля, старт отказывает.
 
-The account is given as `DOMAIN\user`; the split for NTLM follows `spnego` (the engine `requests-ntlm` used in the Python server): the name is split on the first backslash, a UPN (`user@realm`) or a bare name stays whole with an empty domain. The profile stores the account in canonical lower case, and that same value is sent to the host; NTLM upper-cases the user name itself when it builds the hash, so the case of the domain does not change the result.
+Учётная запись задаётся как `DOMAIN\user`; деление для NTLM повторяет `spnego` (движок `requests-ntlm`, использовавшийся в Python-сервере): имя делится по первому обратному слэшу, UPN (`user@realm`) или голое имя остаются целыми с пустым доменом. Профиль хранит учётную запись в каноническом нижнем регистре, и то же значение уходит на хост; NTLM сам приводит имя пользователя к верхнему регистру, когда строит хеш, поэтому регистр домена на результат не влияет.
 
-One process per profile: a lock file in the profile's state directory stops a second process on the same profile and points to the HTTP mode. Profile changes on disk take effect on the next start. The profile password is still subject to the AD lockout; if it is rejected twice in separate lockout windows, the profile is refused until the process restarts and you should run `setup` again.
+Один процесс на профиль: lock-файл в каталоге состояния профиля останавливает второй процесс на том же профиле и указывает на HTTP-режим. Изменения профиля на диске вступают в силу при следующем старте. Пароль профиля по-прежнему подчинён блокировке учётной записи AD; если его отвергли дважды в разных окнах блокировки, профиль отказывает до перезапуска процесса, и вам следует выполнить `setup` заново.
 
-## Configuration
+## Конфигурация
 
-Everything is configured through the environment; there is no config file. The profile file is not configuration — it is a store of ciphertext (ADR-0009).
+Всё настраивается через окружение; файла конфигурации нет. Файл профиля — не конфигурация, а хранилище шифртекста (ADR-0009).
 
-| Variable | Default | Purpose |
+| Переменная | По умолчанию | Назначение |
 |----------|---------|---------|
-| `WINRIG_AUTH_TOKEN` | — | Shared secret for the header path; a request must present it as `Authorization: Bearer <token>` or `X-MCP-Token`. Optional when a profile token is used |
-| `WINRIG_PROFILE` | — | Profile name; omitted when exactly one profile exists, required when several do |
-| `WINRIG_TOKEN` | — | Access token printed by `setup`; required in stdio mode and for the profile path in HTTP |
-| `WINRIG_PROFILE_DIR` | OS config dir | Overrides the profile directory (`~/.config/winrig` on Linux) |
-| `WINRIG_STATE_DIR` | OS state dir | Overrides the **root** of the state directory; `winrig` appends the profile name itself, so the per-profile locks and default logs land in `<WINRIG_STATE_DIR>/<profile>`. Point it at the root, not at a profile's own directory, or the lock moves one level away from where the config claims it is |
-| `WINRIG_BIND_HOST` | `127.0.0.1` | Address the HTTP server listens on |
-| `WINRIG_PORT` | `8005` | Port the HTTP server listens on |
-| `WINRIG_PASSWORD_TTL_SECONDS` | `3600` | How long a cached AD password survives without use. `0` disables expiry. In profile mode it only bounds how long the decrypted password stays in memory; it never forces a re-entry |
-| `WINRIG_LOG_DIR` | profile state dir | Directory for `winrig.log` and `winrig-audit.log`. Created `0700`, files `0600` |
-| `WINRIG_LOG_LEVEL` | `INFO` | Level of the server log (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`). Does not affect the audit trail, which is always written |
-| `WINRIG_LOG_MAX_BYTES` | `10485760` | Size at which a log file rotates |
-| `WINRIG_LOG_BACKUP_COUNT` | `5` | Rotated files kept per log |
-| `WINRIG_AUDIT_MAX_OUTPUT_CHARS` | `2000` | Characters of stdout/stderr per call kept in the audit trail |
-| `WINRIG_AUDIT_LOG_BODY` | `1` | `0`, `false`, `no` or `off` logs only call metadata: no command text, no output |
-| `WINRIG_CONFIRM_TIMEOUT_SECONDS` | `300` | How long a mutating tool waits for the confirmation answer before it fails closed |
-| `WINRIG_LOCKOUT_ATTEMPTS` | `3` | Failed AD password attempts after which the password is not presented again for the lockout window |
-| `WINRIG_LOCKOUT_WINDOW_SECONDS` | `1800` | How long a rejected password is kept from being retried, in seconds |
-| `WINRIG_SECRET_REDACT_MIN_LENGTH` | `4` | Shortest secret redacted from the **reply to the agent**. The audit trail and log files redact secrets of any length, unconditionally |
-| `WINRIG_ALLOWED_HOSTS` | *(empty)* | Comma-separated allowlist; empty allows every host. An entry is an exact hostname/IP (case-insensitive); an entry starting with `.` matches a suffix |
-| `WINRIG_ALLOW_INSECURE_TLS` | `true` | Whether `verify_cert=false` is accepted. `false` refuses such a call before any network activity |
-| `WINRIG_ALLOW_FILE_WRITE` | `false` | Whether the `write_file` tool exists. While `false` it is removed from the router: not advertised and not callable |
-| `WINRIG_MAX_WRITE_BYTES` | `65536` | Largest content `write_file` accepts, in bytes. Refused before any network activity. Cannot be set below one 2000-byte chunk |
-| `WINRIG_SFTP_CRED_TTL_SECONDS` | `3600` | Reserved for the SFTP tools (not yet ported); parsed and validated at startup |
+| `WINRIG_AUTH_TOKEN` | — | Общий секрет для пути по заголовкам; запрос обязан предъявить его как `Authorization: Bearer <token>` или `X-MCP-Token`. Не обязателен, когда используется токен профиля |
+| `WINRIG_PROFILE` | — | Имя профиля; опускается, когда профиль ровно один, обязательно при нескольких |
+| `WINRIG_TOKEN` | — | Токен доступа, напечатанный `setup`; обязателен в stdio-режиме и для пути профиля в HTTP |
+| `WINRIG_PROFILE_DIR` | каталог конфигов ОС | Переопределяет каталог профилей (`~/.config/winrig` на Linux) |
+| `WINRIG_STATE_DIR` | каталог состояния ОС | Переопределяет **корень** каталога состояния; `winrig` сам добавляет имя профиля, поэтому блокировки и журналы по умолчанию ложатся в `<WINRIG_STATE_DIR>/<профиль>`. Указывайте корень, а не каталог самого профиля, иначе блокировка уедет на уровень в сторону от того места, где её ждёт конфиг |
+| `WINRIG_BIND_HOST` | `127.0.0.1` | Адрес, который слушает HTTP-сервер |
+| `WINRIG_PORT` | `8005` | Порт, который слушает HTTP-сервер |
+| `WINRIG_PASSWORD_TTL_SECONDS` | `3600` | Сколько живёт закэшированный пароль AD без использования. `0` отключает истечение. В режиме профиля ограничивает лишь то, как долго расшифрованный пароль остаётся в памяти; повторный ввод он не вызывает никогда |
+| `WINRIG_LOG_DIR` | каталог состояния профиля | Каталог для `winrig.log` и `winrig-audit.log`. Создаётся `0700`, файлы `0600` |
+| `WINRIG_LOG_LEVEL` | `INFO` | Уровень журнала сервера (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`). На аудит не влияет, тот пишется всегда |
+| `WINRIG_LOG_MAX_BYTES` | `10485760` | Размер, при котором журнал ротируется |
+| `WINRIG_LOG_BACKUP_COUNT` | `5` | Сколько ротированных файлов хранится на журнал |
+| `WINRIG_AUDIT_MAX_OUTPUT_CHARS` | `2000` | Сколько символов stdout/stderr на вызов сохраняется в аудите |
+| `WINRIG_AUDIT_LOG_BODY` | `1` | `0`, `false`, `no` или `off` пишут только метаданные вызова: ни текста команды, ни вывода |
+| `WINRIG_CONFIRM_TIMEOUT_SECONDS` | `300` | Сколько модифицирующий инструмент ждёт ответа подтверждения, прежде чем отказать (fail-closed) |
+| `WINRIG_LOCKOUT_ATTEMPTS` | `3` | Число неудачных попыток пароля AD, после которого пароль не предъявляется до конца окна блокировки |
+| `WINRIG_LOCKOUT_WINDOW_SECONDS` | `1800` | Сколько секунд отвергнутый пароль не повторяется |
+| `WINRIG_SECRET_REDACT_MIN_LENGTH` | `4` | Кратчайший секрет, вырезаемый из **ответа агенту**. Аудит и файлы журнала вырезают секреты любой длины, безусловно |
+| `WINRIG_ALLOWED_HOSTS` | *(пусто)* | Allowlist через запятую; пустое значение разрешает любой хост. Запись — точное имя хоста или IP (без учёта регистра); запись, начинающаяся с `.`, совпадает по суффиксу |
+| `WINRIG_ALLOW_INSECURE_TLS` | `true` | Принимается ли `verify_cert=false`. `false` отвергает такой вызов до любой сетевой активности |
+| `WINRIG_ALLOW_FILE_WRITE` | `false` | Существует ли инструмент `write_file`. Пока `false`, он удалён из роутера: не объявляется и не вызывается |
+| `WINRIG_MAX_WRITE_BYTES` | `65536` | Наибольшее содержимое, которое принимает `write_file`, в байтах. Отвергается до сетевой активности. Не может быть меньше одного куска в 2000 байт |
+| `WINRIG_SFTP_CRED_TTL_SECONDS` | `3600` | Зарезервировано под инструменты SFTP (пока не портированы); разбирается и проверяется при старте |
 
-### Transport security
+### Безопасность транспорта
 
-`winrig` serves plain HTTP on `/mcp`; there is no TLS listener in the binary. **The bearer token is now a key: whoever captures it can both reach the server and decrypt the AD password.** Do not bind to a non-loopback address without a TLS-terminating reverse proxy in front (nginx, Caddy, or an ingress). The default bind address is `127.0.0.1` for exactly this reason: the multi-user deployment assumes the proxy authenticates clients and forwards the `Authorization`, `X-AD-User` and `X-AD-Password` headers unchanged. The remote WinRM leg is separate: use `use_ssl` / port 5986 when the hop to the Windows host must be encrypted, and keep `WINRIG_ALLOW_INSECURE_TLS=false` unless a self-signed certificate is deliberate.
+`winrig` отдаёт открытый HTTP на `/mcp`; TLS-слушателя в бинаре нет. **Bearer-токен теперь ключ: кто его перехватит, тот и достигнет сервера, и расшифрует пароль AD.** Не привязывайтесь к не-loopback адресу без TLS-терминирующего обратного прокси впереди (nginx, Caddy или ingress). Адрес по умолчанию — `127.0.0.1` именно поэтому: многопользовательское развёртывание предполагает, что прокси аутентифицирует клиентов и передаёт заголовки `Authorization`, `X-AD-User` и `X-AD-Password` без изменений. Удалённый участок WinRM отдельный: используйте `use_ssl` / порт 5986, когда хоп до Windows-хоста должен быть шифрованным, и держите `WINRIG_ALLOW_INSECURE_TLS=false`, если самоподписанный сертификат не является намеренным.
 
-Over plain HTTP that WinRM leg is only partly encrypted. `winrm-rs` seals SOAP bodies with the NTLM session key, but the key does not exist until the handshake completes, so the **first** request on every new connection carries its body as cleartext alongside the Type 3 message; only the follow-ups on that keep-alive connection are sealed. For `winrig` the first body is the shell `Create`, not the script — but a host that answers an unencrypted message with an empty `HTTP 500` (`AllowUnencrypted=false`, the Windows default) will refuse that first request outright. Port 5986 avoids both the exposure and the refusal.
+Поверх открытого HTTP этот участок WinRM шифрован лишь частично. `winrm-rs` запечатывает SOAP-тела ключом сессии NTLM, но ключа не существует, пока не завершится рукопожатие, поэтому **первый** запрос на каждом новом соединении несёт своё тело открытым текстом рядом с сообщением Type 3; запечатаны только последующие запросы на этом keep-alive соединении. Для `winrig` первое тело — это shell `Create`, а не скрипт, — но хост, отвечающий на незашифрованное сообщение пустым `HTTP 500` (`AllowUnencrypted=false`, умолчание Windows), отвергнет этот первый запрос сразу. Порт 5986 снимает и экспозицию, и отказ.
 
-## Client setup
+## Настройка клиента
 
-There are two request shapes. With a **profile token**, the token is the secret and the identity comes from the profile — no `X-AD-User` is needed. With the **shared secret**, the request must carry `WINRIG_AUTH_TOKEN` and `X-AD-User`; the token is verified before `X-AD-User` is trusted, because that header is the key of the in-memory password and session cache.
+Есть две формы запроса. С **токеном профиля** секрет — это токен, а идентичность берётся из профиля, поэтому `X-AD-User` не нужен. С **общим секретом** запрос обязан нести `WINRIG_AUTH_TOKEN` и `X-AD-User`; токен проверяется прежде, чем `X-AD-User` получает доверие, потому что этот заголовок — ключ кэша паролей и сессий в памяти.
 
-`WINRIG_AUTH_TOKEN` is required only on the header path. `X-AD-Password` is optional at the HTTP layer but required to open a session unless a profile supplies the password: `winrig` does not request passwords through elicitation, because the MCP specification excludes secrets from it and protocol revision `2026-07-28` removes elicitation entirely (see `docs/adr/0006-password-header-and-confirmation.md`).
+`WINRIG_AUTH_TOKEN` обязателен только на пути по заголовкам. `X-AD-Password` необязателен на уровне HTTP, но нужен, чтобы открыть сессию, если пароль не даёт профиль: `winrig` не запрашивает пароли через elicitation, потому что спецификация MCP исключает из неё секреты, а ревизия протокола `2026-07-28` убирает elicitation целиком (см. `docs/adr/0006-password-header-and-confirmation.md`).
 
-The paths below are the global ones written by `--scope global`; with `--scope project` the same entry goes to the project file listed in Quick Start.
+Пути ниже — пользовательские, записываемые `--scope global`; при `--scope project` та же запись уходит в проектный файл, перечисленный в «Быстром старте».
 
 ### opencode (`~/.config/opencode/opencode.json`)
 
-Written by `setup --write-config opencode --scope global`; the token is referenced from a private file:
+Пишется `setup --write-config opencode --scope global`; токен подставляется из приватного файла:
 
 ```json
 {
@@ -266,7 +266,7 @@ Written by `setup --write-config opencode --scope global`; the token is referenc
 
 ### Claude Code
 
-Written by `setup --write-config claude-code --scope global` into the `mcpServers` block of `~/.claude.json`. The CLI equivalent:
+Пишется `setup --write-config claude-code --scope global` в блок `mcpServers` файла `~/.claude.json`. Эквивалент через CLI:
 
 ```bash
 claude mcp add winrig -- /path/to/winrig stdio --profile corp
@@ -274,7 +274,7 @@ claude mcp add winrig -- /path/to/winrig stdio --profile corp
 
 ### Codex (`~/.codex/config.toml`)
 
-Written by `setup --write-config codex --scope global`:
+Пишется `setup --write-config codex --scope global`:
 
 ```toml
 [mcp_servers.winrig]
@@ -282,28 +282,28 @@ command = "/path/to/winrig"
 args = ["stdio", "--profile", "corp"]
 
 [mcp_servers.winrig.env]
-WINRIG_TOKEN = "<token from setup>"
+WINRIG_TOKEN = "<токен из setup>"
 ```
 
 ### Cursor (`~/.cursor/mcp.json`)
 
-Written by `setup --write-config cursor --scope global` into the `mcpServers` block. The HTTP shape works the same way for any client: point it at the streamable HTTP endpoint and pass `Authorization: Bearer <token>`.
+Пишется `setup --write-config cursor --scope global` в блок `mcpServers`. HTTP-форма работает одинаково для любого клиента: направьте его на streamable-HTTP эндпоинт и передайте `Authorization: Bearer <token>`.
 
-Any other MCP client works the same way: either use the stdio definition printed by `setup`, or point it at the HTTP endpoint with the profile token as the bearer.
+Любой другой MCP-клиент работает так же: либо используйте stdio-определение, напечатанное `setup`, либо направьте клиент на HTTP-эндпоинт с токеном профиля в качестве bearer.
 
-### Confirmations on clients without elicitation
+### Подтверждения на клиентах без elicitation
 
-Mutating tools confirm through MCP elicitation and **fail closed** when the client cannot prompt. opencode 1.18.31 announces only `roots`, so write tools refuse to run there and say so instead of acting unconfirmed; read-only tools work normally. The replacement channel (`input_required`, SEP-2322) is tracked in `docs/ROADMAP.md` and `docs/QUESTIONS.md` Q-10.
+Модифицирующие инструменты подтверждаются через MCP elicitation и **отказывают (fail-closed)**, когда клиент не может спросить. opencode 1.18.31 объявляет только `roots`, поэтому инструменты записи отказываются там работать и говорят об этом, вместо того чтобы действовать без подтверждения; инструменты только для чтения работают нормально. Замена каналу (`input_required`, SEP-2322) отслеживается в `docs/ROADMAP.md` и `docs/QUESTIONS.md` Q-10.
 
-## Logging
+## Журналирование
 
-`WINRIG_LOG_DIR` holds `winrig.log` and the audit trail `winrig-audit.log`; the directory is created `0700` and the files `0600`, reapplied on every rotation.
+`WINRIG_LOG_DIR` хранит `winrig.log` и аудит `winrig-audit.log`; каталог создаётся `0700`, файлы `0600`, права переприменяются при каждой ротации.
 
-The audit trail records each call with the PowerShell text and an excerpt of its output. Because that output can contain file contents, registry data, account lists and certificates, only the first `WINRIG_AUDIT_MAX_OUTPUT_CHARS` characters default to being written — the agent still receives the full response. Set `WINRIG_AUDIT_LOG_BODY=0` to log only call metadata.
+Аудит записывает каждый вызов с текстом PowerShell и выдержкой из его вывода. Поскольку в этом выводе могут быть содержимое файлов, данные реестра, списки учётных записей и сертификаты, по умолчанию пишутся только первые `WINRIG_AUDIT_MAX_OUTPUT_CHARS` символов — агент всё равно получает полный ответ. Задайте `WINRIG_AUDIT_LOG_BODY=0`, чтобы писать только метаданные вызова.
 
-In stdio mode stdout carries only JSON-RPC: the server log and audit go to stderr and to the profile's state directory, so a client that runs `winrig stdio` never sees log lines mixed into the protocol.
+В stdio-режиме stdout несёт только JSON-RPC: журнал сервера и аудит уходят в stderr и в каталог состояния профиля, поэтому клиент, запускающий `winrig stdio`, никогда не видит строк журнала, подмешанных в протокол.
 
-## Development
+## Разработка
 
 ```bash
 cargo test
@@ -313,17 +313,17 @@ cargo deny check
 cargo build --release
 ```
 
-The pinned toolchain lives in `rust-toolchain.toml`; CI runs the same commands, plus `cargo-audit` and a build on the MSRV (`rust-version` in `Cargo.toml`). There is no live Windows host in the development environment. Tests run against a fake `WinRmTransport` that records the commands it is given, and never touch the network; `tests/http_gate.rs` exercises the real axum+rmcp `/mcp` wiring, and `tests/stdio_mode.rs` runs the real binary over stdio. The project canon, requirements, ADRs and review cycle live in `AGENTS.md` and `docs/`.
+Закреплённый тулчейн лежит в `rust-toolchain.toml`; CI выполняет те же команды плюс `cargo-audit` и сборку на MSRV (`rust-version` в `Cargo.toml`). Живого Windows-хоста в окружении разработки нет. Тесты работают на фиктивном `WinRmTransport`, который записывает переданные ему команды, и сети не касаются; `tests/http_gate.rs` проверяет реальную обвязку axum+rmcp `/mcp`, а `tests/stdio_mode.rs` запускает настоящий бинарь поверх stdio. Канон проекта, требования, ADR и цикл ревью живут в `AGENTS.md` и `docs/`.
 
-### Releases
+### Релизы
 
-A release is cut by bumping `version` in `Cargo.toml`, adding a matching entry to `CHANGELOG.md`, and pushing a `vX.Y.Z` tag. The tag drives `.github/workflows/release.yml`: a GitHub Release is created from the changelog entry, and the binary is built for five targets and attached with a `sha256` checksum. The workflow refuses to run if the tag and the `Cargo.toml` version disagree.
+Релиз ставится так: поднять `version` в `Cargo.toml`, добавить соответствующую запись в `CHANGELOG.md` и отправить тег `vX.Y.Z`. Тег запускает `.github/workflows/release.yml`: GitHub Release создаётся из записи changelog, а бинарь собирается под пять таргетов и прикладывается с контрольной суммой `sha256`. Workflow отказывает, если тег и версия в `Cargo.toml` расходятся.
 
-| Workflow | Trigger | What it does |
+| Workflow | Триггер | Что делает |
 |----------|---------|--------------|
-| `ci.yml` | every push and pull request | `fmt`, `clippy`, `test`, release build, MSRV build, `cargo-audit`, `cargo-deny` |
-| `release.yml` | a `vX.Y.Z` tag | writes the GitHub Release and uploads the platform archives with checksums |
+| `ci.yml` | каждый push и pull request | `fmt`, `clippy`, `test`, release-сборка, сборка на MSRV, `cargo-audit`, `cargo-deny` |
+| `release.yml` | тег `vX.Y.Z` | пишет GitHub Release и загружает архивы платформ с контрольными суммами |
 
-## License
+## Лицензия
 
-MIT — see [LICENSE](LICENSE).
+MIT — см. [LICENSE](LICENSE).

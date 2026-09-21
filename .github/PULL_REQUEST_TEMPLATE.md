@@ -1,25 +1,25 @@
-## What changes
+## Что меняется
 
-<!-- A short description of the change and why it is needed. -->
+<!-- Короткое описание правки и того, зачем она нужна. -->
 
-## Which rule or requirement it serves
+## Какому правилу или требованию служит
 
-<!-- A Domain Rule (DR-*), a requirement (TR-*), an ADR, or a roadmap slice. -->
+<!-- Доменное правило (DR-*), требование (TR-*), ADR или срез дорожной карты. -->
 
-## How it was verified
+## Как проверено
 
 - [ ] `cargo fmt --check`
 - [ ] `cargo clippy --all-targets -- -D warnings`
 - [ ] `cargo test`
 - [ ] `cargo deny check`
 
-<!-- For a change that needs a live Windows host to exercise fully, say so and how it was covered otherwise. -->
+<!-- Для правки, которую полностью проверяет только живой Windows-хост, скажите об этом и как она покрыта иначе. -->
 
-## Checklist
+## Чек-лист
 
-- [ ] The change is one concern, not several.
-- [ ] A test that failed first now passes (`AGENTS.md` §6).
-- [ ] No secret, password or token appears in a log, an audit entry, a reply, a config or this diff.
-- [ ] User-visible behaviour is reflected in `README.md` and `docs/REQUIREMENTS.md`.
-- [ ] Documents do not soft-wrap paragraphs (`AGENTS.md` §9).
-- [ ] A decision rather than an implementation is recorded as an ADR, not only as code.
+- [ ] Правка — одна тема, а не несколько.
+- [ ] Тест, который падал, теперь проходит (`AGENTS.md` §6).
+- [ ] Ни один секрет, пароль или токен не появляется в журнале, аудите, ответе, конфигурации или этом диффе.
+- [ ] Видимое пользователю поведение отражено в `README.md` и `docs/REQUIREMENTS.md`.
+- [ ] Абзацы в документах не перенесены по ширине (`AGENTS.md` §9).
+- [ ] Решение, а не реализация, записано как ADR, а не только как код.

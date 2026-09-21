@@ -1,18 +1,18 @@
-# Contributing to winrig
+# Как внести вклад в winrig
 
-Thanks for taking the time to look. This project holds an AD password and executes commands on remote hosts, so its rules are strict on purpose. Read `AGENTS.md` first — it is the repository canon, and the documents win over the code.
+Спасибо, что нашли время. Этот проект держит пароль AD и исполняет команды на удалённых хостах, поэтому его правила намеренно строги. Сначала прочитайте `AGENTS.md` — это канон репозитория, и при расхождении документы важнее кода.
 
-This file is the short version for a human contributor. `docs/IMPLEMENTATION_CYCLE.md` describes the slice cycle, the subagent brief and the reviewer checklist used inside the project.
+Этот файл — краткая версия для человека со стороны. `docs/IMPLEMENTATION_CYCLE.md` описывает цикл среза, пакет субагенту и чек-лист ревьюера, принятые внутри проекта.
 
-## Before you start
+## Перед началом
 
-Open an issue before writing a large change. A new tool, a new external system, a new status or a new channel is introduced **only through an ADR** (`docs/adr/`). If your change fits an existing decision, say which one in the issue.
+Откройте issue, прежде чем писать большую правку. Новый инструмент, новая внешняя система, новый статус или канал вводятся **только через ADR** (`docs/adr/`). Если ваша правка укладывается в уже принятое решение, назовите его в issue.
 
-Small fixes — a bug, a test, a documentation correction — need no prior issue.
+Мелкие исправления — баг, тест, поправка документации — issue заранее не требуют.
 
-## Build and test
+## Сборка и проверки
 
-The toolchain is pinned in `rust-toolchain.toml`; `rustup` installs it on first use.
+Тулчейн закреплён в `rust-toolchain.toml`; `rustup` поставит его при первом запуске.
 
 ```bash
 cargo build
@@ -22,23 +22,23 @@ cargo fmt --check
 cargo deny check
 ```
 
-All five must be green before a commit. There is no live Windows host in the development environment: tests run against a fake `WinRmTransport` and never touch the network. A change that can only be exercised against a real host must not be the only thing covering a Domain Rule.
+Все пять обязаны быть зелёными до коммита. Живого Windows-хоста в окружении разработки нет: тесты работают на фиктивном `WinRmTransport` и сети не касаются. Правка, которую можно проверить только на живом хосте, не может быть единственным покрытием доменного правила.
 
-## The rules that are not negotiable
+## Правила, которые не обсуждаются
 
-These come from `AGENTS.md` §3 and `docs/REQUIREMENTS.md`. A pull request that breaks one is not merged, however useful the feature.
+Они следуют из `AGENTS.md` §3 и `docs/REQUIREMENTS.md`. Pull request, нарушающий их, не вливается, сколь бы полезна ни была возможность.
 
-1. **Test first.** Add the test that fails, then the code that makes it pass.
-2. **A secret never reaches disk or a reply.** Not a log, not the audit trail, not a tool response, not a config, not a commit (`DR-4`).
-3. **Verify the secret before trusting anything.** Identity is established per request, never inherited from the MCP session (`DR-1`, `DR-2`).
-4. **A modification is confirmed or it does not run.** When the client cannot prompt, the call fails closed (`DR-5`).
-5. **No command-line injection.** A value from an argument is passed as data, never concatenated into PowerShell.
-6. **Locale independence.** A PowerShell command must not depend on the host's language; format in code, not in the shell.
-7. **One line per paragraph.** Documents do not wrap at a column width — a soft-wrapped paragraph is diff noise (`AGENTS.md` §9).
+1. **Сначала тест.** Добавьте падающий тест, затем код, который его делает зелёным.
+2. **Секрет не попадает на диск и в ответ.** Ни в журнал, ни в аудит, ни в ответ инструмента, ни в конфигурацию, ни в коммит (`DR-4`).
+3. **Проверьте секрет прежде, чем доверять чему-либо.** Идентичность устанавливается на каждый запрос и никогда не наследуется из MCP-сессии (`DR-1`, `DR-2`).
+4. **Модификация подтверждена либо не выполняется.** Когда клиент не может спросить, вызов отказывает (fail-closed) (`DR-5`).
+5. **Никакой инъекции в командную строку.** Значение из аргумента передаётся как данные и никогда не склеивается с PowerShell.
+6. **Независимость от локали.** PowerShell-команда не должна зависеть от языка хоста; форматируйте в коде, а не в оболочке.
+7. **Один абзац — одна строка.** Документы не переносятся по ширине столбца: мягкий перенос абзаца — это diff-шум (`AGENTS.md` §9).
 
-## Commits
+## Коммиты
 
-Conventional commits, one logical change per commit. Documentation goes in its own commit with a `docs:` prefix.
+Conventional-commit, одна логическая правка на коммит. Документация идёт отдельным коммитом с префиксом `docs:`.
 
 ```
 feat: add get_ad_object for a single directory entry
@@ -47,16 +47,16 @@ test: pin down the parity guard in hex_decode
 docs: decide Active Directory and record slices W19-W21
 ```
 
-Do not add `Co-Authored-By` trailers or generated-by footers.
+Не добавляйте трейлеры `Co-Authored-By` и подписи о генерации.
 
 ## Pull requests
 
-- One concern per pull request.
-- Run the full check set above; a red run is not ready for review.
-- Describe what changes, which Domain Rule or requirement it serves, and how it was verified.
-- If the change is user-visible, update `README.md` and `docs/REQUIREMENTS.md` in the same branch.
-- If it is a decision rather than an implementation, add an ADR instead of code.
+- Одна тема на pull request.
+- Прогоните полный набор проверок выше; красный прогон не готов к ревью.
+- Опишите, что меняется, какому доменному правилу или требованию служит и как проверено.
+- Если правка видна пользователю, обновите `README.md` и `docs/REQUIREMENTS.md` в той же ветке.
+- Если это решение, а не реализация, добавьте ADR, а не код.
 
-## Reporting a security issue
+## Как сообщить об уязвимости
 
-Do not open a public issue — follow `SECURITY.md`.
+Не открывайте публичный issue — следуйте `SECURITY.md`.

@@ -1,7 +1,7 @@
 version: 2
 updates:
   # Rust-зависимости. Обновления приходят отдельными PR и проходят полный
-  # прогон (fmt, clippy, test, deny) прежде чем попасть в main.
+  # прогон (fmt, clippy, test, deny), прежде чем попасть в main.
   - package-ecosystem: cargo
     directory: /
     schedule:

@@ -1,49 +1,49 @@
-name: Bug report
-description: Something behaves differently from the documentation
+name: Сообщение об ошибке
+description: Поведение расходится с документацией
 title: "[Bug]: "
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for the report. Do not paste secrets: replace passwords and tokens with placeholders.
-        A security issue does not belong here — follow [SECURITY.md](https://github.com/fgbm/winrig/blob/main/SECURITY.md) instead.
+        Спасибо за сообщение. Не вставляйте секреты: заменяйте пароли и токены на плейсхолдеры.
+        Уязвимости сюда не относятся — следуйте [SECURITY.md](https://github.com/fgbm/winrig/blob/main/SECURITY.md).
   - type: textarea
     id: observed
     attributes:
-      label: What happens
-      description: The observed behaviour, including the tool name and the reply the agent got.
+      label: Что происходит
+      description: Наблюдаемое поведение, включая имя инструмента и ответ, который получил агент.
     validations:
       required: true
   - type: textarea
     id: expected
     attributes:
-      label: What you expected
-      description: What the README or docs/REQUIREMENTS.md says should happen. Quote the line if you can.
+      label: Что вы ожидали
+      description: Что, по README или docs/REQUIREMENTS.md, должно происходить. Приведите строку, если можете.
     validations:
       required: true
   - type: textarea
     id: reproduction
     attributes:
-      label: Reproduction
-      description: The smallest sequence that triggers it. Secrets replaced by placeholders.
+      label: Воспроизведение
+      description: Минимальная последовательность, которая приводит к ошибке. Секреты заменены на плейсхолдеры.
       placeholder: |
         1. winrig setup corp --user 'DOMAIN\user'
         2. winrig serve --profile corp
-        3. call tool X with ...
+        3. вызвать инструмент X с ...
     validations:
       required: true
   - type: input
     id: version
     attributes:
-      label: Version
-      description: A release tag, or the output of `winrig --version`.
+      label: Версия
+      description: Тег релиза или вывод `winrig --version`.
     validations:
       required: true
   - type: dropdown
     id: mode
     attributes:
-      label: Run mode
+      label: Режим запуска
       options:
         - stdio
         - serve (HTTP)
@@ -52,33 +52,33 @@ body:
   - type: input
     id: client
     attributes:
-      label: MCP client and version
+      label: MCP-клиент и версия
       placeholder: opencode 1.18.31, Claude Code 2.x, ...
     validations:
       required: false
   - type: input
     id: platform
     attributes:
-      label: Platform
-      description: The OS winrig runs on, and the Windows host version if it matters.
+      label: Платформа
+      description: ОС, на которой работает winrig, и версия Windows-хоста, если это важно.
     validations:
       required: true
   - type: textarea
     id: logs
     attributes:
-      label: Logs
-      description: Relevant lines from winrig.log or the audit trail, with secrets redacted.
+      label: Журналы
+      description: Относящиеся к делу строки из winrig.log или аудита, с вырезанными секретами.
       render: text
     validations:
       required: false
   - type: checkboxes
     id: checklist
     attributes:
-      label: Checklist
+      label: Чек-лист
       options:
-        - label: I checked this against the current README and docs/REQUIREMENTS.md.
+        - label: Я сверился с текущим README и docs/REQUIREMENTS.md.
           required: true
-        - label: This is not a security report (those go through SECURITY.md).
+        - label: Это не сообщение об уязвимости (те идут через SECURITY.md).
           required: true
-        - label: Secrets, passwords and tokens are redacted from everything above.
+        - label: Секреты, пароли и токены вырезаны из всего выше.
           required: true

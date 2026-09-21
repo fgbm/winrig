@@ -1,55 +1,55 @@
-name: Feature request
-description: Propose a new tool, configuration option or capability
+name: Предложение возможности
+description: Новый инструмент, параметр конфигурации или способность
 title: "[Feature]: "
 labels: ["enhancement"]
 body:
   - type: markdown
     attributes:
       value: |
-        A new tool, external system, status or channel is introduced **only through an ADR** (`docs/adr/`).
-        Describe the need here first; if it is accepted, the design is recorded before the code is written.
+        Новый инструмент, внешняя система, статус или канал вводятся **только через ADR** (`docs/adr/`).
+        Сначала опишите потребность здесь; если она принята, решение записывается до того, как написан код.
   - type: textarea
     id: problem
     attributes:
-      label: The problem
-      description: What an operator or agent cannot do today. Describe the need, not the implementation.
+      label: Задача
+      description: Что оператор или агент не может сделать сегодня. Опишите потребность, а не реализацию.
     validations:
       required: true
   - type: textarea
     id: proposal
     attributes:
-      label: Proposed capability
-      description: The tool, option or behaviour you have in mind. Say whether it reads or modifies.
+      label: Предлагаемая возможность
+      description: Инструмент, параметр или поведение, которые вы имеете в виду. Скажите, читает он или изменяет.
     validations:
       required: true
   - type: textarea
     id: risk
     attributes:
-      label: Risk and confirmation
-      description: If it modifies anything, what must it refuse, and how should confirmation work?
+      label: Риск и подтверждение
+      description: Если возможность что-то изменяет, от чего она обязана отказать и как должно работать подтверждение?
     validations:
       required: false
   - type: textarea
     id: alternatives
     attributes:
-      label: Alternatives considered
-      description: What you tried instead, or why an existing tool does not cover this.
+      label: Рассмотренные альтернативы
+      description: Что вы пробовали вместо этого или почему существующий инструмент не покрывает задачу.
     validations:
       required: false
   - type: textarea
     id: documents
     attributes:
-      label: Related documents
-      description: An existing ADR, a requirement (TR-*), or a roadmap slice this fits.
-      placeholder: ADR-0014, TR-AD-01, slice W19
+      label: Связанные документы
+      description: Существующий ADR, требование (TR-*), срез дорожной карты, к которому это относится.
+      placeholder: ADR-0014, TR-AD-01, срез W19
     validations:
       required: false
   - type: checkboxes
     id: checklist
     attributes:
-      label: Checklist
+      label: Чек-лист
       options:
-        - label: I searched existing issues and ADRs for this.
+        - label: Я поискал это среди существующих issue и ADR.
           required: true
-        - label: I understand a new capability needs an ADR before implementation.
+        - label: Я понимаю, что новая возможность требует ADR до реализации.
           required: true

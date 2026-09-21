@@ -16,16 +16,37 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  verify:
+    name: Verify tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      # Отказ до создания релиза: версия в Cargo.toml и тег поднимаются одним
+      # коммитом (AGENTS.md §7), и расхождение — ошибка подготовки, а не повод
+      # выпустить релиз с чужим номером.
+      - name: Tag must match Cargo.toml
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          manifest=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "$tag" != "$manifest" ]; then
+            echo "tag v$tag does not match Cargo.toml version $manifest" >&2
+            exit 1
+          fi
+
   create-release:
     name: Create release
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v7
-      # Версия берётся из тега, текст — из записи CHANGELOG с той же версией.
-      # Отсутствие записи — ошибка, а не пустой релиз: версию и CHANGELOG
-      # поднимают одним коммитом.
+      # Текст берётся из записи CHANGELOG с версией тега; `branch: main`
+      # отвергает тег на коммите вне main. Каждый коммит main уже прошёл CI,
+      # поэтому к моменту тега качество проверено.
       - uses: taiki-e/create-gh-release-action@v1
         with:
           changelog: CHANGELOG.md
@@ -59,15 +80,6 @@ jobs:
             os: windows-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Verify tag matches Cargo.toml
-        shell: bash
-        run: |
-          tag="${GITHUB_REF_NAME#v}"
-          manifest=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          if [ "$tag" != "$manifest" ]; then
-            echo "tag v$tag does not match Cargo.toml version $manifest" >&2
-            exit 1
-          fi
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: winrig

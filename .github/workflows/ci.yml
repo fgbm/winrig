@@ -16,7 +16,7 @@ jobs:
     name: fmt, clippy, test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
@@ -33,7 +33,7 @@ jobs:
     name: MSRV (rust-version in Cargo.toml)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Read rust-version
         id: msrv
         run: |
@@ -51,16 +51,21 @@ jobs:
     name: cargo-audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
+      - uses: actions/checkout@v7
+      # rustsec/audit-check@v2 закреплён на Node 20, снятом с поддержки, а
+      # релиза на Node 24 нет. Бинарь cargo-audit ставится тем же
+      # install-action, что и остальные инструменты, и запускается напрямую.
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      - name: Check advisories
+        run: cargo audit
 
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check

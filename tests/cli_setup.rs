@@ -20,6 +20,18 @@ fn winrig() -> &'static str {
     env!("CARGO_BIN_EXE_winrig")
 }
 
+/// Изолирует дочерний процесс от конфигов клиента на машине сборки.
+///
+/// `global_config_path` по XDG-спеке отдаёт `XDG_CONFIG_HOME` приоритет над
+/// `HOME`, поэтому один только `HOME` не герметичен: на раннере CI переменная
+/// задана, и `setup --write-config --scope global` пишет мимо временного
+/// каталога теста. Без этого тест проходил локально и падал в CI.
+fn isolated_home(command: &mut Command, home: &std::path::Path) {
+    command
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"));
+}
+
 /// AC-PRF-01/21: `setup` создаёт профиль, печатает токен и не печатает пароль.
 #[test]
 fn setup_prints_token_once_and_never_the_password() {
@@ -175,7 +187,8 @@ fn write_config_preserves_other_entries() {
     )
     .expect("write config");
 
-    let output = Command::new(winrig())
+    let mut command = Command::new(winrig());
+    command
         .arg("setup")
         .arg("corp")
         .arg("--user")
@@ -185,8 +198,9 @@ fn write_config_preserves_other_entries() {
         .arg("--scope")
         .arg("global")
         .env("WINRIG_PROFILE_DIR", dir.join("profiles"))
-        .env("WINRIG_STATE_DIR", dir.join("state"))
-        .env("HOME", &home)
+        .env("WINRIG_STATE_DIR", dir.join("state"));
+    isolated_home(&mut command, &home);
+    let output = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -227,7 +241,8 @@ fn write_config_project_writes_to_git_root() {
     std::fs::create_dir_all(repo.join(".git")).expect("git dir");
     std::fs::create_dir_all(&home).expect("home");
 
-    let output = Command::new(winrig())
+    let mut command = Command::new(winrig());
+    command
         .arg("setup")
         .arg("corp")
         .arg("--user")
@@ -238,8 +253,9 @@ fn write_config_project_writes_to_git_root() {
         .arg("project")
         .current_dir(&nested)
         .env("WINRIG_PROFILE_DIR", dir.join("profiles"))
-        .env("WINRIG_STATE_DIR", &state)
-        .env("HOME", &home)
+        .env("WINRIG_STATE_DIR", &state);
+    isolated_home(&mut command, &home);
+    let output = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -287,7 +303,8 @@ fn write_config_without_scope_refuses_non_interactive() {
     let dir = temp_dir("writeconfig-noscope");
     let home = dir.join("home");
     std::fs::create_dir_all(&home).expect("home");
-    let output = Command::new(winrig())
+    let mut command = Command::new(winrig());
+    command
         .arg("setup")
         .arg("corp")
         .arg("--user")
@@ -295,9 +312,9 @@ fn write_config_without_scope_refuses_non_interactive() {
         .arg("--write-config")
         .arg("opencode")
         .env("WINRIG_PROFILE_DIR", dir.join("profiles"))
-        .env("WINRIG_STATE_DIR", dir.join("state"))
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("WINRIG_STATE_DIR", dir.join("state"));
+    isolated_home(&mut command, &home);
+    let output = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -358,7 +375,8 @@ fn write_config_claude_project_warns_about_commit() {
     std::fs::create_dir_all(repo.join(".git")).expect("git dir");
     std::fs::create_dir_all(dir.join("home")).expect("home");
 
-    let output = Command::new(winrig())
+    let mut command = Command::new(winrig());
+    command
         .arg("setup")
         .arg("corp")
         .arg("--user")
@@ -369,8 +387,9 @@ fn write_config_claude_project_warns_about_commit() {
         .arg("project")
         .current_dir(&repo)
         .env("WINRIG_PROFILE_DIR", dir.join("profiles"))
-        .env("WINRIG_STATE_DIR", dir.join("state"))
-        .env("HOME", dir.join("home"))
+        .env("WINRIG_STATE_DIR", dir.join("state"));
+    isolated_home(&mut command, &dir.join("home"));
+    let output = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

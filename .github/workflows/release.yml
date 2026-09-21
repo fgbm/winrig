@@ -1,0 +1,81 @@
+name: Release
+
+# Тег `vX.Y.Z` — единственный вход в релиз (AGENTS.md §7). Работа делится на две
+# части: create-release берёт текст из CHANGELOG.md и создаёт GitHub Release,
+# upload-assets собирает под каждый таргет и прикладывает архив с чексуммой.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create-release:
+    name: Create release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      # Версия берётся из тега, текст — из записи CHANGELOG с той же версией.
+      # Отсутствие записи — ошибка, а не пустой релиз: версию и CHANGELOG
+      # поднимают одним коммитом.
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          changelog: CHANGELOG.md
+          branch: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  upload-assets:
+    name: Build ${{ matrix.target }}
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: musl даёт статический бинарь без glibc-зависимости. AWS-LC
+          # (`aws-lc-sys`) и ring несут C-код, поэтому сборка идёт через cross —
+          # в образе есть musl-компилятор и cmake, которых нет на голом раннере.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          # macOS и Windows собираются нативно; Intel-лейбл закреплён явно,
+          # потому что macos-latest с macos-14 — это arm64.
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify tag matches Cargo.toml
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          manifest=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "$tag" != "$manifest" ]; then
+            echo "tag v$tag does not match Cargo.toml version $manifest" >&2
+            exit 1
+          fi
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: winrig
+          target: ${{ matrix.target }}
+          archive: winrig-$tag-$target
+          locked: true
+          checksum: sha256
+          # В архив кладутся лицензия и краткое описание, чтобы распакованный
+          # набор был самодостаточен.
+          include: LICENSE,README.md
+          token: ${{ secrets.GITHUB_TOKEN }}

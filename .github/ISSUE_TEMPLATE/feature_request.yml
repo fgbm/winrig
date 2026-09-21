@@ -1,0 +1,55 @@
+name: Feature request
+description: Propose a new tool, configuration option or capability
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A new tool, external system, status or channel is introduced **only through an ADR** (`docs/adr/`).
+        Describe the need here first; if it is accepted, the design is recorded before the code is written.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What an operator or agent cannot do today. Describe the need, not the implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed capability
+      description: The tool, option or behaviour you have in mind. Say whether it reads or modifies.
+    validations:
+      required: true
+  - type: textarea
+    id: risk
+    attributes:
+      label: Risk and confirmation
+      description: If it modifies anything, what must it refuse, and how should confirmation work?
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What you tried instead, or why an existing tool does not cover this.
+    validations:
+      required: false
+  - type: textarea
+    id: documents
+    attributes:
+      label: Related documents
+      description: An existing ADR, a requirement (TR-*), or a roadmap slice this fits.
+      placeholder: ADR-0014, TR-AD-01, slice W19
+    validations:
+      required: false
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and ADRs for this.
+          required: true
+        - label: I understand a new capability needs an ADR before implementation.
+          required: true

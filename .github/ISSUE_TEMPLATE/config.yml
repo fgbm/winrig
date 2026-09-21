@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/fgbm/winrig/security/advisories/new
+    about: Do not open a public issue for a security report — use the private advisory channel. See SECURITY.md.
+  - name: Question or design discussion
+    url: https://github.com/fgbm/winrig/discussions
+    about: Ask about usage, deployment or a design decision before filing an issue.

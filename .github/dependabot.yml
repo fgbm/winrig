@@ -1,0 +1,28 @@
+version: 2
+updates:
+  # Rust-зависимости. Обновления приходят отдельными PR и проходят полный
+  # прогон (fmt, clippy, test, deny) прежде чем попасть в main.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build"
+    groups:
+      # Один PR на все патч-версии: они почти всегда безопасны и не создают
+      # очередь из двадцати веток.
+      patch-updates:
+        applies-to: version-updates
+        update-types: ["patch"]
+
+  # Версии actions в workflow: закреплены мажором, обновляются вручную или
+  # этим PR.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "ci"

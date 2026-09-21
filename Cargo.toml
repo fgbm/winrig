@@ -1,0 +1,92 @@
+[package]
+name = "winrig"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "MCP server for remote Windows administration over WinRM/NTLM"
+license = "MIT"
+repository = "https://github.com/fgbm/winrig"
+homepage = "https://github.com/fgbm/winrig"
+readme = "README.md"
+keywords = ["mcp", "winrm", "windows", "ntlm", "remote-administration"]
+categories = ["command-line-utilities", "network-programming"]
+
+[[bin]]
+name = "winrig"
+path = "src/main.rs"
+
+[lib]
+name = "winrig"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime and HTTP transport for the MCP endpoint.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }
+axum = "0.8"
+# Official Rust SDK for the Model Context Protocol (streamable HTTP server).
+rmcp = { version = "3.4.0", features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+    "transport-io",
+    "elicitation",
+] }
+# WinRM (WS-Management) client with NTLMv2 authentication.
+# 1.2.x needs rustc 1.98 (`slice::as_chunks`), which is stable since 1.98.0;
+# that is why this crate's own MSRV is 1.98. Worth the bump: 1.2.x escapes the
+# ResourceURI in the SOAP header, stops leaking server-side shells on Delete
+# and on a failed disconnect, and stamps a `wsmv:SessionId` on every request.
+winrm-rs = "1.2.2"
+# Serialization for config, audit and tool replies.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Structured logging and the audit trail.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Typed errors.
+thiserror = "2"
+# dyn-compatible async trait for the transport seam.
+async-trait = "0.1"
+# SHA-256 for the rejected-password digest (DR-4).
+sha2 = "0.10"
+# Base64 for chunked file writes: the payload rides inside a PowerShell string
+# and the WinRS command line is ~8191 chars (ADR-0013).
+base64 = "0.22"
+# Constant-time comparison for the shared-secret gate (DR-1).
+subtle = "2"
+http = "1.5.0"
+schemars = "1"
+tokio-util = "0.7.19"
+# CLI: подкоманды и ввод пароля без эха.
+clap = { version = "4.6", features = ["derive"] }
+rpassword = "7.5"
+# Профиль: аутентифицированное шифрование пароля ключом из токена (ADR-0009).
+chacha20poly1305 = "0.11"
+zeroize = "1.9"
+rand = "0.10"
+# Кроссплатформенные каталоги конфигурации и состояния (ADR-0009).
+# `directories` отвергнут cargo-deny: тянет MPL-2.0 `option-ext`.
+platform-dirs = "0.3"
+hkdf = "0.12"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+
+# Один статический бинарь без контейнера: агрессивная оптимизация размера
+# уместна, память и так мала.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
+[dev-dependencies]
+tower = { version = "0.5.3", features = ["util"] }
+# Только для тестов: пара транспортов в памяти (`tokio::io::duplex`) и роль
+# клиента MCP, чтобы прогнать вызов инструмента и канал подтверждения (DR-5).
+# Резолвер edition 2024 не подмешивает эти фичи в release-сборку бинаря.
+tokio = { version = "1", features = ["io-util"] }
+rmcp = { version = "3.4.0", features = ["client"] }

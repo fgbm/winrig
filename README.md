@@ -118,8 +118,8 @@ Prebuilt binaries are attached to every release for Linux, macOS and Windows, wi
 ```bash
 # Change the version and target to match your platform.
 curl -LO https://github.com/fgbm/winrig/releases/latest/download/winrig-v0.1.0-x86_64-unknown-linux-musl.tar.gz
-curl -LO https://github.com/fgbm/winrig/releases/latest/download/winrig-v0.1.0-x86_64-unknown-linux-musl.tar.gz.sha256
-sha256sum -c winrig-v0.1.0-x86_64-unknown-linux-musl.tar.gz.sha256
+curl -LO https://github.com/fgbm/winrig/releases/latest/download/winrig-v0.1.0-x86_64-unknown-linux-musl.sha256
+sha256sum -c winrig-v0.1.0-x86_64-unknown-linux-musl.sha256
 tar xzf winrig-v0.1.0-x86_64-unknown-linux-musl.tar.gz
 install -m 0755 winrig ~/.local/bin/winrig
 ```

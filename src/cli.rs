@@ -165,33 +165,24 @@ pub fn parse_client(value: &str) -> Result<Client, String> {
 
 /// Разбирает `--allowed-hosts` в значение `WINRIG_ALLOWED_HOSTS` (TR-PRF-17).
 ///
-/// Грамматика та же, что у переменной (ADR-0015 §6–7): имя или IP, элемент с
-/// ведущей `.` как суффикс, либо `*` отдельным элементом. Список приводится к
-/// нижнему регистру без пробелов, как его читает сервер.
+/// Грамматика та же, что у переменной (`policy::parse_allowed_hosts`). Флаг,
+/// заданный без единого хоста, — ошибка: без флага сервер и так разрешает
+/// только loopback.
 ///
 /// # Errors
 ///
 /// Текст ошибки, называющий флаг и ожидаемую форму.
 pub fn parse_allowed_hosts(value: &str) -> Result<String, String> {
-    let refuse = || {
+    let refuse = |detail: String| {
         format!(
-            "invalid --allowed-hosts {value:?}; expected a comma-separated list of host names \
-             or IPs, '.suffix' entries, or '*' for any host"
+            "invalid --allowed-hosts {value:?}: {detail}; expected {}",
+            crate::policy::ALLOWED_HOSTS_FORM
         )
     };
-    let mut entries = Vec::new();
-    for raw in value.split(',') {
-        let entry = raw.trim().to_ascii_lowercase();
-        let valid = entry == "*"
-            || (!entry.is_empty()
-                && entry != "."
-                && entry.chars().all(|c| {
-                    c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | ':' | '[' | ']' | '_')
-                }));
-        if !valid {
-            return Err(refuse());
-        }
-        entries.push(entry);
+    let entries = crate::policy::parse_allowed_hosts(value)
+        .map_err(|entry| refuse(format!("entry {entry:?} is not valid")))?;
+    if entries.is_empty() {
+        return Err(refuse("no hosts given".to_owned()));
     }
     Ok(entries.join(","))
 }
@@ -223,20 +214,13 @@ mod tests {
             Ok("host1,.corp.example,127.0.0.1,[::1]")
         );
         assert_eq!(parse_allowed_hosts("*").as_deref(), Ok("*"));
+        assert_eq!(parse_allowed_hosts("a,,b").as_deref(), Ok("a,b"));
     }
 
     /// AC-PRF-68: неверный список отвергается с именем флага и формой.
     #[test]
     fn malformed_allowed_hosts_name_the_flag() {
-        for raw in [
-            "",
-            " , ",
-            "*.corp.example",
-            "host one",
-            "a,,b",
-            "host\\x",
-            ".",
-        ] {
+        for raw in ["", " , ", "*.corp.example", "host one", "host\\x", "."] {
             let error = parse_allowed_hosts(raw).expect_err(raw);
             assert!(error.contains("--allowed-hosts"), "{raw:?}: {error}");
         }

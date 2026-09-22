@@ -261,15 +261,20 @@ fn read_log_level(env: &Env, name: &str, default: LogLevel) -> Result<LogLevel, 
     })
 }
 
-fn read_allowed_hosts(env: &Env) -> Vec<String> {
-    match read(env, "WINRIG_ALLOWED_HOSTS") {
-        Some(raw) => raw
-            .split(',')
-            .map(|item| item.trim().to_ascii_lowercase())
-            .filter(|item| !item.is_empty())
-            .collect(),
-        None => Vec::new(),
-    }
+/// Список разрешённых хостов по грамматике `policy::parse_allowed_hosts`.
+///
+/// Неверный элемент — отказ старта (DR-8): иначе `*.corp.example` молча не
+/// разрешал бы ничего, и оператор не понял бы почему.
+fn read_allowed_hosts(env: &Env) -> Result<Vec<String>, ConfigError> {
+    let Some(raw) = read(env, "WINRIG_ALLOWED_HOSTS") else {
+        return Ok(Vec::new());
+    };
+    crate::policy::parse_allowed_hosts(&raw).map_err(|entry| {
+        ConfigError::new(format!(
+            "WINRIG_ALLOWED_HOSTS entry {entry:?} is invalid; expected {}",
+            crate::policy::ALLOWED_HOSTS_FORM
+        ))
+    })
 }
 
 fn load_auth_token(env: &Env) -> Option<String> {
@@ -419,7 +424,7 @@ pub fn load_config_from(env: &Env) -> Result<AppConfig, ConfigError> {
             Some(1),
             None,
         )?,
-        allowed_hosts: read_allowed_hosts(env),
+        allowed_hosts: read_allowed_hosts(env)?,
         allow_insecure_tls: read_bool(env, "WINRIG_ALLOW_INSECURE_TLS", false)?,
         audit_max_output_chars: read_uint(
             env,
@@ -660,10 +665,21 @@ mod tests {
     fn allowed_hosts_parsed_and_case_folded() {
         let env = source(&with(&[(
             "WINRIG_ALLOWED_HOSTS",
-            " HOST1 , *.Example.com ,host2,, ",
+            " HOST1 , .Example.com ,host2,, ",
         )]));
         let config = load_config_from(&env).expect("valid");
-        assert_eq!(config.allowed_hosts, ["host1", "*.example.com", "host2"]);
+        assert_eq!(config.allowed_hosts, ["host1", ".example.com", "host2"]);
+    }
+
+    /// AC-SEC05-6: неверный элемент списка хостов — отказ старта с именем
+    /// переменной и ожидаемой формой (DR-8).
+    #[test]
+    fn invalid_allowed_hosts_entry_refuses_startup() {
+        let env = source(&with(&[("WINRIG_ALLOWED_HOSTS", "host1,*.example.com")]));
+        let error = load_config_from(&env).expect_err("must fail").to_string();
+        assert!(error.contains("WINRIG_ALLOWED_HOSTS"), "{error}");
+        assert!(error.contains("*.example.com"), "{error}");
+        assert!(error.contains("'.suffix'"), "{error}");
     }
 
     #[test]

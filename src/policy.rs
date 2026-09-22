@@ -335,6 +335,40 @@ pub fn is_valid_host(host: &str) -> bool {
     host.parse::<std::net::IpAddr>().is_ok() || is_host_name(host)
 }
 
+/// Разбирает список разрешённых хостов (ADR-0015 §6–7, §9).
+///
+/// Одна грамматика для `WINRIG_ALLOWED_HOSTS` и `setup --allowed-hosts`:
+/// элементы через запятую, пустые пропускаются; элемент — `*`, суффикс с
+/// ведущей `.` или имя хоста, IP-адрес, IPv6 в скобках. Результат приведён к
+/// нижнему регистру без пробелов.
+///
+/// # Errors
+///
+/// Первый элемент, не подходящий под грамматику, — вызывающий называет в
+/// отказе свой источник (переменную или флаг).
+pub fn parse_allowed_hosts(raw: &str) -> Result<Vec<String>, String> {
+    let mut entries = Vec::new();
+    for item in raw.split(',') {
+        let entry = item.trim().to_lowercase();
+        if entry.is_empty() {
+            continue;
+        }
+        let valid = entry == ANY_HOST
+            || entry
+                .strip_prefix('.')
+                .map_or_else(|| is_valid_host(&entry), is_host_name);
+        if !valid {
+            return Err(item.trim().to_owned());
+        }
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+/// Ожидаемая форма списка хостов для текста отказа.
+pub const ALLOWED_HOSTS_FORM: &str =
+    "a comma-separated list of host names or IPs, '.suffix' entries, or '*' for any host";
+
 /// Решает, разрешён ли хост (Q-03, ADR-0015 §6–7).
 ///
 /// Строка, которая не является именем или IP, не разрешена никогда. Пустой
@@ -1035,6 +1069,31 @@ mod tests {
             "[fe80::1]",
         ] {
             assert!(host_allowed(host, &hosts(&["*"])), "{host:?}");
+        }
+    }
+
+    /// AC-SEC05-6: одна грамматика списка для переменной и флага `setup`.
+    #[test]
+    fn allowed_hosts_grammar() {
+        assert_eq!(
+            parse_allowed_hosts(" Host1 , .Corp.Example,,127.0.0.1,[::1],* ").expect("valid"),
+            ["host1", ".corp.example", "127.0.0.1", "[::1]", "*"]
+        );
+        assert!(parse_allowed_hosts(" , ").expect("valid").is_empty());
+        for bad in [
+            "*.corp.example",
+            "host one",
+            "host\\x",
+            ".",
+            "..corp",
+            "evil.com/.corp",
+            "a:80",
+        ] {
+            assert_eq!(
+                parse_allowed_hosts(&format!("ok,{bad}")),
+                Err(bad.to_owned()),
+                "{bad}"
+            );
         }
     }
 

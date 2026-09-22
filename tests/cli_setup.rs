@@ -719,3 +719,97 @@ fn probe_with_headers(port: u16, headers: &[(&str, &str)]) -> Option<u32> {
     }
     None
 }
+
+/// Запускает `setup corp` с паролем на stdin и дополнительными аргументами.
+fn run_setup(
+    dir: &std::path::Path,
+    home: &std::path::Path,
+    extra: &[&str],
+) -> std::process::Output {
+    let mut command = Command::new(winrig());
+    command
+        .arg("setup")
+        .arg("corp")
+        .arg("--user")
+        .arg("domain\\alice")
+        .args(extra)
+        .env("WINRIG_PROFILE_DIR", dir.join("profiles"))
+        .env("WINRIG_STATE_DIR", dir.join("state"));
+    isolated_home(&mut command, home);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.as_mut().expect("stdin").write_all(b"pass\n")?;
+            child.wait_with_output()
+        })
+        .expect("run setup")
+}
+
+/// AC-PRF-68: `--allowed-hosts` пишет `WINRIG_ALLOWED_HOSTS` в запись клиента,
+/// повторный `setup` без флага её убирает, неверный список отвергается с
+/// именем флага (TR-PRF-17).
+#[test]
+fn write_config_carries_allowed_hosts() {
+    let dir = temp_dir("allowed-hosts");
+    let home = dir.join("home");
+    let config = home.join(".claude.json");
+
+    let with_hosts = run_setup(
+        &dir,
+        &home,
+        &[
+            "--write-config",
+            "claude-code",
+            "--scope",
+            "global",
+            "--allowed-hosts",
+            "Web01,.corp.example",
+        ],
+    );
+    assert_eq!(
+        with_hosts.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&with_hosts.stderr)
+    );
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config).expect("read")).expect("json");
+    assert_eq!(
+        written["mcpServers"]["winrig"]["env"]["WINRIG_ALLOWED_HOSTS"],
+        "web01,.corp.example"
+    );
+
+    let without = run_setup(
+        &dir,
+        &home,
+        &[
+            "--overwrite",
+            "--write-config",
+            "claude-code",
+            "--scope",
+            "global",
+        ],
+    );
+    assert_eq!(without.status.code(), Some(0));
+    let rewritten: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config).expect("read")).expect("json");
+    assert!(
+        rewritten["mcpServers"]["winrig"]["env"]
+            .get("WINRIG_ALLOWED_HOSTS")
+            .is_none(),
+        "{rewritten}"
+    );
+
+    let malformed = run_setup(&dir, &home, &["--overwrite", "--allowed-hosts", "*.corp"]);
+    assert_ne!(malformed.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&malformed.stderr).contains("--allowed-hosts"),
+        "stderr: {}",
+        String::from_utf8_lossy(&malformed.stderr)
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

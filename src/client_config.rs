@@ -187,6 +187,9 @@ pub struct ServerDefinition {
     /// Явное имя записи MCP-сервера (`--server-name`). Без него ключ берётся у
     /// существующей записи на тот же профиль, иначе [`DEFAULT_SERVER_NAME`].
     pub server_name: Option<String>,
+    /// Значение `WINRIG_ALLOWED_HOSTS` (`--allowed-hosts`). `None` — переменной
+    /// в записи нет, и сервер разрешает только loopback (TR-PRF-17).
+    pub allowed_hosts: Option<String>,
 }
 
 /// Имя записи MCP-сервера по умолчанию.
@@ -228,6 +231,9 @@ impl ServerDefinition {
         }
         if let Some(dir) = &self.state_root {
             env.push(("WINRIG_STATE_DIR", dir.clone()));
+        }
+        if let Some(hosts) = &self.allowed_hosts {
+            env.push(("WINRIG_ALLOWED_HOSTS", hosts.clone()));
         }
         env
     }
@@ -433,6 +439,12 @@ fn write_opencode(
     if let Some(dir) = &definition.state_root {
         environment.insert("WINRIG_STATE_DIR".to_owned(), Value::String(dir.clone()));
     }
+    if let Some(hosts) = &definition.allowed_hosts {
+        environment.insert(
+            "WINRIG_ALLOWED_HOSTS".to_owned(),
+            Value::String(hosts.clone()),
+        );
+    }
     let key = definition.key_in(&mcp, opencode_profile);
     mcp.insert(
         key,
@@ -632,7 +644,57 @@ mod tests {
             profile_dir: Some("/tmp/profiles".to_owned()),
             state_root: Some("/tmp/state".to_owned()),
             server_name: None,
+            allowed_hosts: None,
         }
+    }
+
+    /// AC-PRF-68: `--allowed-hosts` доходит до записи каждого клиента, а
+    /// повторная запись без флага убирает переменную (TR-PRF-17, ADR-0015 §9).
+    #[test]
+    fn allowed_hosts_are_written_and_removed_for_every_client() {
+        let dir = temp_dir("allowed-hosts");
+        for (client, file) in [
+            (Client::Opencode, "opencode.json"),
+            (Client::ClaudeCode, "claude.json"),
+            (Client::Cursor, "cursor.json"),
+            (Client::Codex, "config.toml"),
+        ] {
+            let path = dir.join(file);
+            let mut with_hosts = definition();
+            with_hosts.allowed_hosts = Some("host1,.corp.example".to_owned());
+            write_client_config_at(client, &path, Scope::Global, &with_hosts).expect("write");
+            let written = std::fs::read_to_string(&path).expect("read");
+            assert!(
+                written.contains("WINRIG_ALLOWED_HOSTS") && written.contains("host1,.corp.example"),
+                "{client:?}: {written}"
+            );
+
+            write_client_config_at(client, &path, Scope::Global, &definition()).expect("rewrite");
+            let rewritten = std::fs::read_to_string(&path).expect("read");
+            assert!(
+                !rewritten.contains("WINRIG_ALLOWED_HOSTS"),
+                "{client:?} kept the variable: {rewritten}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Печатное определение тоже несёт список хостов.
+    #[test]
+    fn printed_definition_carries_allowed_hosts() {
+        let mut with_hosts = definition();
+        with_hosts.allowed_hosts = Some("*".to_owned());
+        let rendered = with_hosts.to_json().expect("json");
+        assert!(
+            rendered.contains("\"WINRIG_ALLOWED_HOSTS\": \"*\""),
+            "{rendered}"
+        );
+        assert!(
+            !definition()
+                .to_json()
+                .expect("json")
+                .contains("WINRIG_ALLOWED_HOSTS")
+        );
     }
 
     /// Определение несёт каталоги профиля и состояния, иначе клиент с

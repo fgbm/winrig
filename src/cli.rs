@@ -103,6 +103,11 @@ pub enum Command {
         /// serves this profile, or 'winrig' when there is none.
         #[arg(long, value_name = "NAME")]
         server_name: Option<String>,
+        /// Hosts the server may connect to, written as WINRIG_ALLOWED_HOSTS:
+        /// comma-separated names or IPs, '.suffix' entries, or '*' for any
+        /// host. Without it the entry has no list and only loopback is allowed.
+        #[arg(long, value_name = "HOSTS", value_parser = parse_allowed_hosts)]
+        allowed_hosts: Option<String>,
     },
     /// List profiles without secrets.
     List {
@@ -134,6 +139,7 @@ pub fn server_definition(
     profile_dir: &std::path::Path,
     state_root: &std::path::Path,
     server_name: Option<&str>,
+    allowed_hosts: Option<&str>,
 ) -> ServerDefinition {
     ServerDefinition {
         command: binary.to_string_lossy().into_owned(),
@@ -142,6 +148,7 @@ pub fn server_definition(
         profile_dir: Some(profile_dir.to_string_lossy().into_owned()),
         state_root: Some(state_root.to_string_lossy().into_owned()),
         server_name: server_name.map(str::to_owned),
+        allowed_hosts: allowed_hosts.map(str::to_owned),
     }
 }
 
@@ -156,6 +163,39 @@ pub fn parse_client(value: &str) -> Result<Client, String> {
     })
 }
 
+/// Разбирает `--allowed-hosts` в значение `WINRIG_ALLOWED_HOSTS` (TR-PRF-17).
+///
+/// Грамматика та же, что у переменной (ADR-0015 §6–7): имя или IP, элемент с
+/// ведущей `.` как суффикс, либо `*` отдельным элементом. Список приводится к
+/// нижнему регистру без пробелов, как его читает сервер.
+///
+/// # Errors
+///
+/// Текст ошибки, называющий флаг и ожидаемую форму.
+pub fn parse_allowed_hosts(value: &str) -> Result<String, String> {
+    let refuse = || {
+        format!(
+            "invalid --allowed-hosts {value:?}; expected a comma-separated list of host names \
+             or IPs, '.suffix' entries, or '*' for any host"
+        )
+    };
+    let mut entries = Vec::new();
+    for raw in value.split(',') {
+        let entry = raw.trim().to_ascii_lowercase();
+        let valid = entry == "*"
+            || (!entry.is_empty()
+                && entry != "."
+                && entry.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | ':' | '[' | ']' | '_')
+                }));
+        if !valid {
+            return Err(refuse());
+        }
+        entries.push(entry);
+    }
+    Ok(entries.join(","))
+}
+
 /// Разбирает уровень записи конфига из флага `--scope` (ADR-0012).
 ///
 /// # Errors
@@ -168,5 +208,37 @@ pub fn parse_scope(value: &str) -> Result<Scope, String> {
         _ => Err(format!(
             "unknown scope {value:?}; expected one of global, project"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AC-PRF-68: список приводится к той форме, которую читает сервер.
+    #[test]
+    fn allowed_hosts_are_normalized() {
+        assert_eq!(
+            parse_allowed_hosts(" Host1 , .Corp.Example,127.0.0.1,[::1] ").as_deref(),
+            Ok("host1,.corp.example,127.0.0.1,[::1]")
+        );
+        assert_eq!(parse_allowed_hosts("*").as_deref(), Ok("*"));
+    }
+
+    /// AC-PRF-68: неверный список отвергается с именем флага и формой.
+    #[test]
+    fn malformed_allowed_hosts_name_the_flag() {
+        for raw in [
+            "",
+            " , ",
+            "*.corp.example",
+            "host one",
+            "a,,b",
+            "host\\x",
+            ".",
+        ] {
+            let error = parse_allowed_hosts(raw).expect_err(raw);
+            assert!(error.contains("--allowed-hosts"), "{raw:?}: {error}");
+        }
     }
 }

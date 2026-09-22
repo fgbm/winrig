@@ -79,6 +79,7 @@ pub fn run(cli: Cli) -> Result<(), StartupError> {
             write_config,
             scope,
             server_name,
+            allowed_hosts,
         }) => setup_command(
             &name,
             user.as_deref(),
@@ -86,6 +87,7 @@ pub fn run(cli: Cli) -> Result<(), StartupError> {
             write_config.as_deref(),
             scope,
             server_name.as_deref(),
+            allowed_hosts.as_deref(),
         ),
         Some(Command::List { json }) => list_command(json),
         Some(Command::Rotate { name }) => rotate_command(&name),
@@ -265,6 +267,7 @@ fn setup_command(
     write_config: Option<&str>,
     scope: Option<Scope>,
     server_name: Option<&str>,
+    allowed_hosts: Option<&str>,
 ) -> Result<(), StartupError> {
     use std::io::Write;
 
@@ -319,6 +322,7 @@ fn setup_command(
         locations.profile_dir(),
         locations.state_root(),
         server_name,
+        allowed_hosts,
     );
     match write_target {
         Some((client, scope)) => {

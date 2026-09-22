@@ -495,3 +495,84 @@ async fn default_config_refuses_disabled_certificate_check() {
     );
     harness.client.cancel().await.ok();
 }
+
+thread_local! {
+    /// Буфер перехвата журнала текущего потока; `None` — события выбрасываются.
+    static SINK: std::cell::RefCell<Option<Arc<Mutex<Vec<u8>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Писатель глобального подписчика: складывает событие в буфер потока.
+struct ThreadSink;
+
+impl std::io::Write for ThreadSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        SINK.with(|sink| {
+            if let Some(buffer) = sink.borrow().as_ref() {
+                buffer.lock().expect("lock").extend_from_slice(bytes);
+            }
+        });
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Перехватывает журнал и аудит текущего потока.
+///
+/// Подписчик глобальный и один на бинарь: временный подписчик на поток теряет
+/// события в гонке за общий кэш интереса callsite. `tokio::test` исполняет и
+/// тест, и порождённый им сервер на одном потоке, поэтому буфер потока видит
+/// аудит сервера.
+fn capture() -> Arc<Mutex<Vec<u8>>> {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(|| ThreadSink)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("single global subscriber");
+    });
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    SINK.with(|sink| *sink.borrow_mut() = Some(Arc::clone(&buffer)));
+    buffer
+}
+
+/// AC-OBS03-1: отказы политики до сети попадают в аудит с инструментом и кодом
+/// (TR-OBS-03).
+#[tokio::test]
+async fn policy_refusals_are_audited() {
+    let buffer = capture();
+    let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_FILE_WRITE", "true")]).await;
+    let host = harness.call(connect_to("evil-host")).await;
+    assert!(error_of(&host).is_some(), "{:?}", host.structured_content);
+    let write = harness
+        .call(
+            CallToolRequestParams::new("write_file").with_arguments(args(&serde_json::json!({
+                "session_id": HOST,
+                "path": "C:\\Windows\\System32\\evil.dll",
+                "content": "x"
+            }))),
+        )
+        .await;
+    assert!(error_of(&write).is_some(), "{:?}", write.structured_content);
+    harness.client.cancel().await.ok();
+
+    let text = String::from_utf8_lossy(&buffer.lock().expect("lock")).into_owned();
+    SINK.with(|sink| sink.borrow_mut().take());
+    let refusals: Vec<&str> = text.split("POLICY REFUSED").skip(1).collect();
+    assert!(
+        refusals
+            .iter()
+            .any(|record| record.contains("connect") && record.contains("HOST_NOT_ALLOWED")),
+        "host refusal missing from the audit: {text}"
+    );
+    assert!(
+        refusals
+            .iter()
+            .any(|record| record.contains("write_file") && record.contains("PATH_PROTECTED")),
+        "path refusal missing from the audit: {text}"
+    );
+}

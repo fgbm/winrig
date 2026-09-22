@@ -457,6 +457,12 @@ impl SessionRegistry {
         // секрета может назвать чужим (ADR-0015 §3). Профиль несёт пароль
         // всегда, поэтому для него ветка не меняется.
         let Some(password) = identity.password.clone() else {
+            self.audit_refusal(
+                &username,
+                "connect",
+                "PASSWORD_REQUIRED",
+                "X-AD-Password is missing from the request",
+            );
             return json!({
                 "error": "connect requires the AD password in the X-AD-Password header of the same \
                           request; a cached password is not used to open a session."
@@ -944,6 +950,24 @@ impl SessionRegistry {
         }
     }
 
+    /// Пишет в аудит отказ политики, случившийся до обращения к хосту
+    /// (TR-OBS-03, ADR-0015 §14).
+    ///
+    /// Причина называет хост или путь, но не секрет: пароль и токены в отказы
+    /// политики не попадают. Поля экранируются, как и в остальных записях.
+    pub fn audit_refusal(&self, username: &str, tool: &str, code: &str, reason: &str) {
+        self.audit(
+            "POLICY REFUSED",
+            &[
+                ("user", username.to_owned()),
+                ("tool", tool.to_owned()),
+                ("code", code.to_owned()),
+                ("reason", reason.to_owned()),
+            ],
+            "",
+        );
+    }
+
     fn audit(&self, header: &str, fields: &[(&str, String)], body: &str) {
         let body = if self.config.audit_log_body { body } else { "" };
         let mut lines = vec![
@@ -1061,6 +1085,71 @@ fn format_time(time: SystemTime) -> String {
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+
+    /// Буфер, в который тестовый подписчик `tracing` пишет журнал и аудит.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<StdMutex<Vec<u8>>>);
+
+    thread_local! {
+        /// Буфер перехвата текущего потока; `None` — события выбрасываются.
+        static SINK: std::cell::RefCell<Option<Captured>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Писатель глобального подписчика: складывает событие в буфер потока.
+    struct ThreadSink;
+
+    impl std::io::Write for ThreadSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            SINK.with(|sink| {
+                if let Some(captured) = sink.borrow().as_ref() {
+                    captured.0.lock().expect("lock").extend_from_slice(bytes);
+                }
+            });
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Перехват событий `tracing` текущего потока, включая аудит.
+    ///
+    /// Подписчик один на весь тестовый бинарь и ставится глобально: временные
+    /// подписчики на поток гоняются с параллельными тестами за общий кэш
+    /// интереса callsite и теряют события. Глобальный подписчик интересуется
+    /// всем всегда, а разводит события по тестам буфер потока. `tokio::test`
+    /// исполняет тест на том же потоке, поэтому асинхронные тесты тоже видны.
+    struct Capture {
+        captured: Captured,
+    }
+
+    impl Capture {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.captured.0.lock().expect("lock")).into_owned()
+        }
+    }
+
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            SINK.with(|sink| sink.borrow_mut().take());
+        }
+    }
+
+    fn capture() -> Capture {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(|| ThreadSink)
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other global subscriber in unit tests");
+        });
+        let captured = Captured::default();
+        SINK.with(|sink| *sink.borrow_mut() = Some(captured.clone()));
+        Capture { captured }
+    }
 
     /// Фиктивный транспорт: записывает команды и отдаёт заранее заданные ответы.
     struct FakeTransport {
@@ -1726,5 +1815,41 @@ mod tests {
         assert_eq!(ok["status"], "connected");
         // Счёт подряд идущих блокировок пуст: следующая блокировка снова первая.
         assert!(lock(&registry.lockout_streak).get("alice").is_none());
+    }
+
+    /// AC-OBS03-1: отказ политики пишется в аудит отдельной записью с
+    /// пользователем, инструментом, кодом и причиной (TR-OBS-03).
+    #[test]
+    fn policy_refusal_is_audited() {
+        let registry = registry(Arc::new(FakeTransport::returning(output("", "", 0))));
+        let captured = capture();
+        registry.audit_refusal(
+            "domain\\alice",
+            "connect",
+            "HOST_NOT_ALLOWED",
+            "host \"evil\" is not allowed\nforged: line",
+        );
+        let text = captured.text();
+        assert!(text.contains("POLICY REFUSED"), "{text}");
+        assert!(text.contains("domain\\alice"), "{text}");
+        assert!(text.contains("connect"), "{text}");
+        assert!(text.contains("HOST_NOT_ALLOWED"), "{text}");
+        // TR-SEC-09: причина не подделывает структуру записи.
+        assert!(!text.contains("\nforged: line"), "{text}");
+    }
+
+    /// AC-OBS03-1: `connect` без пароля попадает в аудит как отказ политики,
+    /// а не как отказ учётных данных.
+    #[tokio::test]
+    async fn connect_without_password_is_audited() {
+        let registry = registry(Arc::new(FakeTransport::returning(output("", "", 0))));
+        let captured = capture();
+        let _ = registry
+            .connect(&UserIdentity::new("bob"), "host1", None, None, true)
+            .await;
+        let text = captured.text();
+        assert!(text.contains("POLICY REFUSED"), "{text}");
+        assert!(text.contains("PASSWORD_REQUIRED"), "{text}");
+        assert!(!text.contains("AUTH LOCKOUT"), "{text}");
     }
 }

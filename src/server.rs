@@ -20,8 +20,8 @@ use crate::config::AppConfig;
 use crate::executor::sanitize_prompt_value;
 use crate::identity::RequestIdentity;
 use crate::policy::{
-    DeleteScan, FileScan, WriteScan, decide_delete_path, decide_delete_scan, decide_file_delete,
-    decide_host, decide_port, decide_tls, decide_write_path, decide_write_scan,
+    DeleteScan, FileScan, PolicyDecision, WriteScan, decide_delete_path, decide_delete_scan,
+    decide_file_delete, decide_host, decide_port, decide_tls, decide_write_path, decide_write_scan,
 };
 use crate::ps;
 use crate::session::{SessionRegistry, UserIdentity};
@@ -125,6 +125,12 @@ impl WinrigServer {
                 crate::identity::IdentitySource::Headers => crate::session::IdentityOrigin::Headers,
             },
         }
+    }
+
+    /// Пишет отказ политики в аудит (TR-OBS-03, ADR-0015 §14).
+    fn audit_refusal(&self, identity: &RequestIdentity, tool: &str, decision: &PolicyDecision) {
+        self.registry
+            .audit_refusal(&identity.username, tool, decision.code, &decision.reason);
     }
 
     /// Выполняет команду в сессии и оборачивает ответ в результат инструмента.
@@ -804,6 +810,7 @@ impl WinrigServer {
             decide_tls(params.verify_cert, self.config.allow_insecure_tls),
         ] {
             if !decision.allow {
+                self.audit_refusal(&identity, "connect", &decision);
                 return Ok(CallToolResult::structured(
                     json!({ "error": decision.reason }),
                 ));
@@ -1672,6 +1679,7 @@ impl WinrigServer {
         // DR-6: лексический отказ до любой сети.
         let decision = decide_write_path(&params.path);
         if !decision.allow {
+            self.audit_refusal(&identity, "write_file", &decision);
             return Ok(CallToolResult::structured(
                 json!({ "error": decision.reason }),
             ));
@@ -1727,6 +1735,7 @@ impl WinrigServer {
         };
         let scan_decision = decide_write_scan(&scan, &params.path, params.overwrite);
         if !scan_decision.allow {
+            self.audit_refusal(&identity, "write_file", &scan_decision);
             return Ok(CallToolResult::structured(json!({
                 "error": scan_decision.reason,
                 "scan": probe_stdout,
@@ -1811,6 +1820,7 @@ impl WinrigServer {
         // DR-6: лексический отказ до любой сети.
         let decision = decide_delete_path(&params.path);
         if !decision.allow {
+            self.audit_refusal(&identity, "delete_file", &decision);
             return Ok(CallToolResult::structured(
                 json!({ "error": decision.reason }),
             ));
@@ -1844,6 +1854,7 @@ impl WinrigServer {
         };
         let scan_decision = decide_file_delete(&scan, &params.path);
         if !scan_decision.allow {
+            self.audit_refusal(&identity, "delete_file", &scan_decision);
             return Ok(CallToolResult::structured(json!({
                 "error": scan_decision.reason,
                 "scan": stdout,
@@ -1883,6 +1894,7 @@ impl WinrigServer {
         // DR-6: лексический отказ до любой сети.
         let decision = decide_delete_path(&params.path);
         if !decision.allow {
+            self.audit_refusal(&identity, "delete_directory", &decision);
             return Ok(CallToolResult::structured(
                 json!({ "error": decision.reason }),
             ));
@@ -1922,6 +1934,7 @@ impl WinrigServer {
         };
         let scan_decision = decide_delete_scan(&scan, &params.path, cap);
         if !scan_decision.allow {
+            self.audit_refusal(&identity, "delete_directory", &scan_decision);
             return Ok(CallToolResult::structured(json!({
                 "error": scan_decision.reason,
                 "scan": stdout,

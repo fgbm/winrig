@@ -277,6 +277,9 @@ pub fn is_protected_path(path: &str) -> bool {
     {
         return true;
     }
+    if is_system_share(&norm) {
+        return true;
+    }
     if is_volume_root(&norm) || is_volume_guid(&norm) || is_volume_guid_root(&norm) {
         return true;
     }
@@ -306,6 +309,17 @@ fn admin_share_local(norm: &str) -> Option<String> {
         return None;
     }
     Some(format!("{drive}:\\{}", parts.next().unwrap_or("")))
+}
+
+/// Истина для шаров, которые указывают внутрь системного каталога:
+/// `ADMIN$` — это `%SystemRoot%`, `PRINT$` — каталог драйверов внутри него.
+///
+/// Принимает нормализованный путь. Куда смотрит шар, знает только хост, но у
+/// этих двух назначение фиксировано, поэтому защищено всё их содержимое.
+fn is_system_share(norm: &str) -> bool {
+    norm.strip_prefix("\\\\")
+        .and_then(|rest| rest.split('\\').nth(1))
+        .is_some_and(|share| share == "ADMIN$" || share == "PRINT$")
 }
 
 /// Компонент пути в форме 8.3 (`PROGRA~1`), если он есть.
@@ -407,7 +421,7 @@ pub fn is_valid_host(host: &str) -> bool {
 pub fn parse_allowed_hosts(raw: &str) -> Result<Vec<String>, String> {
     let mut entries = Vec::new();
     for item in raw.split(',') {
-        let entry = item.trim().to_lowercase();
+        let entry = item.trim().to_ascii_lowercase();
         if entry.is_empty() {
             continue;
         }
@@ -434,7 +448,9 @@ pub const ALLOWED_HOSTS_FORM: &str =
 /// ведущей `.` — суффикс; иначе точное совпадение без учёта регистра.
 #[must_use]
 pub fn host_allowed(host: &str, allowed_hosts: &[String]) -> bool {
-    let candidate = host.trim().to_lowercase();
+    // Только ASCII-свёртка: Unicode-свёртка превратила бы знак Кельвина
+    // U+212A в `k`, и не-ASCII имя прошло бы проверку синтаксиса.
+    let candidate = host.trim().to_ascii_lowercase();
     if !is_valid_host(&candidate) {
         return false;
     }
@@ -496,7 +512,7 @@ pub fn decide_host(host: &str, allowed_hosts: &[String]) -> PolicyDecision {
     if host_allowed(host, allowed_hosts) {
         PolicyDecision::allow("host is allowed")
     } else {
-        let reason = if !is_valid_host(&host.trim().to_lowercase()) {
+        let reason = if !is_valid_host(&host.trim().to_ascii_lowercase()) {
             format!(
                 "host {host:?} is not a host name or IP address; pass the bare name or address, \
                  and the port in the port argument"
@@ -1114,6 +1130,8 @@ mod tests {
             "evil.com:5985",
             "evil .corp.example",
             "evil.com\\.corp.example",
+            "\u{212A}.corp.example",
+            "evil.com%2f.corp.example",
             "a..corp.example",
             ".corp.example",
             "[evil.com]",
@@ -1539,6 +1557,15 @@ mod tests {
         ] {
             assert!(is_protected_path(path), "{path}");
             assert_eq!(decide_write_path(path).code, "PATH_PROTECTED", "{path}");
+        }
+        // `ADMIN$` — это `%SystemRoot%`, `PRINT$` лежит внутри него.
+        for path in [
+            "\\\\localhost\\ADMIN$\\System32\\x.dll",
+            "\\\\host\\admin$",
+            "//host/PRINT$/x64/x.dll",
+        ] {
+            assert!(is_protected_path(path), "{path}");
+            assert_eq!(decide_delete_path(path).code, "PATH_PROTECTED", "{path}");
         }
         assert!(!is_protected_path("\\\\server\\C$\\App\\x"));
         assert!(!is_protected_path("\\\\server\\share\\Windows\\x"));

@@ -804,8 +804,10 @@ impl WinrigServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let identity = self.identity(&ctx)?;
+        // Политика и транспорт видят одну и ту же строку хоста.
+        let host = params.host.trim();
         for decision in [
-            decide_host(&params.host, &self.config.allowed_hosts),
+            decide_host(host, &self.config.allowed_hosts),
             decide_port(params.port),
             decide_tls(params.verify_cert, self.config.allow_insecure_tls),
         ] {
@@ -821,7 +823,7 @@ impl WinrigServer {
             .registry
             .connect(
                 &Self::user(&identity),
-                &params.host,
+                host,
                 port,
                 params.use_ssl,
                 params.verify_cert,

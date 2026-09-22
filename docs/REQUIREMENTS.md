@@ -13,7 +13,7 @@
 | TR-SEC-01 | Заведомо отклонённый пароль не предъявляется повторно в окне блокировки; отказ без обращения к AD |
 | TR-SEC-02 | Секрет и его производные формы не попадают в логи, аудит и конфигурацию. Аудит — безусловно и при любой длине (DR-4); порог `WINRIG_SECRET_REDACT_MIN_LENGTH` ограничивает только правку ответа агенту |
 | TR-SEC-03 | Редактирование не искажает вывод при коротком/пустом секрете |
-| TR-SEC-04 | Рекурсивное удаление отказывает для корней, системных каталогов и точек повторной обработки в любой форме записи пути, включая вложенные точки и момент удаления. Системные каталоги защищаются и по фактическому расположению на хосте: удаление файла и каталога отвергает путь внутри корней из переменных `SystemRoot`, `ProgramFiles`, `ProgramFiles(x86)`, `ProgramData` и родителя `PUBLIC` (ADR-0015) |
+| TR-SEC-04 | Рекурсивное удаление отказывает для корней, системных каталогов и точек повторной обработки в любой форме записи пути, включая вложенные точки и момент удаления. Системные каталоги защищаются и по фактическому расположению на хосте: удаление файла и каталога отвергает путь внутри корней из переменных `SystemRoot`, `ProgramFiles`, `ProgramFiles(x86)`, `ProgramData` и родителя `PUBLIC`; путь с 8.3-именем отвергается, административный шар `\\host\C$` проверяется как `C:` (ADR-0015) |
 | TR-SEC-05 | Множество разрешённых хостов настраивается; недопустимый порт отвергается. Умолчание — TR-SEC-14 |
 | TR-SEC-06 | Понижение проверки TLS управляется конфигурацией и по умолчанию запрещено: `verify_cert=false` принимается только при явном `WINRIG_ALLOW_INSECURE_TLS=true` (ADR-0015) |
 | TR-SEC-07 | Идентичность — по текущему запросу; кэши изолированы по пользователю; имя учётной записи канонизируется по регистру |
@@ -31,7 +31,7 @@
 | TR-SEC-11 | `WINRIG_CONFIRM_FALLBACK=proceed` выполняет модифицирующую операцию без подтверждения только когда клиент не объявил elicitation; отказ пользователя, отмена, таймаут и ошибка транспорта не обходятся никогда, а аудит помечает операцию как прошедшую без подтверждения. Не реализовано — срез W16 |
 | TR-SEC-12 | Значение внутри PowerShell-строки в одинарных кавычках удваивает каждый из пяти символов, которые PowerShell считает одинарной кавычкой: `'` U+0027, `‘` U+2018, `’` U+2019, `‚` U+201A, `‛` U+201B. Требование касается генераторов `src/ps.rs` и скриптов, собираемых в `src/server.rs` (ADR-0015) |
 | TR-SEC-13 | На пути по заголовкам `connect` открывает сессию только паролем из `X-AD-Password` того же запроса; закэшированный пароль по имени сессию не открывает. Отказ не обращается к транспорту и не двигает счётчик блокировки. Путь профиля не меняется (ADR-0015) |
-| TR-SEC-14 | Пустой `WINRIG_ALLOWED_HOSTS` разрешает только loopback-литералы: `localhost`, `127.0.0.0/8`, `::1`; DNS не разрешается. Отдельный элемент `*` разрешает любой хост (ADR-0015) |
+| TR-SEC-14 | Пустой `WINRIG_ALLOWED_HOSTS` разрешает только loopback-литералы: `localhost`, `127.0.0.0/8`, `::1`; DNS не разрешается. Отдельный элемент `*` разрешает любой хост. Хост, который не является именем, IP-адресом или IPv6 в скобках, отвергается при любом списке. Неверный элемент списка отказывает старту (ADR-0015) |
 | TR-FS-01 | `write_file` выключен по умолчанию (`WINRIG_ALLOW_FILE_WRITE`) и в выключенном виде не объявляется агенту. |
 | TR-FS-02 | Запись по защищённому пути отвергается до обращения к хосту, тем же списком, что охраняет удаление. |
 | TR-FS-03 | Перезапись существующего файла только при явном `overwrite`. |
@@ -97,6 +97,8 @@
 | AC-SEC04-3 | ReparsePoint внутри поддерева | отказ до удаления и повторная проверка в команде удаления | `policy::tests::delete_scan_refuses_nested_reparse_point`, генератор `delete_directory` |
 | AC-SEC04-4 | путь без расширения разрешился в каталог (`delete_file`) | отказ | `policy::tests::file_delete_refuses_directory_and_protected_path` |
 | AC-SEC05-1 | allowlist пуст | разрешены только loopback-литералы; удалённый хост и имя, лишь разрешающееся в loopback, отвергаются до сети | `policy::tests::empty_allowlist_admits_only_loopback_literals`, `tests/tool_calls.rs::default_allowlist_refuses_remote_host_before_network` |
+| AC-SEC05-5 | хост `evil.com/.corp.example`, `evil.com?.x`, `a@evil.com`, `evil.com:5985` при любом списке, включая `*` | отказ до сети, причина — «не имя и не IP» | `policy::tests::malformed_host_is_refused_by_any_allowlist` |
+| AC-SEC05-6 | `WINRIG_ALLOWED_HOSTS` или `--allowed-hosts` с элементом `*.corp.example` | старт отказывает с именем переменной, `setup` — с именем флага; грамматика одна | `policy::tests::allowed_hosts_grammar`, `config::tests::invalid_allowed_hosts_entry_refuses_startup`, `cli::tests::malformed_allowed_hosts_name_the_flag` |
 | AC-SEC05-4 | в allowlist есть `*` | разрешён любой хост; `*.domain` шаблоном не является; явный список не подмешивает loopback | `policy::tests::star_admits_any_host`, `policy::tests::explicit_list_does_not_add_loopback` |
 | AC-SEC05-2 | хост вне allowlist | отказ до сети | `policy::tests::decision_wrappers` |
 | AC-SEC05-3 | порт вне 1..65535 | отказ до сети, сессия не создана | `policy::tests::validate_port_range_and_passthrough` |
@@ -110,6 +112,9 @@
 | AC-SEC12-1 | аргумент с любой из пяти форм одинарной кавычки | каждая форма удвоена во всех генераторах и в скриптах `server.rs`, дошедших до хоста | `ps::tests::escape_doubles_every_single_quote_form`, `ps::tests::every_generator_escapes_single_quoted_free_text`, `tests/tool_calls.rs::inline_scripts_escape_every_single_quote_form` |
 | AC-SEC13-1 | `connect` по заголовкам без `X-AD-Password`, пароль этого имени в кэше | отказ с именем заголовка, транспорт не вызван, счётчик блокировки не сдвинут, чужая сессия цела | `session::tests::header_connect_without_password_ignores_the_cached_one`, `session::tests::connect_without_password_is_refused` |
 | AC-SEC04-5 | хост разрешил путь удаления внутрь корня из своих переменных (система на `D:`) | отказ `PATH_PROTECTED`, причина называет корень | `policy::tests::delete_scans_refuse_paths_inside_host_roots`, `policy::tests::host_roots_cover_the_actual_system_location` |
+| AC-SEC04-6 | путь записи или удаления с 8.3-именем, запрошенный или разрешённый хостом | отказ `PATH_PROTECTED`, причина называет короткое имя; имена вроде `backup~old` проходят | `policy::tests::short_names_are_refused_for_write_and_delete` |
+| AC-SEC04-7 | `\\localhost\C$\Windows\...` | защищён как `C:\Windows\...` и по корням хоста | `policy::tests::admin_share_is_checked_as_its_local_path` |
+| AC-SEC13-2 | `connect` без пароля под именем заблокированного пользователя | ответ «нужен `X-AD-Password`», блокировка не раскрыта | `session::tests::connect_without_password_does_not_reveal_lockout` |
 | AC-SEC10-1 | `AuthFailed("HTTP 500 Internal Server Error: ")` | не отказ учётных данных; текст называет 5986 и `AllowUnencrypted` | `session::tests::empty_500_is_not_an_auth_failure` |
 | AC-SEC10-2 | `AuthFailed("HTTP 503 ...: busy")` | не отказ учётных данных; статус сохранён, подсказка не приписана | `session::tests::other_http_status_is_rejected_without_the_hint` |
 | AC-SEC10-3 | `AuthFailed("NTLM authentication rejected ...")` | остаётся отказом учётных данных | `session::tests::ntlm_rejection_stays_an_auth_failure` |

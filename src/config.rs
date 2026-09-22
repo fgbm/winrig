@@ -132,7 +132,7 @@ pub struct AppConfig {
     pub ad_lockout_window_seconds: u64,
     /// Минимальная длина секрета, редактируемого в ответе агенту.
     pub secret_redact_min_length: usize,
-    /// Allowlist хостов; пустой список разрешает всё (TR-SEC-05).
+    /// Allowlist хостов; пустой список разрешает только loopback, `*` — любой хост (TR-SEC-14).
     pub allowed_hosts: Vec<String>,
     /// Разрешено ли понижение проверки TLS (TR-SEC-06).
     pub allow_insecure_tls: bool,
@@ -420,7 +420,7 @@ pub fn load_config_from(env: &Env) -> Result<AppConfig, ConfigError> {
             None,
         )?,
         allowed_hosts: read_allowed_hosts(env),
-        allow_insecure_tls: read_bool(env, "WINRIG_ALLOW_INSECURE_TLS", true)?,
+        allow_insecure_tls: read_bool(env, "WINRIG_ALLOW_INSECURE_TLS", false)?,
         audit_max_output_chars: read_uint(
             env,
             "WINRIG_AUDIT_MAX_OUTPUT_CHARS",
@@ -508,7 +508,9 @@ mod tests {
         assert_eq!(config.ad_lockout_window_seconds, 1800);
         assert_eq!(config.secret_redact_min_length, 4);
         assert!(config.allowed_hosts.is_empty());
-        assert!(config.allow_insecure_tls);
+        // AC-SEC06-1: понижение проверки TLS запрещено, пока оператор его не
+        // разрешил явно (TR-SEC-06, ADR-0015).
+        assert!(!config.allow_insecure_tls);
         assert_eq!(config.audit_max_output_chars, 2000);
         assert!(config.audit_log_body);
         assert_eq!(config.sftp_cred_idle_ttl_seconds, 3600);
@@ -645,13 +647,13 @@ mod tests {
             ("WINRIG_LOCKOUT_ATTEMPTS", "7"),
             ("WINRIG_LOCKOUT_WINDOW_SECONDS", "60"),
             ("WINRIG_SECRET_REDACT_MIN_LENGTH", "8"),
-            ("WINRIG_ALLOW_INSECURE_TLS", "false"),
+            ("WINRIG_ALLOW_INSECURE_TLS", "true"),
         ]));
         let config = load_config_from(&env).expect("valid");
         assert_eq!(config.ad_lockout_max_attempts, 7);
         assert_eq!(config.ad_lockout_window_seconds, 60);
         assert_eq!(config.secret_redact_min_length, 8);
-        assert!(!config.allow_insecure_tls);
+        assert!(config.allow_insecure_tls);
     }
 
     #[test]

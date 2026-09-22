@@ -128,10 +128,21 @@ fn config(overrides: &[(&str, &str)]) -> AppConfig {
         if name == "WINRIG_AUTH_TOKEN" {
             return Some("token".to_owned());
         }
-        owned
+        let found = owned
             .iter()
             .find(|(key, _)| key == name)
-            .map(|(_, value)| value.clone())
+            .map(|(_, value)| value.clone());
+        // Фиктивный хост не loopback, поэтому обвязка разрешает его явно, как
+        // сделал бы оператор (ADR-0015 §6). Пустое переопределение возвращает
+        // умолчание.
+        if name == "WINRIG_ALLOWED_HOSTS" {
+            return match found {
+                Some(value) if value.is_empty() => None,
+                Some(value) => Some(value),
+                None => Some(HOST.to_owned()),
+            };
+        }
+        found
     });
     load_config_from(lookup.as_ref()).expect("config")
 }
@@ -159,6 +170,26 @@ impl Harness {
 /// Идентичность берётся из профиля, как в stdio: HTTP-заголовков здесь нет, а
 /// проверяется слой инструментов, а не гейт (его закрывает `http_gate.rs`).
 async fn connected(answer: Answer, overrides: &[(&str, &str)]) -> Harness {
+    let harness = started(answer, overrides).await;
+    let connect = harness.call(connect_to(HOST)).await;
+    assert_eq!(
+        status_of(&connect).as_deref(),
+        Some("connected"),
+        "connect must succeed before the tool under test: {:?}",
+        connect.structured_content
+    );
+    harness
+}
+
+/// Вызов `connect` к указанному хосту.
+fn connect_to(host: &str) -> CallToolRequestParams {
+    CallToolRequestParams::new("connect").with_arguments(args(&serde_json::json!({
+        "host": host
+    })))
+}
+
+/// Поднимает сервер и клиента, не открывая сессию.
+async fn started(answer: Answer, overrides: &[(&str, &str)]) -> Harness {
     let transport = Arc::new(RecordingTransport {
         calls: Mutex::new(Vec::new()),
     });
@@ -188,25 +219,11 @@ async fn connected(answer: Answer, overrides: &[(&str, &str)]) -> Harness {
     .await
     .expect("client handshake");
 
-    let harness = Harness {
+    Harness {
         client,
         transport,
         elicitations,
-    };
-    let connect = harness
-        .call(
-            CallToolRequestParams::new("connect").with_arguments(args(&serde_json::json!({
-                "host": HOST
-            }))),
-        )
-        .await;
-    assert_eq!(
-        status_of(&connect).as_deref(),
-        Some("connected"),
-        "connect must succeed before the tool under test: {:?}",
-        connect.structured_content
-    );
-    harness
+    }
 }
 
 /// Превращает JSON-объект в аргументы вызова инструмента.
@@ -424,6 +441,57 @@ async fn timeout_refuses_and_does_not_execute() {
         Some("timeout"),
         "silence must end in a timeout refusal: {:?}",
         result.structured_content
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// AC-SEC05-1, AC-SEC05-2: без `WINRIG_ALLOWED_HOSTS` удалённый хост отвергается
+/// до сети, а loopback проходит (TR-SEC-14).
+#[tokio::test]
+async fn default_allowlist_refuses_remote_host_before_network() {
+    let harness = started(Answer::Accept, &[("WINRIG_ALLOWED_HOSTS", "")]).await;
+    let refused = harness.call(connect_to(HOST)).await;
+    assert!(
+        error_of(&refused).is_some_and(|error| error.contains("loopback")),
+        "a remote host must be refused by the empty allowlist: {:?}",
+        refused.structured_content
+    );
+    assert!(
+        harness.transport.calls.lock().expect("lock").is_empty(),
+        "the refused host reached the transport"
+    );
+    let local = harness.call(connect_to("localhost")).await;
+    assert_eq!(
+        status_of(&local).as_deref(),
+        Some("connected"),
+        "loopback must pass the empty allowlist: {:?}",
+        local.structured_content
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// AC-SEC06-1: по умолчанию `verify_cert=false` отвергается до сети
+/// (TR-SEC-06).
+#[tokio::test]
+async fn default_config_refuses_disabled_certificate_check() {
+    let harness = started(Answer::Accept, &[]).await;
+    let result = harness
+        .call(
+            CallToolRequestParams::new("connect").with_arguments(args(&serde_json::json!({
+                "host": HOST,
+                "port": 5986,
+                "verify_cert": false
+            }))),
+        )
+        .await;
+    assert!(
+        error_of(&result).is_some_and(|error| error.contains("WINRIG_ALLOW_INSECURE_TLS")),
+        "disabled certificate check must be refused by default: {:?}",
+        result.structured_content
+    );
+    assert!(
+        harness.transport.calls.lock().expect("lock").is_empty(),
+        "the refused connection reached the transport"
     );
     harness.client.cancel().await.ok();
 }

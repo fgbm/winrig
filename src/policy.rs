@@ -282,17 +282,43 @@ pub fn is_protected_path(path: &str) -> bool {
         .any(|protected| norm == *protected || norm.starts_with(&format!("{protected}\\")))
 }
 
-/// Q-03: пустой список разрешает всё; `.` — суффикс, иначе точное совпадение.
-#[must_use]
-pub fn host_allowed(host: &str, allowed_hosts: &[String]) -> bool {
-    if allowed_hosts.is_empty() {
+/// Элемент списка хостов, разрешающий любой хост (ADR-0015 §7).
+pub const ANY_HOST: &str = "*";
+
+/// Истина для loopback-литерала: `localhost`, адрес из `127.0.0.0/8` или
+/// `::1` (в том числе в квадратных скобках).
+///
+/// DNS не разрешается: имя, которое лишь указывает на loopback, литералом не
+/// является, потому что ответ DNS контролирует не оператор (ADR-0015 §6).
+fn is_loopback_literal(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+}
+
+/// Решает, разрешён ли хост (Q-03, ADR-0015 §6–7).
+///
+/// Пустой список разрешает только loopback-литералы; `*` — любой хост;
+/// элемент с ведущей `.` — суффикс; иначе точное совпадение без учёта регистра.
+#[must_use]
+pub fn host_allowed(host: &str, allowed_hosts: &[String]) -> bool {
     let candidate = host.trim().to_lowercase();
+    if allowed_hosts.iter().all(|raw| raw.trim().is_empty()) {
+        return is_loopback_literal(&candidate);
+    }
     for raw in allowed_hosts {
         let entry = raw.trim().to_lowercase();
         if entry.is_empty() {
             continue;
+        }
+        if entry == ANY_HOST {
+            return true;
         }
         if let Some(apex) = entry.strip_prefix('.') {
             if candidate == apex || candidate.ends_with(&entry) {
@@ -341,10 +367,15 @@ pub fn decide_host(host: &str, allowed_hosts: &[String]) -> PolicyDecision {
     if host_allowed(host, allowed_hosts) {
         PolicyDecision::allow("host is allowed")
     } else {
-        PolicyDecision::deny(
-            format!("host {host:?} is not in WINRIG_ALLOWED_HOSTS"),
-            "HOST_NOT_ALLOWED",
-        )
+        let reason = if allowed_hosts.iter().all(|raw| raw.trim().is_empty()) {
+            format!(
+                "host {host:?} is not allowed: WINRIG_ALLOWED_HOSTS is empty, which permits only \
+                 loopback (localhost, 127.0.0.0/8, ::1); list the hosts, or use * for any host"
+            )
+        } else {
+            format!("host {host:?} is not in WINRIG_ALLOWED_HOSTS")
+        };
+        PolicyDecision::deny(reason, "HOST_NOT_ALLOWED")
     }
 }
 
@@ -725,9 +756,53 @@ mod tests {
         assert!(is_protected_path("C:\\Windows\\System32\\config\\SAM"));
     }
 
+    /// AC-SEC05-1: пустой список разрешает только loopback-литералы; имя,
+    /// которое лишь разрешается в loopback, литералом не является (TR-SEC-14).
+    #[test]
+    fn empty_allowlist_admits_only_loopback_literals() {
+        for host in [
+            "localhost",
+            "LOCALHOST",
+            " localhost ",
+            "127.0.0.1",
+            "127.1.2.3",
+            "::1",
+            "[::1]",
+        ] {
+            assert!(host_allowed(host, &[]), "loopback {host:?} must pass");
+        }
+        for host in [
+            "anything.example.com",
+            "localhost.example.com",
+            "localhost.",
+            "127.0.0.1.evil.com",
+            "128.0.0.1",
+            "10.0.0.1",
+            "::2",
+            "0.0.0.0",
+            "",
+        ] {
+            assert!(!host_allowed(host, &[]), "{host:?} must be refused");
+        }
+    }
+
+    /// AC-SEC05-4: элемент `*` разрешает любой хост, но только отдельным
+    /// элементом (TR-SEC-14).
+    #[test]
+    fn star_admits_any_host() {
+        assert!(host_allowed("anything.example.com", &hosts(&["*"])));
+        assert!(host_allowed("10.0.0.1", &hosts(&["host1", "*"])));
+        assert!(!host_allowed("web.example.com", &hosts(&["*.example.com"])));
+    }
+
+    /// Непустой список не подмешивает loopback: оператор перечислил хосты сам.
+    #[test]
+    fn explicit_list_does_not_add_loopback() {
+        assert!(!host_allowed("localhost", &hosts(&["web-server-01"])));
+    }
+
     #[test]
     fn host_allowed_variants() {
-        assert!(host_allowed("anything.example.com", &[]));
         assert!(host_allowed("Web-Server-01", &hosts(&["web-server-01"])));
         assert!(host_allowed("web-server-01", &hosts(&["Web-Server-01"])));
         assert!(!host_allowed("other-host", &hosts(&["web-server-01"])));

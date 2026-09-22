@@ -312,14 +312,15 @@ fn admin_share_local(norm: &str) -> Option<String> {
 }
 
 /// Истина для шаров, которые указывают внутрь системного каталога:
-/// `ADMIN$` — это `%SystemRoot%`, `PRINT$` — каталог драйверов внутри него.
+/// `ADMIN$` — это `%SystemRoot%`, `PRINT$` — каталог драйверов внутри него,
+/// `SYSVOL` и `NETLOGON` на контроллере домена лежат в `%SystemRoot%\SYSVOL`.
 ///
 /// Принимает нормализованный путь. Куда смотрит шар, знает только хост, но у
 /// этих двух назначение фиксировано, поэтому защищено всё их содержимое.
 fn is_system_share(norm: &str) -> bool {
     norm.strip_prefix("\\\\")
         .and_then(|rest| rest.split('\\').nth(1))
-        .is_some_and(|share| share == "ADMIN$" || share == "PRINT$")
+        .is_some_and(|share| matches!(share, "ADMIN$" | "PRINT$" | "SYSVOL" | "NETLOGON"))
 }
 
 /// Компонент пути в форме 8.3 (`PROGRA~1`), если он есть.
@@ -1563,6 +1564,8 @@ mod tests {
             "\\\\localhost\\ADMIN$\\System32\\x.dll",
             "\\\\host\\admin$",
             "//host/PRINT$/x64/x.dll",
+            "\\\\dc01\\SYSVOL\\corp.example\\scripts\\logon.ps1",
+            "\\\\dc01\\netlogon\\logon.bat",
         ] {
             assert!(is_protected_path(path), "{path}");
             assert_eq!(decide_delete_path(path).code, "PATH_PROTECTED", "{path}");

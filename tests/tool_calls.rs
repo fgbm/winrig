@@ -460,13 +460,15 @@ async fn default_allowlist_refuses_remote_host_before_network() {
         harness.transport.calls.lock().expect("lock").is_empty(),
         "the refused host reached the transport"
     );
-    let local = harness.call(connect_to("localhost")).await;
+    let local = harness.call(connect_to(" localhost ")).await;
     assert_eq!(
         status_of(&local).as_deref(),
         Some("connected"),
         "loopback must pass the empty allowlist: {:?}",
         local.structured_content
     );
+    // Политика и сессия видят одну и ту же обрезанную строку хоста.
+    assert_eq!(field(&local, "session_id").as_deref(), Some("localhost"));
     harness.client.cancel().await.ok();
 }
 

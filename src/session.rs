@@ -448,10 +448,6 @@ impl SessionRegistry {
             });
         }
 
-        if let Some(locked) = self.check_lockout(&username) {
-            return locked;
-        }
-
         // TR-SEC-13: пароль приходит в том же запросе. Кэш по одному имени
         // сессию не открывает: имя из `X-AD-User` любой держатель общего
         // секрета может назвать чужим (ADR-0015 §3). Профиль несёт пароль
@@ -468,6 +464,10 @@ impl SessionRegistry {
                           request; a cached password is not used to open a session."
             });
         };
+
+        if let Some(locked) = self.check_lockout(&username) {
+            return locked;
+        }
 
         let use_tls =
             use_ssl.unwrap_or((port.unwrap_or(self.config.default_port)) == DEFAULT_HTTPS_PORT);
@@ -1452,6 +1452,30 @@ mod tests {
         let reply = registry.connect(&identity, "host1", None, None, true).await;
         assert_eq!(reply["locked_out"], true);
         assert_eq!(transport.calls().len(), calls_before);
+    }
+
+    /// AC-SEC13-2: `connect` без пароля отвечает «нужен пароль» раньше, чем
+    /// раскрывает чужую блокировку (ADR-0015).
+    #[tokio::test]
+    async fn connect_without_password_does_not_reveal_lockout() {
+        let transport = Arc::new(FakeTransport::failing(TransportError::AuthFailed(
+            "nope".to_owned(),
+        )));
+        let registry = registry(transport);
+        for _ in 0..4 {
+            let identity = UserIdentity::with_password("alice", "wrong");
+            let _ = registry.connect(&identity, "host1", None, None, true).await;
+        }
+        let reply = registry
+            .connect(&UserIdentity::new("alice"), "host1", None, None, true)
+            .await;
+        assert!(reply.get("locked_out").is_none(), "{reply}");
+        assert!(
+            reply["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("X-AD-Password")),
+            "{reply}"
+        );
     }
 
     #[tokio::test]

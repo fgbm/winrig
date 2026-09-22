@@ -13,9 +13,9 @@
 | TR-SEC-01 | Заведомо отклонённый пароль не предъявляется повторно в окне блокировки; отказ без обращения к AD |
 | TR-SEC-02 | Секрет и его производные формы не попадают в логи, аудит и конфигурацию. Аудит — безусловно и при любой длине (DR-4); порог `WINRIG_SECRET_REDACT_MIN_LENGTH` ограничивает только правку ответа агенту |
 | TR-SEC-03 | Редактирование не искажает вывод при коротком/пустом секрете |
-| TR-SEC-04 | Рекурсивное удаление отказывает для корней, системных каталогов и точек повторной обработки в любой форме записи пути, включая вложенные точки и момент удаления |
-| TR-SEC-05 | Множество разрешённых хостов настраивается; недопустимый порт отвергается |
-| TR-SEC-06 | Понижение проверки TLS управляется конфигурацией |
+| TR-SEC-04 | Рекурсивное удаление отказывает для корней, системных каталогов и точек повторной обработки в любой форме записи пути, включая вложенные точки и момент удаления. Системные каталоги защищаются и по фактическому расположению на хосте: удаление файла и каталога отвергает путь внутри корней из переменных `SystemRoot`, `ProgramFiles`, `ProgramFiles(x86)`, `ProgramData` и родителя `PUBLIC` (ADR-0015) |
+| TR-SEC-05 | Множество разрешённых хостов настраивается; недопустимый порт отвергается. Умолчание — TR-SEC-14 |
+| TR-SEC-06 | Понижение проверки TLS управляется конфигурацией и по умолчанию запрещено: `verify_cert=false` принимается только при явном `WINRIG_ALLOW_INSECURE_TLS=true` (ADR-0015) |
 | TR-SEC-07 | Идентичность — по текущему запросу; кэши изолированы по пользователю; имя учётной записи канонизируется по регистру |
 | TR-SEC-08 | Заголовки произвольного HTTP-запроса, включая авторизационные, редактируются в аудите. Требование относится к непортированному `invoke_http_request` и пока не имеет покрытия; см. ROADMAP |
 | TR-SEC-09 | Поля аудита и текст подтверждения не позволяют подделать свою структуру |
@@ -29,11 +29,15 @@
 | TR-REL-07 | Невалидная конфигурация даёт понятный отказ при старте |
 | TR-REL-08 | Запрос подтверждения не висит бесконечно: истечение таймаута — отказ (fail-closed) |
 | TR-SEC-11 | `WINRIG_CONFIRM_FALLBACK=proceed` выполняет модифицирующую операцию без подтверждения только когда клиент не объявил elicitation; отказ пользователя, отмена, таймаут и ошибка транспорта не обходятся никогда, а аудит помечает операцию как прошедшую без подтверждения. Не реализовано — срез W16 |
+| TR-SEC-12 | Значение внутри PowerShell-строки в одинарных кавычках удваивает каждый из пяти символов, которые PowerShell считает одинарной кавычкой: `'` U+0027, `‘` U+2018, `’` U+2019, `‚` U+201A, `‛` U+201B. Требование касается генераторов `src/ps.rs` и скриптов, собираемых в `src/server.rs` (ADR-0015) |
+| TR-SEC-13 | На пути по заголовкам `connect` открывает сессию только паролем из `X-AD-Password` того же запроса; закэшированный пароль по имени сессию не открывает. Отказ не обращается к транспорту и не двигает счётчик блокировки. Путь профиля не меняется (ADR-0015) |
+| TR-SEC-14 | Пустой `WINRIG_ALLOWED_HOSTS` разрешает только loopback-литералы: `localhost`, `127.0.0.0/8`, `::1`; DNS не разрешается. Отдельный элемент `*` разрешает любой хост (ADR-0015) |
 | TR-FS-01 | `write_file` выключен по умолчанию (`WINRIG_ALLOW_FILE_WRITE`) и в выключенном виде не объявляется агенту. |
 | TR-FS-02 | Запись по защищённому пути отвергается до обращения к хосту, тем же списком, что охраняет удаление. |
 | TR-FS-03 | Перезапись существующего файла только при явном `overwrite`. |
 | TR-FS-04 | Содержимое сверх `WINRIG_MAX_WRITE_BYTES` отвергается внятным отказом до обращения к хосту. |
 | TR-FS-05 | Запись идёт кусками не больше 2000 байт (предел командной строки WinRS) во временный файл, и цель заменяется переименованием: отказ на середине не оставляет обрезанный файл на месте целевого. |
+| TR-FS-06 | Запись отвергает путь, который хост разрешает внутрь защищённого корня из своих системных переменных (как в TR-SEC-04), в любом из двух разрешений: .NET для кусков и PowerShell для замены цели. Скан, который не выполнился, не разобран или вернул пустой `SystemRoot`, — отказ (ADR-0015) |
 | TR-EXE-01 | `run_command` выключен по умолчанию (`WINRIG_ALLOW_COMMAND_EXEC`) и в выключенном виде не объявляется агенту. Не реализовано — срез W16 |
 | TR-EXE-02 | Команда вне непустого `WINRIG_ALLOWED_COMMANDS` отвергается до обращения к хосту. Список защищает от случайной команды, но не от намерения: вместе с `write_file` он обходится запуском положенного скрипта (ADR-0013 §18). Не реализовано — срез W16 |
 | TR-EXE-03 | Выполнение требует подтверждения. Отсутствие канала подтверждения — отказ, если оператор не выбрал `WINRIG_CONFIRM_FALLBACK=proceed`. Не реализовано — срез W16 |
@@ -41,6 +45,7 @@
 | TR-REL-09 | Канал подтверждения и вызов инструментов проверяются исполняемым тестом через MCP, а не чтением кода: согласие выполняет операцию, отказ и отсутствие канала — нет. Покрыта одна площадка `require_confirmation!` из десяти; макрос един, поэтому остальные держатся на нём, а не на отдельной проверке |
 | TR-OBS-01 | Аудит содержит инициатора, хост, действие, результат, длительность; секретов нет. Длительность пока не записывается — вынесено в ROADMAP |
 | TR-OBS-02 | Редактирование и защита путей покрыты автотестами |
+| TR-OBS-03 | Отказ политики до обращения к хосту — хост, порт, TLS, отсутствие `X-AD-Password`, защищённый или отвергнутый путь записи и удаления — пишется в аудит записью `POLICY REFUSED` с пользователем, инструментом, кодом и причиной, без секретов (ADR-0015) |
 | TR-PRF-01 | `setup` запрашивает имя AD (канонизируется как в `identity`) и пароль без эха, генерирует случайный токен и печатает его ровно один раз |
 | TR-PRF-02 | На диске в каталоге профилей лежит только аутентифицированный шифртекст; ключ выводится из токена и на сервере не хранится |
 | TR-PRF-03 | Старт требует хотя бы один секрет; совпадение `WINRIG_AUTH_TOKEN` с токеном профиля отказывает старту |
@@ -57,6 +62,7 @@
 | TR-PRF-14 | `setup --write-config` не создаёт вторую запись на тот же профиль: существующая обновляется на месте с сохранением ключа; ключ задаётся явно через `--server-name` |
 | TR-PRF-15 | `WINRIG_STATE_DIR` в записи клиента — корень каталога состояния: каталог профиля собирается ровно один раз, и токен лежит в нём же |
 | TR-PRF-16 | Учётная запись без `\` и без `@` не создаёт профиль молча: отказ называет ожидаемую форму `DOMAIN\user` |
+| TR-PRF-17 | `setup` принимает `--allowed-hosts` с грамматикой `WINRIG_ALLOWED_HOSTS` и пишет переменную в запись каждого клиента; повторный `setup` без флага её убирает; неверный список отвергается с именем флага (ADR-0015) |
 | TR-AD-01 | AD-инструмент выполняется только на хосте с ролью контроллера домена; на рядовом хосте — отказ, называющий причину, а не ошибка каталога. Не реализовано — срез W19 |
 | TR-AD-02 | Значение из аргумента не может изменить структуру LDAP-фильтра: экранирование по RFC 4515 предшествует экранированию PowerShell. Не реализовано — срез W19 |
 | TR-AD-03 | Число возвращаемых объектов ограничено сверху; достижение потолка названо в ответе, а не молча обрезано. Не реализовано — срез W19 |
@@ -90,15 +96,20 @@
 | AC-SEC04-2 | ReparsePoint (junction/symlink) в корне | отказ до удаления | `policy::tests::delete_scan_refuses_reparse_point` |
 | AC-SEC04-3 | ReparsePoint внутри поддерева | отказ до удаления и повторная проверка в команде удаления | `policy::tests::delete_scan_refuses_nested_reparse_point`, генератор `delete_directory` |
 | AC-SEC04-4 | путь без расширения разрешился в каталог (`delete_file`) | отказ | `policy::tests::file_delete_refuses_directory_and_protected_path` |
-| AC-SEC05-1 | allowlist пуст | подключение разрешено | `policy::tests::host_allowed_variants` |
+| AC-SEC05-1 | allowlist пуст | разрешены только loopback-литералы; удалённый хост и имя, лишь разрешающееся в loopback, отвергаются до сети | `policy::tests::empty_allowlist_admits_only_loopback_literals`, `tests/tool_calls.rs::default_allowlist_refuses_remote_host_before_network` |
+| AC-SEC05-4 | в allowlist есть `*` | разрешён любой хост; `*.domain` шаблоном не является; явный список не подмешивает loopback | `policy::tests::star_admits_any_host`, `policy::tests::explicit_list_does_not_add_loopback` |
 | AC-SEC05-2 | хост вне allowlist | отказ до сети | `policy::tests::decision_wrappers` |
 | AC-SEC05-3 | порт вне 1..65535 | отказ до сети, сессия не создана | `policy::tests::validate_port_range_and_passthrough` |
+| AC-SEC06-1 | конфигурация по умолчанию + `verify_cert=false` | отказ до сети с именем `WINRIG_ALLOW_INSECURE_TLS` | `config::tests::defaults_preserved`, `tests/tool_calls.rs::default_config_refuses_disabled_certificate_check` |
 | AC-SEC06-2 | `WINRIG_ALLOW_INSECURE_TLS=false` + `verify_cert=false` | отказ до сети | `policy::tests::tls_decisions` |
 | AC-SEC07-1 | сессия A, запрос `X-AD-User: B` | видны только объекты B | `session::tests::sessions_are_isolated_per_user` |
 | AC-SEC07-2 | запрос без `X-AD-User` на пути общего секрета | 401, инструменты не выполняются | `tests/http_gate.rs::request_with_token_but_without_user_is_rejected`, `tests/http_gate.rs::request_without_token_is_rejected` |
 | AC-SEC08-1 | `Authorization` в аудите | в аудите отсутствует | **Не проверяемо**: инструмент `invoke_http_request` не портирован (TR-SEC-08) |
 | AC-SEC09-1 | перевод строки в `X-AD-User` | аудит не подделан | `auth::tests::crlf_username_is_unsafe`; `executor::tests::escape_log_field_*` |
 | AC-SEC09-2 | перевод строки в аргументе подтверждения | диалог не подделан | `executor::tests::sanitize_prompt_value_*` |
+| AC-SEC12-1 | аргумент с любой из пяти форм одинарной кавычки | каждая форма удвоена во всех генераторах и в скриптах `server.rs`, дошедших до хоста | `ps::tests::escape_doubles_every_single_quote_form`, `ps::tests::every_generator_escapes_single_quoted_free_text`, `tests/tool_calls.rs::inline_scripts_escape_every_single_quote_form` |
+| AC-SEC13-1 | `connect` по заголовкам без `X-AD-Password`, пароль этого имени в кэше | отказ с именем заголовка, транспорт не вызван, счётчик блокировки не сдвинут, чужая сессия цела | `session::tests::header_connect_without_password_ignores_the_cached_one`, `session::tests::connect_without_password_is_refused` |
+| AC-SEC04-5 | хост разрешил путь удаления внутрь корня из своих переменных (система на `D:`) | отказ `PATH_PROTECTED`, причина называет корень | `policy::tests::delete_scans_refuse_paths_inside_host_roots`, `policy::tests::host_roots_cover_the_actual_system_location` |
 | AC-SEC10-1 | `AuthFailed("HTTP 500 Internal Server Error: ")` | не отказ учётных данных; текст называет 5986 и `AllowUnencrypted` | `session::tests::empty_500_is_not_an_auth_failure` |
 | AC-SEC10-2 | `AuthFailed("HTTP 503 ...: busy")` | не отказ учётных данных; статус сохранён, подсказка не приписана | `session::tests::other_http_status_is_rejected_without_the_hint` |
 | AC-SEC10-3 | `AuthFailed("NTLM authentication rejected ...")` | остаётся отказом учётных данных | `session::tests::ntlm_rejection_stays_an_auth_failure` |
@@ -109,6 +120,7 @@
 | AC-FS-06 | тело файла в команде | в аудит и ответ уходит отредактированным: редактируется аргумент `FromBase64String`, то есть ровно то, что в команде и лежит | `server::tests::base64_payload_is_extracted_for_redaction` |
 | AC-FS-04 | содержимое больше `WINRIG_MAX_WRITE_BYTES` | отказ до сети, назван фактический размер и предел; счёт в байтах, не в символах | `ps::tests::plan_refuses_content_above_the_limit`, `ps::tests::plan_counts_bytes_not_characters`, `config::tests::max_write_bytes_must_hold_at_least_one_chunk` |
 | AC-FS-05 | содержимое 5000 байт | три куска по 2000 плюс одна замена; первый кусок создаёт, прочие дописывают; кусок помещается в командную строку WinRS; цель заменяется переименованием при любой кодировке, а не пишется на месте; уборка достаёт оба временных файла; имя временного файла не повторяется между вызовами | `ps::tests::plan_splits_content_and_ends_with_one_commit`, `ps::tests::first_chunk_creates_and_the_rest_append`, `ps::tests::a_full_chunk_fits_the_winrs_command_line`, `ps::tests::commit_renames_for_utf8_and_converts_otherwise`, `ps::tests::commit_never_writes_the_target_in_place`, `ps::tests::abort_removes_the_temporary_file_quietly`, `ps::tests::abort_removes_the_staged_file_too`, `server::tests::temporary_suffix_differs_between_calls` |
+| AC-FS-07 | путь записи в любом из двух разрешений лежит внутри корня хоста; скан без корней или с пустым `SystemRoot` | отказ `PATH_PROTECTED` или отказ скана до подтверждения; обычный путь переходит к правилу перезаписи; корни читаются из переменных окружения, а не из локализованных имён | `policy::tests::write_scan_checks_both_resolutions_and_then_overwrite`, `policy::tests::write_scan_parses_and_fails_closed`, `policy::tests::host_roots_parse_and_require_system_root`, `ps::tests::scans_read_protected_roots_from_the_environment`, `ps::tests::write_scan_resolves_the_path_both_ways` |
 | AC-REL03-1 | неизвестный `level` | ошибка со списком, команда не отправлена | `ps::tests::get_event_log_rejects_unknown_level` |
 | AC-REL04-1 | источник задан | фильтр до лимита | `ps::tests::get_event_log_source_filter_does_not_precap` |
 | AC-REL05-1 | событие с пустым сообщением | инструмент не падает | PS-команда `get_event_log` ветвится по `$_.Message` (живой хост — «не проверяемо», Q-08) |
@@ -124,6 +136,7 @@
 | AC-REL09-3 | клиент не объявил elicitation | отказ, операция не выполнена (fail-closed, DR-5) | `tests/tool_calls.rs::client_without_elicitation_is_refused` |
 | AC-REL09-4 | read-only инструмент через MCP | вызов проходит без подтверждения и доходит до транспорта | `tests/tool_calls.rs::read_only_tool_needs_no_confirmation` |
 | AC-OBS01-2 | `WINRIG_AUDIT_LOG_BODY=0` | только метаданные | `config::tests::audit_defaults_and_reads` + `session.rs` |
+| AC-OBS03-1 | отказ политики по хосту, пути записи или отсутствию пароля | запись `POLICY REFUSED` с инструментом и кодом; причина не подделывает структуру записи | `session::tests::policy_refusal_is_audited`, `session::tests::connect_without_password_is_audited`, `tests/tool_calls.rs::policy_refusals_are_audited` |
 | AC-OBS02-1 | свободный текст в генераторе | кавычка удвоена, сырой ввод не проходит | `ps::tests::every_generator_escapes_single_quoted_free_text`; `ps::tests::compare_files_does_not_interpolate_paths_in_double_quotes` |
 | AC-OBS02-2 | список инструментов | ровно 37 уникальных имён | `server::tests::tool_router_lists_registered_tools`, `tests/stdio_mode.rs::stdio_serves_mcp_over_clean_stdout` |
 
@@ -187,7 +200,8 @@
 | AC-PRF-65 | `--server-name winrig-prod` | ключом записи становится указанное имя | `client_config::tests::explicit_server_name_is_used_as_the_key` |
 | AC-PRF-66 | запись конфига с корнем состояния | `WINRIG_STATE_DIR` равен корню, ссылка на токен указывает в `<корень>/<профиль>` | `client_config::tests::state_dir_in_the_entry_is_the_root`, `client_config::tests::opencode_project_token_goes_to_state_dir` |
 | AC-PRF-67 | `--user contosoalice` | отказ, профиль не создан, текст называет `DOMAIN\user`; `DOMAIN\user` и UPN проходят | `profile::tests::account_without_a_separator_is_refused`, `profile::tests::domain_and_upn_accounts_are_accepted` |
+| AC-PRF-68 | `setup --allowed-hosts` | переменная в записи каждого клиента в нормализованной форме; повтор без флага её убирает; неверный список отвергнут с именем флага | `client_config::tests::allowed_hosts_are_written_and_removed_for_every_client`, `client_config::tests::printed_definition_carries_allowed_hosts`, `cli::tests::allowed_hosts_are_normalized`, `cli::tests::malformed_allowed_hosts_name_the_flag`, `tests/cli_setup.rs::write_config_carries_allowed_hosts` |
 
 ## 4. Решённые параметры (ADR-0005)
 
-Порог блокировки 3, окно 1800 с, минимальная длина редактирования 4, allowlist по умолчанию пуст (разрешать всё), TLS-понижение по умолчанию разрешено, идемпотентность модификаций сохраняется. Носитель конфигурации — переменные окружения (ADR-0004). Двойная блокировка профиля — ADR-0009.
+Порог блокировки 3, окно 1800 с, минимальная длина редактирования 4, allowlist по умолчанию пуст (только loopback-литералы, ADR-0015), TLS-понижение по умолчанию запрещено (ADR-0015), идемпотентность модификаций сохраняется. Носитель конфигурации — переменные окружения (ADR-0004). Двойная блокировка профиля — ADR-0009.

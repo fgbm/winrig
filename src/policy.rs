@@ -271,6 +271,12 @@ pub fn is_protected_path(path: &str) -> bool {
     if norm.is_empty() {
         return false;
     }
+    // Административный шар `\\host\C$\...` — тот же `C:\...` (ADR-0015).
+    if let Some(local) = admin_share_local(&norm)
+        && is_protected_path(&local)
+    {
+        return true;
+    }
     if is_volume_root(&norm) || is_volume_guid(&norm) || is_volume_guid_root(&norm) {
         return true;
     }
@@ -280,6 +286,58 @@ pub fn is_protected_path(path: &str) -> bool {
     PROTECTED_DIRS
         .iter()
         .any(|protected| norm == *protected || norm.starts_with(&format!("{protected}\\")))
+}
+
+/// Локальная форма административного шара: `\\HOST\C$\REST` → `C:\REST`.
+///
+/// Принимает нормализованный путь (`normalize_windows_path`). Шар `X$`
+/// указывает на корень тома `X:`, поэтому защита проверяет его как локальный
+/// путь; иначе `\\localhost\C$\Windows` прошёл бы мимо списка.
+fn admin_share_local(norm: &str) -> Option<String> {
+    let rest = norm.strip_prefix("\\\\")?;
+    let mut parts = rest.splitn(3, '\\');
+    let _server = parts.next()?;
+    let share = parts.next()?;
+    let mut chars = share.chars();
+    let (Some(drive), Some('$'), None) = (chars.next(), chars.next(), chars.next()) else {
+        return None;
+    };
+    if !drive.is_ascii_alphabetic() {
+        return None;
+    }
+    Some(format!("{drive}:\\{}", parts.next().unwrap_or("")))
+}
+
+/// Компонент пути в форме 8.3 (`PROGRA~1`), если он есть.
+///
+/// Короткое имя нельзя сравнить со списком защищённых путей строкой:
+/// `C:\PROGRA~1` — это `C:\Program Files`, но узнать это может только хост.
+/// Признак — `~` после хотя бы одного символа и перед цифрой.
+#[must_use]
+pub fn short_name_component(path: &str) -> Option<String> {
+    normalize_windows_path(path)
+        .split('\\')
+        .find(|component| {
+            component.char_indices().any(|(index, c)| {
+                c == '~'
+                    && index > 0
+                    && component[index + 1..].starts_with(|next: char| next.is_ascii_digit())
+            })
+        })
+        .map(str::to_owned)
+}
+
+/// Отказ для пути с 8.3-именем (ADR-0015, DR-6: «в любой форме записи пути»).
+fn refuse_short_name(path: &str, requested: &str, verb: &str) -> Option<PolicyDecision> {
+    short_name_component(path).map(|component| {
+        PolicyDecision::deny(
+            format!(
+                "refusing to {verb} {requested:?}: {component} is an 8.3 short name, which cannot \
+                 be checked against protected paths; pass the long name"
+            ),
+            "PATH_PROTECTED",
+        )
+    })
 }
 
 /// Элемент списка хостов, разрешающий любой хост (ADR-0015 §7).
@@ -476,6 +534,9 @@ pub fn decide_tls(verify_cert: bool, allow_insecure_tls: bool) -> PolicyDecision
 /// Решение по рекурсивному удалению пути.
 #[must_use]
 pub fn decide_delete_path(path: &str) -> PolicyDecision {
+    if let Some(refusal) = refuse_short_name(path, path, "delete") {
+        return refusal;
+    }
     if is_protected_path(path) {
         PolicyDecision::deny(
             format!("refusing to delete protected path: {path:?}"),
@@ -492,6 +553,9 @@ pub fn decide_delete_path(path: &str) -> PolicyDecision {
 /// отличается по последствиям от возможности его удалить.
 #[must_use]
 pub fn decide_write_path(path: &str) -> PolicyDecision {
+    if let Some(refusal) = refuse_short_name(path, path, "write to") {
+        return refusal;
+    }
     if is_protected_path(path) {
         PolicyDecision::deny(
             format!("refusing to write to protected path: {path:?}"),
@@ -617,6 +681,8 @@ impl HostRoots {
         if norm.is_empty() {
             return None;
         }
+        // Административный шар проверяется как локальный путь (ADR-0015).
+        let norm = admin_share_local(&norm).unwrap_or(norm);
         self.roots.iter().find_map(|(name, root)| {
             let root_norm = normalize_windows_path(root);
             if root_norm.is_empty() {
@@ -641,6 +707,9 @@ fn refuse_resolved(
     requested: &str,
     verb: &str,
 ) -> Option<PolicyDecision> {
+    if let Some(refusal) = refuse_short_name(resolved, requested, verb) {
+        return Some(refusal);
+    }
     if is_protected_path(resolved) {
         return Some(PolicyDecision::deny(
             format!(
@@ -1424,6 +1493,60 @@ mod tests {
         assert_eq!(system.containing("D:\\WindowsApps\\x"), None);
         assert_eq!(system.containing("D:\\App\\x"), None);
         assert_eq!(system.containing(""), None);
+    }
+
+    /// AC-SEC04-6: путь с 8.3-именем не сравнить со списком строкой
+    /// (`C:\PROGRA~1` — это `C:\Program Files`), поэтому запись и удаление его
+    /// отвергают — и лексически, и после разрешения хостом (ADR-0015).
+    #[test]
+    fn short_names_are_refused_for_write_and_delete() {
+        for path in [
+            "C:\\PROGRA~1\\app\\x.dll",
+            "d:/progra~2/x",
+            "C:\\Users\\ALICE~1\\a.txt",
+        ] {
+            assert_eq!(decide_write_path(path).code, "PATH_PROTECTED", "{path}");
+            assert_eq!(decide_delete_path(path).code, "PATH_PROTECTED", "{path}");
+            assert!(decide_write_path(path).reason.contains("8.3"), "{path}");
+        }
+        for path in [
+            "C:\\App\\backup~old.txt",
+            "C:\\App\\~1",
+            "C:\\App\\x~y1.txt",
+        ] {
+            assert!(decide_write_path(path).allow, "{path}");
+        }
+        let resolved = FileScan {
+            full_name: "D:\\PROGRA~1\\x.dll".to_owned(),
+            is_directory: false,
+            roots: roots(&[("SystemRoot", "D:\\Windows")]),
+        };
+        assert_eq!(
+            decide_file_delete(&resolved, "x.dll").code,
+            "PATH_PROTECTED"
+        );
+        let write = write_scan("D:\\App\\x", "D:\\PROGRA~1\\x", false);
+        assert_eq!(decide_write_scan(&write, "x", false).code, "PATH_PROTECTED");
+    }
+
+    /// AC-SEC04-7: административный шар `\\host\C$\...` защищается как `C:\...`.
+    #[test]
+    fn admin_share_is_checked_as_its_local_path() {
+        for path in [
+            "\\\\localhost\\C$\\Windows\\System32\\x.dll",
+            "\\\\127.0.0.1\\c$\\program files\\x",
+            "//server/C$/Users/alice/a.txt",
+        ] {
+            assert!(is_protected_path(path), "{path}");
+            assert_eq!(decide_write_path(path).code, "PATH_PROTECTED", "{path}");
+        }
+        assert!(!is_protected_path("\\\\server\\C$\\App\\x"));
+        assert!(!is_protected_path("\\\\server\\share\\Windows\\x"));
+        let system = roots(&[("SystemRoot", "D:\\Windows")]);
+        assert_eq!(
+            system.containing("\\\\localhost\\D$\\Windows\\Temp"),
+            Some(("SystemRoot", "D:\\Windows"))
+        );
     }
 
     /// AC-SEC04-5: удаление отвергает путь внутри корня хоста.

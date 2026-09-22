@@ -6,10 +6,25 @@
 
 use serde_json::Value;
 
+/// Символы, которые PowerShell считает одинарной кавычкой (TR-SEC-12).
+///
+/// Токенизатор PowerShell закрывает строку в одинарных кавычках не только
+/// ASCII-апострофом, но и типографскими кавычками: `‘` U+2018, `’` U+2019,
+/// `‚` U+201A и `‛` U+201B. Удвоение любого из них внутри такой строки даёт
+/// литеральный символ.
+pub const SINGLE_QUOTES: [char; 5] = ['\'', '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'];
+
 /// Экранирует значение для вставки в PowerShell-строку в одинарных кавычках.
 #[must_use]
 pub fn escape(value: &str) -> String {
-    value.replace('\'', "''")
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        if SINGLE_QUOTES.contains(&c) {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Уровни журнала событий: имя инструмента → числовой уровень.
@@ -1168,11 +1183,35 @@ mod tests {
         assert!(command.contains("SilentlyContinue"), "{command}");
     }
 
+    /// TR-SEC-12: PowerShell закрывает строку в одинарных кавычках любым из
+    /// пяти символов, а не только ASCII-апострофом.
+    #[test]
+    fn escape_doubles_every_single_quote_form() {
+        for quote in SINGLE_QUOTES {
+            let value = format!("a{quote}b");
+            assert_eq!(escape(&value), format!("a{quote}{quote}b"), "{quote:?}");
+        }
+        assert_eq!(
+            escape("a\u{2018}b\u{2019}c"),
+            "a\u{2018}\u{2018}b\u{2019}\u{2019}c"
+        );
+    }
+
     #[test]
     fn every_generator_escapes_single_quoted_free_text() {
-        // Инъекция: свободный текст, попавший в строку PowerShell в одинарных
-        // кавычках, обязан удваивать кавычку во всех генераторах.
-        let evil = "x' ; Remove-Item -Recurse C:\\ ; '";
+        for quote in SINGLE_QUOTES {
+            assert_generators_escape(quote);
+        }
+    }
+
+    /// Инъекция: свободный текст, попавший в строку PowerShell в одинарных
+    /// кавычках, обязан удваивать кавычку во всех генераторах (AC-OBS02-1,
+    /// AC-SEC12-1).
+    fn assert_generators_escape(quote: char) {
+        let evil = format!("x{quote} ; Remove-Item -Recurse C:\\ ; {quote}");
+        let evil = evil.as_str();
+        let opened = format!("x{quote}");
+        let doubled = format!("x{quote}{quote}");
         let commands = vec![
             list_directory(evil),
             find_files(evil, evil, 5, true),
@@ -1209,8 +1248,8 @@ mod tests {
             // Если текст вообще попал в команду, его кавычка обязана быть
             // удвоена; генераторы с enum-фильтром просто не принимают текст.
             assert!(
-                !command.contains("x'") || command.contains("x''"),
-                "single quote was not doubled: {command}"
+                !command.contains(&opened) || command.contains(&doubled),
+                "single quote {quote:?} was not doubled: {command}"
             );
         }
     }

@@ -360,6 +360,50 @@ async fn client_without_elicitation_is_refused() {
     harness.client.cancel().await.ok();
 }
 
+/// AC-SEC12-1: скрипты, собранные в `server.rs`, а не в генераторах `ps.rs`,
+/// удваивают каждую форму одинарной кавычки (TR-SEC-12).
+///
+/// Проверяется то, что ушло на хост: оператор подтверждает, поэтому до
+/// транспорта доходят и предварительные чтения, и сами модификации.
+#[tokio::test]
+async fn inline_scripts_escape_every_single_quote_form() {
+    for quote in winrig::ps::SINGLE_QUOTES {
+        let evil = format!("x{quote} ; Remove-Item -Recurse C:\\ ; {quote}");
+        let harness = connected(Answer::Accept, &[]).await;
+        let calls = [
+            ("restart_service", serde_json::json!({ "name": evil })),
+            ("stop_service", serde_json::json!({ "name": evil })),
+            ("start_service", serde_json::json!({ "name": evil })),
+            (
+                "set_registry",
+                serde_json::json!({ "key": evil, "value_name": evil, "value_data": evil }),
+            ),
+            ("delete_file", serde_json::json!({ "path": evil })),
+            ("delete_directory", serde_json::json!({ "path": evil })),
+        ];
+        for (tool, mut arguments) in calls {
+            arguments["session_id"] = serde_json::json!(HOST);
+            harness
+                .call(CallToolRequestParams::new(tool).with_arguments(args(&arguments)))
+                .await;
+        }
+        let scripts = harness.transport.calls.lock().expect("lock").clone();
+        let opened = format!("x{quote} ");
+        let doubled = format!("x{quote}{quote} ");
+        assert!(
+            scripts.iter().any(|script| script.contains(&doubled)),
+            "no escaped value reached the host: {scripts:#?}"
+        );
+        for script in scripts {
+            assert!(
+                !script.contains(&opened),
+                "quote {quote:?} left unescaped: {script}"
+            );
+        }
+        harness.client.cancel().await.ok();
+    }
+}
+
 /// AC-REL08-1: молчание оператора — отказ по таймауту, а не выполнение.
 #[tokio::test]
 async fn timeout_refuses_and_does_not_execute() {

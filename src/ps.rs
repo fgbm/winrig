@@ -201,13 +201,66 @@ pub fn write_abort(temp_path: &str) -> String {
     )
 }
 
-/// Сообщает, существует ли цель: для отказа без `overwrite` (TR-FS-03).
+/// Свойство `Roots` скана: защищённые корни из системных переменных хоста
+/// (TR-FS-06, ADR-0015 §10–12).
+///
+/// Переменные окружения не зависят от языка системы, поэтому проверка не
+/// зависит от локали (AGENTS.md §6). Корня профилей в переменных нет, поэтому
+/// берётся родитель `PUBLIC`. Отсутствующая переменная даёт `null`, и разбор
+/// её пропускает; пустой `SystemRoot` разбор отвергает.
+pub const HOST_ROOTS: &str = "Roots=[PSCustomObject]@{ SystemRoot=$env:SystemRoot; \
+     ProgramFiles=$env:ProgramFiles; ProgramFilesX86=${env:ProgramFiles(x86)}; \
+     ProgramData=$env:ProgramData; \
+     Users=$(if ($env:PUBLIC) { Split-Path -Parent $env:PUBLIC } else { $null }) }";
+
+/// Скан цели записи: оба разрешения пути, существование и корни хоста
+/// (TR-FS-03, TR-FS-06).
+///
+/// Куски пишет .NET, цель заменяет `Move-Item`, а относительный путь они
+/// разрешают от разных каталогов, поэтому хост возвращает оба разрешения.
+/// Любая ошибка останавливает скрипт, и инструмент отказывает (fail-closed).
 #[must_use]
-pub fn write_precheck(path: &str) -> String {
+pub fn write_scan(path: &str) -> String {
     let safe = escape(path);
     format!(
-        "if (Test-Path -LiteralPath '{safe}') {{ Write-Output 'EXISTS' }} \
-         else {{ Write-Output 'ABSENT' }}"
+        "$ErrorActionPreference = 'Stop'; \
+         $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath('{safe}'); \
+         $net = [IO.Path]::GetFullPath('{safe}'); \
+         [PSCustomObject]@{{ FullName=$full; DotNetFullName=$net; \
+         Exists=[bool](Test-Path -LiteralPath '{safe}'); {HOST_ROOTS} }} \
+         | ConvertTo-Json -Compress"
+    )
+}
+
+/// Скан удаляемого файла: путь, как его разрешил хост, признак каталога и
+/// корни хоста (DR-6, TR-SEC-04).
+#[must_use]
+pub fn delete_file_scan(path: &str) -> String {
+    let safe = escape(path);
+    format!(
+        "$item = Get-Item -LiteralPath '{safe}' -Force -ErrorAction Stop; \
+         [PSCustomObject]@{{ FullName=$item.FullName; IsDirectory=[bool]$item.PSIsContainer; \
+         SizeBytes=if($item.PSIsContainer){{$null}}else{{$item.Length}}; \
+         Modified=$item.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'); {HOST_ROOTS} }} \
+         | ConvertTo-Json -Compress"
+    )
+}
+
+/// Скан удаляемого каталога: путь хоста, reparse-точки в корне и поддереве,
+/// число элементов до `limit` и корни хоста (DR-6, ADR-0005 §5, TR-SEC-04).
+#[must_use]
+pub fn delete_directory_scan(path: &str, limit: i64) -> String {
+    let safe = escape(path);
+    format!(
+        "$item = Get-Item -LiteralPath '{safe}' -Force -ErrorAction Stop; \
+         if (-not $item.PSIsContainer) {{ throw 'Path is a file — use delete_file instead' }}; \
+         $isReparse = [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint); \
+         $files = @(Get-ChildItem -LiteralPath '{safe}' -Recurse -File -Force -ErrorAction SilentlyContinue | Select-Object -First {limit}); \
+         $dirs = @(Get-ChildItem -LiteralPath '{safe}' -Recurse -Directory -Force -ErrorAction SilentlyContinue | Select-Object -First {limit}); \
+         $nestedReparse = [bool](@($dirs | Where-Object {{ [bool]($_.Attributes -band [IO.FileAttributes]::ReparsePoint) }}).Count -gt 0); \
+         [PSCustomObject]@{{ FullName=$item.FullName; IsReparsePoint=$isReparse; NestedReparsePoint=$nestedReparse; \
+         FileCount=$files.Count; DirCount=$dirs.Count; TotalItems=($files.Count + $dirs.Count); {HOST_ROOTS} }} \
+         | ConvertTo-Json -Compress"
     )
 }
 
@@ -1238,7 +1291,9 @@ mod tests {
             write_commit(evil, evil, "utf8").expect("valid"),
             write_commit(evil, evil, "unicode").expect("valid"),
             write_abort(evil),
-            write_precheck(evil),
+            write_scan(evil),
+            delete_file_scan(evil),
+            delete_directory_scan(evil, 10),
         ];
         for command in commands {
             assert!(
@@ -1252,5 +1307,52 @@ mod tests {
                 "single quote {quote:?} was not doubled: {command}"
             );
         }
+    }
+
+    /// AC-FS-07: корни берутся из переменных окружения хоста, а не из
+    /// локализованных имён каталогов, и попадают во все три скана.
+    #[test]
+    fn scans_read_protected_roots_from_the_environment() {
+        for variable in [
+            "$env:SystemRoot",
+            "$env:ProgramFiles",
+            "${env:ProgramFiles(x86)}",
+            "$env:ProgramData",
+            "$env:PUBLIC",
+        ] {
+            assert!(HOST_ROOTS.contains(variable), "{variable}");
+        }
+        for command in [
+            write_scan("D:\\App\\x"),
+            delete_file_scan("D:\\App\\x"),
+            delete_directory_scan("D:\\App", 10),
+        ] {
+            assert!(command.contains(HOST_ROOTS), "{command}");
+            assert!(command.contains("ConvertTo-Json"), "{command}");
+        }
+    }
+
+    /// AC-FS-07: скан записи возвращает оба разрешения пути и останавливается
+    /// на первой ошибке, чтобы отказ не выглядел пустым успехом.
+    #[test]
+    fn write_scan_resolves_the_path_both_ways() {
+        let command = write_scan("x.ps1");
+        assert!(
+            command.starts_with("$ErrorActionPreference = 'Stop'"),
+            "{command}"
+        );
+        assert!(
+            command.contains("GetUnresolvedProviderPathFromPSPath('x.ps1')"),
+            "{command}"
+        );
+        assert!(
+            command.contains("[IO.Path]::GetFullPath('x.ps1')"),
+            "{command}"
+        );
+        assert!(command.contains("DotNetFullName="), "{command}");
+        assert!(
+            command.contains("Test-Path -LiteralPath 'x.ps1'"),
+            "{command}"
+        );
     }
 }

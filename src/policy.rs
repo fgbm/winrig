@@ -444,6 +444,146 @@ pub fn decide_overwrite(path: &str, exists: bool, overwrite: bool) -> PolicyDeci
     }
 }
 
+/// Разбирает ответ скана хоста в JSON-объект.
+///
+/// Нечитаемый ответ — не «безопасно по умолчанию», а причина отказа
+/// (fail-closed).
+fn scan_object(raw: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let value: serde_json::Value = serde_json::from_str(raw.trim())
+        .map_err(|error| format!("Pre-scan returned an unreadable result: {error}"))?;
+    match value {
+        serde_json::Value::Object(object) => Ok(object),
+        _ => Err("Pre-scan returned a non-object result.".to_owned()),
+    }
+}
+
+/// Непустое строковое поле скана.
+fn required_str(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<String, String> {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("Pre-scan result is missing {key}."))
+}
+
+/// Булево поле скана.
+fn required_bool(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<bool, String> {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| format!("Pre-scan result is missing {key}."))
+}
+
+/// Защищённые корни, которые хост прочитал из своих системных переменных
+/// (TR-FS-06, ADR-0015 §10–12).
+///
+/// Лексический список `PROTECTED_DIRS` знает только `C:`; эти корни называют
+/// фактическое расположение системы, на каком бы томе она ни стояла.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostRoots {
+    /// Пары (имя корня, путь на хосте).
+    roots: Vec<(String, String)>,
+}
+
+impl HostRoots {
+    /// Имена корней в том порядке, в каком их отдаёт скан (`ps::HOST_ROOTS`).
+    const NAMES: [&'static str; 5] = [
+        "SystemRoot",
+        "ProgramFiles",
+        "ProgramFilesX86",
+        "ProgramData",
+        "Users",
+    ];
+
+    /// Читает свойство `Roots` из скана.
+    ///
+    /// Пустой корень пропускается: `ProgramFiles(x86)` на 32-битной системе
+    /// отсутствует законно. Пустой `SystemRoot` — отказ: без него проверка
+    /// теряет главный корень (ADR-0015 §11).
+    fn from_scan(object: &serde_json::Map<String, serde_json::Value>) -> Result<Self, String> {
+        let roots = object
+            .get("Roots")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| "Pre-scan result is missing Roots.".to_owned())?;
+        let mut out = Vec::new();
+        for name in Self::NAMES {
+            let value = roots
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            match value {
+                Some(path) => out.push((name.to_owned(), path.to_owned())),
+                None if name == "SystemRoot" => {
+                    return Err(
+                        "Pre-scan result has no SystemRoot, so the protected system location on \
+                         the host is unknown."
+                            .to_owned(),
+                    );
+                }
+                None => {}
+            }
+        }
+        Ok(Self { roots: out })
+    }
+
+    /// Корень, внутри которого лежит путь: `(имя, путь корня)`.
+    #[must_use]
+    pub fn containing(&self, path: &str) -> Option<(&str, &str)> {
+        let norm = normalize_windows_path(path);
+        if norm.is_empty() {
+            return None;
+        }
+        self.roots.iter().find_map(|(name, root)| {
+            let root_norm = normalize_windows_path(root);
+            if root_norm.is_empty() {
+                return None;
+            }
+            let prefix = if root_norm.ends_with('\\') {
+                root_norm.clone()
+            } else {
+                format!("{root_norm}\\")
+            };
+            (norm == root_norm || norm.starts_with(&prefix))
+                .then_some((name.as_str(), root.as_str()))
+        })
+    }
+}
+
+/// Отказ, если путь, разрешённый хостом, защищён лексически или лежит внутри
+/// корня хоста (DR-6, TR-FS-06).
+fn refuse_resolved(
+    resolved: &str,
+    roots: &HostRoots,
+    requested: &str,
+    verb: &str,
+) -> Option<PolicyDecision> {
+    if is_protected_path(resolved) {
+        return Some(PolicyDecision::deny(
+            format!(
+                "refusing to {verb} a protected path (resolved by the host to {resolved}): {requested}"
+            ),
+            "PATH_PROTECTED",
+        ));
+    }
+    roots.containing(resolved).map(|(name, root)| {
+        PolicyDecision::deny(
+            format!(
+                "refusing to {verb} a protected path (resolved by the host to {resolved}, inside \
+                 the {name} root {root}): {requested}"
+            ),
+            "PATH_PROTECTED",
+        )
+    })
+}
+
 /// Результат предварительного скана удаляемого каталога, полученный от хоста.
 ///
 /// `full_name` — путь, как его разрешил сам Windows-хост: только он раскрывает
@@ -466,6 +606,8 @@ pub struct DeleteScan {
     /// junction и удалить его цель, поэтому вложенная точка — такая же причина
     /// отказа, как и корневая (DR-6).
     pub nested_reparse_point: bool,
+    /// Защищённые корни хоста (TR-SEC-04, ADR-0015 §10).
+    pub roots: HostRoots,
 }
 
 impl DeleteScan {
@@ -474,35 +616,23 @@ impl DeleteScan {
     /// # Errors
     ///
     /// Возвращает текст ошибки, если ответ не JSON-объект или в нём нет
-    /// обязательных защитных полей `FullName`, `IsReparsePoint` и `TotalItems`.
+    /// обязательных защитных полей `FullName`, `IsReparsePoint`, `TotalItems`,
+    /// `NestedReparsePoint` и `Roots` с непустым `SystemRoot`.
     /// Отсутствующее защитное поле — не «безопасно по умолчанию», а признак
     /// нечитаемого скана: вызывающая сторона обязана отказать (ADR-0005 §5,
     /// fail-closed).
     pub fn from_json(raw: &str) -> Result<Self, String> {
-        let value: serde_json::Value = serde_json::from_str(raw.trim())
-            .map_err(|error| format!("Pre-scan returned an unreadable result: {error}"))?;
-        let object = value
-            .as_object()
-            .ok_or_else(|| "Pre-scan returned a non-object result.".to_owned())?;
-        let full_name = object
-            .get("FullName")
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| "Pre-scan result is missing FullName.".to_owned())?;
-        let is_reparse_point = object
-            .get("IsReparsePoint")
-            .and_then(serde_json::Value::as_bool)
-            .ok_or_else(|| "Pre-scan result is missing IsReparsePoint.".to_owned())?;
+        let object = scan_object(raw)?;
+        let full_name = required_str(&object, "FullName")?;
+        let is_reparse_point = required_bool(&object, "IsReparsePoint")?;
         let total_items = object
             .get("TotalItems")
             .and_then(serde_json::Value::as_i64)
             .ok_or_else(|| "Pre-scan result is missing TotalItems.".to_owned())?;
-        let nested_reparse_point = object
-            .get("NestedReparsePoint")
-            .and_then(serde_json::Value::as_bool)
-            .ok_or_else(|| "Pre-scan result is missing NestedReparsePoint.".to_owned())?;
+        let nested_reparse_point = required_bool(&object, "NestedReparsePoint")?;
+        let roots = HostRoots::from_scan(&object)?;
         Ok(Self {
-            full_name: full_name.to_owned(),
+            full_name,
             is_reparse_point,
             total_items,
             file_count: object
@@ -514,6 +644,7 @@ impl DeleteScan {
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0),
             nested_reparse_point,
+            roots,
         })
     }
 }
@@ -528,6 +659,8 @@ pub struct FileScan {
     pub full_name: String,
     /// Является ли цель каталогом.
     pub is_directory: bool,
+    /// Защищённые корни хоста (TR-SEC-04, ADR-0015 §10).
+    pub roots: HostRoots,
 }
 
 impl FileScan {
@@ -536,27 +669,64 @@ impl FileScan {
     /// # Errors
     ///
     /// Возвращает текст ошибки, если ответ не JSON-объект или в нём нет
-    /// обязательных полей `FullName` и `IsDirectory`.
+    /// обязательных полей `FullName`, `IsDirectory` и `Roots` с непустым
+    /// `SystemRoot`.
     pub fn from_json(raw: &str) -> Result<Self, String> {
-        let value: serde_json::Value = serde_json::from_str(raw.trim())
-            .map_err(|error| format!("Pre-scan returned an unreadable result: {error}"))?;
-        let object = value
-            .as_object()
-            .ok_or_else(|| "Pre-scan returned a non-object result.".to_owned())?;
-        let full_name = object
-            .get("FullName")
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| "Pre-scan result is missing FullName.".to_owned())?;
-        let is_directory = object
-            .get("IsDirectory")
-            .and_then(serde_json::Value::as_bool)
-            .ok_or_else(|| "Pre-scan result is missing IsDirectory.".to_owned())?;
+        let object = scan_object(raw)?;
         Ok(Self {
-            full_name: full_name.to_owned(),
-            is_directory,
+            full_name: required_str(&object, "FullName")?,
+            is_directory: required_bool(&object, "IsDirectory")?,
+            roots: HostRoots::from_scan(&object)?,
         })
     }
+}
+
+/// Результат скана цели записи, полученный от хоста (TR-FS-06).
+///
+/// Путь разрешается дважды, потому что запись идёт двумя механизмами: куски
+/// пишет .NET (`[IO.File]`), который разрешает относительный путь от текущего
+/// каталога процесса, а цель заменяет `Move-Item`, который разрешает его от
+/// расположения PowerShell. Проверяются оба.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteScan {
+    /// Путь, как его разрешит PowerShell для `-LiteralPath`.
+    pub full_name: String,
+    /// Путь, как его разрешит .NET (`[IO.Path]::GetFullPath`).
+    pub dotnet_full_name: String,
+    /// Существует ли цель.
+    pub exists: bool,
+    /// Защищённые корни хоста.
+    pub roots: HostRoots,
+}
+
+impl WriteScan {
+    /// Разбирает JSON-ответ скана записи.
+    ///
+    /// # Errors
+    ///
+    /// Возвращает текст ошибки, если нет `FullName`, `DotNetFullName`,
+    /// `Exists` или `Roots` с непустым `SystemRoot` (fail-closed).
+    pub fn from_json(raw: &str) -> Result<Self, String> {
+        let object = scan_object(raw)?;
+        Ok(Self {
+            full_name: required_str(&object, "FullName")?,
+            dotnet_full_name: required_str(&object, "DotNetFullName")?,
+            exists: required_bool(&object, "Exists")?,
+            roots: HostRoots::from_scan(&object)?,
+        })
+    }
+}
+
+/// Решение по скану записи: защищённый путь в любом из двух разрешений, затем
+/// правило перезаписи (TR-FS-03, TR-FS-06).
+#[must_use]
+pub fn decide_write_scan(scan: &WriteScan, requested: &str, overwrite: bool) -> PolicyDecision {
+    for resolved in [&scan.full_name, &scan.dotnet_full_name] {
+        if let Some(refusal) = refuse_resolved(resolved, &scan.roots, requested, "write to") {
+            return refusal;
+        }
+    }
+    decide_overwrite(requested, scan.exists, overwrite)
 }
 
 /// Решение по результату скана одиночного файла (DR-6).
@@ -570,32 +740,21 @@ pub fn decide_file_delete(scan: &FileScan, requested: &str) -> PolicyDecision {
             "PATH_IS_DIRECTORY",
         );
     }
-    if is_protected_path(&scan.full_name) {
-        return PolicyDecision::deny(
-            format!(
-                "refusing to delete a protected path (resolved by the host to {}): {requested}",
-                scan.full_name
-            ),
-            "PATH_PROTECTED",
-        );
+    if let Some(refusal) = refuse_resolved(&scan.full_name, &scan.roots, requested, "delete") {
+        return refusal;
     }
     PolicyDecision::allow("file delete scan is safe")
 }
 
 /// Решение по результату предварительного скана (DR-6, ADR-0005 §5).
 ///
-/// Проверяет канонический путь хоста (`FullName`), точку повторной обработки и
-/// предохранительный лимит элементов. Любая непройденная проверка — отказ.
+/// Проверяет канонический путь хоста (`FullName`) по лексическому списку и по
+/// корням хоста, точку повторной обработки и предохранительный лимит
+/// элементов. Любая непройденная проверка — отказ.
 #[must_use]
 pub fn decide_delete_scan(scan: &DeleteScan, requested: &str, cap: i64) -> PolicyDecision {
-    if is_protected_path(&scan.full_name) {
-        return PolicyDecision::deny(
-            format!(
-                "refusing to delete a protected path (resolved by the host to {}): {requested}",
-                scan.full_name
-            ),
-            "PATH_PROTECTED",
-        );
+    if let Some(refusal) = refuse_resolved(&scan.full_name, &scan.roots, requested, "delete") {
+        return refusal;
     }
     if scan.is_reparse_point {
         return PolicyDecision::deny(
@@ -905,7 +1064,7 @@ mod tests {
     #[test]
     fn delete_scan_parses_host_json() {
         let scan = DeleteScan::from_json(
-            r#"{"FullName":"C:\\App\\link","IsReparsePoint":true,"FileCount":2,"DirCount":1,"TotalItems":3,"NestedReparsePoint":false}"#,
+            r#"{"FullName":"C:\\App\\link","IsReparsePoint":true,"FileCount":2,"DirCount":1,"TotalItems":3,"NestedReparsePoint":false,"Roots":{"SystemRoot":"C:\\Windows"}}"#,
         )
         .expect("valid scan");
         assert_eq!(scan.full_name, "C:\\App\\link");
@@ -934,6 +1093,7 @@ mod tests {
             file_count: 1,
             dir_count: 0,
             nested_reparse_point: false,
+            roots: HostRoots::default(),
         };
         let decision = decide_delete_scan(&scan, "C:\\App\\link", 5000);
         assert!(!decision.allow);
@@ -950,6 +1110,7 @@ mod tests {
             file_count: 1,
             dir_count: 0,
             nested_reparse_point: false,
+            roots: HostRoots::default(),
         };
         let decision = decide_delete_scan(&scan, "C:\\App\\shortcut", 5000);
         assert!(!decision.allow);
@@ -965,6 +1126,7 @@ mod tests {
             file_count: 5000,
             dir_count: 1,
             nested_reparse_point: false,
+            roots: HostRoots::default(),
         };
         let decision = decide_delete_scan(&scan, "C:\\App\\logs", 5000);
         assert!(!decision.allow);
@@ -980,6 +1142,7 @@ mod tests {
             file_count: 9,
             dir_count: 1,
             nested_reparse_point: false,
+            roots: HostRoots::default(),
         };
         assert!(decide_delete_scan(&scan, "C:\\App\\logs", 5000).allow);
     }
@@ -995,6 +1158,7 @@ mod tests {
             file_count: 9,
             dir_count: 1,
             nested_reparse_point: true,
+            roots: HostRoots::default(),
         };
         let decision = decide_delete_scan(&scan, "C:\\App\\logs", 5000);
         assert!(!decision.allow);
@@ -1011,7 +1175,7 @@ mod tests {
             .is_err()
         );
         let scan = DeleteScan::from_json(
-            r#"{"FullName":"C:\\App","IsReparsePoint":false,"TotalItems":1,"NestedReparsePoint":false}"#,
+            r#"{"FullName":"C:\\App","IsReparsePoint":false,"TotalItems":1,"NestedReparsePoint":false,"Roots":{"SystemRoot":"C:\\Windows"}}"#,
         )
         .expect("valid scan");
         assert!(!scan.nested_reparse_point);
@@ -1019,7 +1183,7 @@ mod tests {
 
     #[test]
     fn file_scan_parses_and_rejects_missing_fields() {
-        let scan = FileScan::from_json(r#"{"FullName":"C:\\App\\a.txt","IsDirectory":false}"#)
+        let scan = FileScan::from_json(r#"{"FullName":"C:\\App\\a.txt","IsDirectory":false,"Roots":{"SystemRoot":"C:\\Windows"}}"#)
             .expect("valid scan");
         assert_eq!(scan.full_name, "C:\\App\\a.txt");
         assert!(!scan.is_directory);
@@ -1033,6 +1197,7 @@ mod tests {
         let directory = FileScan {
             full_name: "C:\\App\\logs".to_owned(),
             is_directory: true,
+            roots: HostRoots::default(),
         };
         assert_eq!(
             decide_file_delete(&directory, "C:\\App\\logs").code,
@@ -1042,6 +1207,7 @@ mod tests {
         let protected = FileScan {
             full_name: "C:\\Windows\\System32\\drivers\\etc\\hosts".to_owned(),
             is_directory: false,
+            roots: HostRoots::default(),
         };
         assert_eq!(
             decide_file_delete(&protected, "C:\\App\\shortcut").code,
@@ -1051,7 +1217,161 @@ mod tests {
         let ordinary = FileScan {
             full_name: "C:\\App\\a.txt".to_owned(),
             is_directory: false,
+            roots: HostRoots::default(),
         };
         assert!(decide_file_delete(&ordinary, "C:\\App\\a.txt").allow);
+    }
+
+    fn roots(pairs: &[(&str, &str)]) -> HostRoots {
+        HostRoots {
+            roots: pairs
+                .iter()
+                .map(|(name, path)| ((*name).to_owned(), (*path).to_owned()))
+                .collect(),
+        }
+    }
+
+    /// AC-FS-07: корни читаются из скана; пустой необязательный пропускается,
+    /// а пустой или отсутствующий `SystemRoot` — отказ (ADR-0015 §11).
+    #[test]
+    fn host_roots_parse_and_require_system_root() {
+        let scan = FileScan::from_json(
+            r#"{"FullName":"D:\\App\\a.txt","IsDirectory":false,"Roots":{"SystemRoot":"D:\\Windows","ProgramFiles":"D:\\Program Files","ProgramFilesX86":null,"ProgramData":"","Users":"D:\\Users"}}"#,
+        )
+        .expect("valid scan");
+        assert_eq!(
+            scan.roots,
+            roots(&[
+                ("SystemRoot", "D:\\Windows"),
+                ("ProgramFiles", "D:\\Program Files"),
+                ("Users", "D:\\Users"),
+            ])
+        );
+        for broken in [
+            r#"{"FullName":"D:\\a","IsDirectory":false}"#,
+            r#"{"FullName":"D:\\a","IsDirectory":false,"Roots":{}}"#,
+            r#"{"FullName":"D:\\a","IsDirectory":false,"Roots":{"SystemRoot":""}}"#,
+            r#"{"FullName":"D:\\a","IsDirectory":false,"Roots":{"SystemRoot":null,"ProgramFiles":"D:\\Program Files"}}"#,
+        ] {
+            assert!(FileScan::from_json(broken).is_err(), "{broken}");
+        }
+    }
+
+    /// AC-FS-07: система на `D:` защищена по фактическому расположению, хотя
+    /// лексический список знает только `C:`.
+    #[test]
+    fn host_roots_cover_the_actual_system_location() {
+        let system = roots(&[
+            ("SystemRoot", "D:\\Windows"),
+            ("ProgramData", "D:\\ProgramData"),
+            ("Users", "D:\\Users"),
+        ]);
+        assert_eq!(
+            system.containing("d:/windows/system32/drivers/etc/hosts"),
+            Some(("SystemRoot", "D:\\Windows"))
+        );
+        assert_eq!(
+            system.containing("D:\\Windows"),
+            Some(("SystemRoot", "D:\\Windows"))
+        );
+        assert_eq!(
+            system.containing("D:\\Users\\alice\\notes.txt"),
+            Some(("Users", "D:\\Users"))
+        );
+        assert_eq!(system.containing("D:\\WindowsApps\\x"), None);
+        assert_eq!(system.containing("D:\\App\\x"), None);
+        assert_eq!(system.containing(""), None);
+    }
+
+    /// AC-SEC04-5: удаление отвергает путь внутри корня хоста.
+    #[test]
+    fn delete_scans_refuse_paths_inside_host_roots() {
+        let system = roots(&[("SystemRoot", "D:\\Windows")]);
+        let file = FileScan {
+            full_name: "D:\\Windows\\System32\\kernel32.dll".to_owned(),
+            is_directory: false,
+            roots: system.clone(),
+        };
+        let decision = decide_file_delete(&file, "D:\\Windows\\System32\\kernel32.dll");
+        assert_eq!(decision.code, "PATH_PROTECTED");
+        assert!(
+            decision.reason.contains("SystemRoot"),
+            "{}",
+            decision.reason
+        );
+
+        let directory = DeleteScan {
+            full_name: "D:\\Windows\\Temp".to_owned(),
+            is_reparse_point: false,
+            total_items: 1,
+            file_count: 1,
+            dir_count: 0,
+            nested_reparse_point: false,
+            roots: system,
+        };
+        assert_eq!(
+            decide_delete_scan(&directory, "D:\\Windows\\Temp", 5000).code,
+            "PATH_PROTECTED"
+        );
+    }
+
+    fn write_scan(full: &str, dotnet: &str, exists: bool) -> WriteScan {
+        WriteScan {
+            full_name: full.to_owned(),
+            dotnet_full_name: dotnet.to_owned(),
+            exists,
+            roots: roots(&[
+                ("SystemRoot", "D:\\Windows"),
+                ("ProgramFiles", "D:\\Program Files"),
+            ]),
+        }
+    }
+
+    /// AC-FS-07: запись отвергается, если в корень хоста попадает любое из
+    /// двух разрешений пути, а обычный путь проходит к правилу перезаписи.
+    #[test]
+    fn write_scan_checks_both_resolutions_and_then_overwrite() {
+        let inside_ps = write_scan("D:\\Windows\\x.ps1", "D:\\App\\x.ps1", false);
+        assert_eq!(
+            decide_write_scan(&inside_ps, "x.ps1", false).code,
+            "PATH_PROTECTED"
+        );
+        let inside_net = write_scan("D:\\App\\x.ps1", "D:\\Program Files\\x.ps1", false);
+        assert_eq!(
+            decide_write_scan(&inside_net, "x.ps1", false).code,
+            "PATH_PROTECTED"
+        );
+        let lexical = write_scan("C:\\Windows\\x.ps1", "C:\\Windows\\x.ps1", false);
+        assert_eq!(
+            decide_write_scan(&lexical, "x.ps1", false).code,
+            "PATH_PROTECTED"
+        );
+
+        let fresh = write_scan("D:\\App\\x.ps1", "D:\\App\\x.ps1", false);
+        assert!(decide_write_scan(&fresh, "D:\\App\\x.ps1", false).allow);
+        let existing = write_scan("D:\\App\\x.ps1", "D:\\App\\x.ps1", true);
+        assert_eq!(
+            decide_write_scan(&existing, "D:\\App\\x.ps1", false).code,
+            "FILE_EXISTS"
+        );
+        assert!(decide_write_scan(&existing, "D:\\App\\x.ps1", true).allow);
+    }
+
+    #[test]
+    fn write_scan_parses_and_fails_closed() {
+        let scan = WriteScan::from_json(
+            r#"{"FullName":"D:\\App\\x","DotNetFullName":"D:\\App\\x","Exists":true,"Roots":{"SystemRoot":"D:\\Windows"}}"#,
+        )
+        .expect("valid scan");
+        assert!(scan.exists);
+        assert_eq!(scan.dotnet_full_name, "D:\\App\\x");
+        for broken in [
+            "not json",
+            r#"{"FullName":"D:\\App\\x","Exists":true,"Roots":{"SystemRoot":"D:\\Windows"}}"#,
+            r#"{"FullName":"D:\\App\\x","DotNetFullName":"D:\\App\\x","Roots":{"SystemRoot":"D:\\Windows"}}"#,
+            r#"{"FullName":"D:\\App\\x","DotNetFullName":"D:\\App\\x","Exists":false}"#,
+        ] {
+            assert!(WriteScan::from_json(broken).is_err(), "{broken}");
+        }
     }
 }

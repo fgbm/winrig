@@ -20,8 +20,8 @@ use crate::config::AppConfig;
 use crate::executor::sanitize_prompt_value;
 use crate::identity::RequestIdentity;
 use crate::policy::{
-    DeleteScan, FileScan, decide_delete_path, decide_delete_scan, decide_file_delete, decide_host,
-    decide_overwrite, decide_port, decide_tls, decide_write_path,
+    DeleteScan, FileScan, WriteScan, decide_delete_path, decide_delete_scan, decide_file_delete,
+    decide_host, decide_port, decide_tls, decide_write_path, decide_write_scan,
 };
 use crate::ps;
 use crate::session::{SessionRegistry, UserIdentity};
@@ -1695,13 +1695,14 @@ impl WinrigServer {
             Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
         };
 
-        // Существование цели выясняем у хоста: гонку это не закрывает, но
-        // отличает создание от перезаписи в подтверждении (TR-FS-03).
+        // Скан хостом: путь, как его разрешат .NET и PowerShell, существование
+        // цели и защищённые корни хоста (TR-FS-03, TR-FS-06). Гонку это не
+        // закрывает, но отличает создание от перезаписи в подтверждении.
         let probe = self
             .run_value(
                 &identity,
                 &params.session_id,
-                &ps::write_precheck(&params.path),
+                &ps::write_scan(&params.path),
                 "write_file",
             )
             .await;
@@ -1715,13 +1716,23 @@ impl WinrigServer {
                 "probe": probe,
             })));
         };
-        let exists = probe_stdout.trim() == "EXISTS";
-        let overwrite_decision = decide_overwrite(&params.path, exists, params.overwrite);
-        if !overwrite_decision.allow {
-            return Ok(CallToolResult::structured(
-                json!({ "error": overwrite_decision.reason }),
-            ));
+        let scan = match WriteScan::from_json(&probe_stdout) {
+            Ok(scan) => scan,
+            Err(error) => {
+                return Ok(CallToolResult::structured(json!({
+                    "error": format!("{error} Refusing to write."),
+                    "scan": probe_stdout,
+                })));
+            }
+        };
+        let scan_decision = decide_write_scan(&scan, &params.path, params.overwrite);
+        if !scan_decision.allow {
+            return Ok(CallToolResult::structured(json!({
+                "error": scan_decision.reason,
+                "scan": probe_stdout,
+            })));
         }
+        let exists = scan.exists;
 
         let bytes = params.content.len();
         require_confirmation!(
@@ -1733,9 +1744,10 @@ impl WinrigServer {
                 "WRITE FILE"
             },
             &format!(
-                "Path: {}\nBytes: {bytes}\nEncoding: {}\nExisting file: {}\n\n\
+                "Path: {}\nResolved: {}\nBytes: {bytes}\nEncoding: {}\nExisting file: {}\n\n\
                  The file is replaced as a whole.",
                 params.path,
+                scan.full_name,
                 params.encoding,
                 if exists { "yes" } else { "no" }
             )
@@ -1807,13 +1819,7 @@ impl WinrigServer {
 
         // Скан хостом: раскрывает полный путь (8.3, reparse) и не даёт удалить
         // каталог через delete_file.
-        let scan_command = format!(
-            "$item = Get-Item -LiteralPath '{safe}' -Force -ErrorAction Stop; \
-             [PSCustomObject]@{{ FullName=$item.FullName; IsDirectory=[bool]$item.PSIsContainer; \
-             SizeBytes=if($item.PSIsContainer){{$null}}else{{$item.Length}}; \
-             Modified=$item.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss') }} \
-             | ConvertTo-Json -Compress"
-        );
+        let scan_command = ps::delete_file_scan(&params.path);
         let pre = self
             .run_value(&identity, &params.session_id, &scan_command, "delete_file")
             .await;
@@ -1886,18 +1892,7 @@ impl WinrigServer {
 
         // ADR-0005 §5: предварительный скан хостом — единственный способ
         // увидеть реальный FullName (8.3-имена) и признак reparse point.
-        let scan_command = format!(
-            "$item = Get-Item -LiteralPath '{safe}' -Force -ErrorAction Stop; \
-             if (-not $item.PSIsContainer) {{ throw 'Path is a file — use delete_file instead' }}; \
-             $isReparse = [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint); \
-             $files = @(Get-ChildItem -LiteralPath '{safe}' -Recurse -File -Force -ErrorAction SilentlyContinue | Select-Object -First {limit}); \
-             $dirs = @(Get-ChildItem -LiteralPath '{safe}' -Recurse -Directory -Force -ErrorAction SilentlyContinue | Select-Object -First {limit}); \
-             $nestedReparse = [bool](@($dirs | Where-Object {{ [bool]($_.Attributes -band [IO.FileAttributes]::ReparsePoint) }}).Count -gt 0); \
-             [PSCustomObject]@{{ FullName=$item.FullName; IsReparsePoint=$isReparse; NestedReparsePoint=$nestedReparse; \
-             FileCount=$files.Count; DirCount=$dirs.Count; TotalItems=($files.Count + $dirs.Count) }} \
-             | ConvertTo-Json -Compress",
-            limit = cap + 1
-        );
+        let scan_command = ps::delete_directory_scan(&params.path, cap + 1);
         let pre = self
             .run_value(
                 &identity,
@@ -2115,7 +2110,7 @@ mod tests {
         assert_eq!(base64_payloads(&command), vec!["c2VjcmV0".to_owned()]);
         // Команда без полезной нагрузки не даёт ложных секретов: пустая строка
         // редактировала бы весь вывод.
-        assert!(base64_payloads(&ps::write_precheck("C:\\a")).is_empty());
+        assert!(base64_payloads(&ps::write_scan("C:\\a")).is_empty());
         assert!(base64_payloads(&ps::write_chunk("C:\\Temp\\p", "", true)).is_empty());
     }
 

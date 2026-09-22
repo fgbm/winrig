@@ -452,17 +452,15 @@ impl SessionRegistry {
             return locked;
         }
 
-        let password = match identity
-            .password
-            .clone()
-            .or_else(|| self.cached_password(&username))
-        {
-            Some(password) => password,
-            None => {
-                return json!({
-                    "error": "AD password is not cached or has expired. Call connect to enter it again."
-                });
-            }
+        // TR-SEC-13: пароль приходит в том же запросе. Кэш по одному имени
+        // сессию не открывает: имя из `X-AD-User` любой держатель общего
+        // секрета может назвать чужим (ADR-0015 §3). Профиль несёт пароль
+        // всегда, поэтому для него ветка не меняется.
+        let Some(password) = identity.password.clone() else {
+            return json!({
+                "error": "connect requires the AD password in the X-AD-Password header of the same \
+                          request; a cached password is not used to open a session."
+            });
         };
 
         let use_tls =
@@ -1193,13 +1191,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_without_password_reports_expired_cache() {
+    async fn connect_without_password_is_refused() {
         let transport = Arc::new(FakeTransport::returning(output("", "", 0)));
         let registry = registry(transport);
         let reply = registry
             .connect(&UserIdentity::new("bob"), "host1", None, None, true)
             .await;
-        assert!(reply["error"].as_str().is_some());
+        assert!(
+            reply["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("X-AD-Password"))
+        );
+    }
+
+    /// AC-SEC13-1: на пути по заголовкам закэшированный пароль по одному
+    /// имени не открывает сессию. Иначе держатель общего секрета, назвавшись
+    /// чужим `X-AD-User`, подключился бы чужим паролем (TR-SEC-13).
+    #[tokio::test]
+    async fn header_connect_without_password_ignores_the_cached_one() {
+        let transport = Arc::new(FakeTransport::returning(output("HOST1||||", "", 0)));
+        let registry = registry(Arc::clone(&transport));
+        let alice = UserIdentity::with_password("alice", "a-secret");
+        let _ = registry.connect(&alice, "host1", None, None, true).await;
+        assert!(registry.has_cached_password("alice"));
+        let calls_before = transport.calls().len();
+
+        let impostor = UserIdentity::new("alice");
+        let reply = registry.connect(&impostor, "host2", None, None, true).await;
+
+        let error = reply["error"].as_str().expect("refused");
+        assert!(error.contains("X-AD-Password"), "{error}");
+        assert_eq!(
+            transport.calls().len(),
+            calls_before,
+            "the refused connect reached the transport"
+        );
+        assert_eq!(registry.list_sessions("alice")["count"], 1);
+        // Пароля не было, поэтому и отказа учётных данных не было.
+        assert!(registry.check_lockout("alice").is_none());
+        assert!(!lock(&registry.failures).contains_key("alice"));
     }
 
     #[tokio::test]

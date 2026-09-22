@@ -117,10 +117,10 @@
 
 ```bash
 # Замените версию и таргет на свою платформу.
-curl -LO https://github.com/fgbm/winrig/releases/latest/download/winrig-v0.1.0-x86_64-unknown-linux-musl.tar.gz
-curl -LO https://github.com/fgbm/winrig/releases/latest/download/winrig-v0.1.0-x86_64-unknown-linux-musl.sha256
-sha256sum -c winrig-v0.1.0-x86_64-unknown-linux-musl.sha256
-tar xzf winrig-v0.1.0-x86_64-unknown-linux-musl.tar.gz
+curl -LO https://github.com/fgbm/winrig/releases/latest/download/winrig-v0.2.0-x86_64-unknown-linux-musl.tar.gz
+curl -LO https://github.com/fgbm/winrig/releases/latest/download/winrig-v0.2.0-x86_64-unknown-linux-musl.sha256
+sha256sum -c winrig-v0.2.0-x86_64-unknown-linux-musl.sha256
+tar xzf winrig-v0.2.0-x86_64-unknown-linux-musl.tar.gz
 install -m 0755 winrig ~/.local/bin/winrig
 ```
 

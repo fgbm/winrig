@@ -302,13 +302,50 @@ fn is_loopback_literal(host: &str) -> bool {
         .is_ok_and(|address| address.is_loopback())
 }
 
+/// Истина для DNS-имени: метки из `[A-Za-z0-9_-]` через точку, без пустых.
+///
+/// `_` допускается ради NetBIOS-имён; символов, которыми URL или `winrm-rs`
+/// режут строку (`/`, `?`, `#`, `@`, `:`), в имени быть не может.
+fn is_host_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+}
+
+/// Истина, если строка — имя хоста, IP-адрес или IPv6 в квадратных скобках.
+///
+/// Проверка нужна до сравнения со списком: `winrm-rs` обрезает хост по `/`,
+/// `@`, `://` и `:порт`, а URL-парсер — по `?` и `#`, поэтому строка
+/// `evil.com/.corp.example` совпала бы с суффиксом `.corp.example`, а
+/// подключение ушло бы на `evil.com` (ADR-0015 §6).
+#[must_use]
+pub fn is_valid_host(host: &str) -> bool {
+    if let Some(inner) = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        return inner.parse::<std::net::Ipv6Addr>().is_ok();
+    }
+    host.parse::<std::net::IpAddr>().is_ok() || is_host_name(host)
+}
+
 /// Решает, разрешён ли хост (Q-03, ADR-0015 §6–7).
 ///
-/// Пустой список разрешает только loopback-литералы; `*` — любой хост;
-/// элемент с ведущей `.` — суффикс; иначе точное совпадение без учёта регистра.
+/// Строка, которая не является именем или IP, не разрешена никогда. Пустой
+/// список разрешает только loopback-литералы; `*` — любой хост; элемент с
+/// ведущей `.` — суффикс; иначе точное совпадение без учёта регистра.
 #[must_use]
 pub fn host_allowed(host: &str, allowed_hosts: &[String]) -> bool {
     let candidate = host.trim().to_lowercase();
+    if !is_valid_host(&candidate) {
+        return false;
+    }
     if allowed_hosts.iter().all(|raw| raw.trim().is_empty()) {
         return is_loopback_literal(&candidate);
     }
@@ -367,7 +404,12 @@ pub fn decide_host(host: &str, allowed_hosts: &[String]) -> PolicyDecision {
     if host_allowed(host, allowed_hosts) {
         PolicyDecision::allow("host is allowed")
     } else {
-        let reason = if allowed_hosts.iter().all(|raw| raw.trim().is_empty()) {
+        let reason = if !is_valid_host(&host.trim().to_lowercase()) {
+            format!(
+                "host {host:?} is not a host name or IP address; pass the bare name or address, \
+                 and the port in the port argument"
+            )
+        } else if allowed_hosts.iter().all(|raw| raw.trim().is_empty()) {
             format!(
                 "host {host:?} is not allowed: WINRIG_ALLOWED_HOSTS is empty, which permits only \
                  loopback (localhost, 127.0.0.0/8, ::1); list the hosts, or use * for any host"
@@ -952,6 +994,48 @@ mod tests {
         assert!(host_allowed("anything.example.com", &hosts(&["*"])));
         assert!(host_allowed("10.0.0.1", &hosts(&["host1", "*"])));
         assert!(!host_allowed("web.example.com", &hosts(&["*.example.com"])));
+    }
+
+    /// AC-SEC05-5: хост, который не является именем или IP, отвергается при
+    /// любом списке. `winrm-rs` обрезает строку по `/`, `@`, `://` и `:порт`, а
+    /// URL-парсер — по `?` и `#`, поэтому `evil.com/.corp.example` проходил
+    /// суффиксную проверку и уходил на `evil.com` (ADR-0015).
+    #[test]
+    fn malformed_host_is_refused_by_any_allowlist() {
+        for host in [
+            "evil.com/.corp.example",
+            "evil.com?.corp.example",
+            "evil.com#.corp.example",
+            "x.corp.example@evil.com",
+            "http://evil.com",
+            "evil.com:5985",
+            "evil .corp.example",
+            "evil.com\\.corp.example",
+            "a..corp.example",
+            ".corp.example",
+            "[evil.com]",
+            "",
+        ] {
+            for list in [hosts(&[".corp.example"]), hosts(&["*"]), Vec::new()] {
+                assert!(!host_allowed(host, &list), "{host:?} with {list:?}");
+            }
+            assert!(
+                decide_host(host, &hosts(&["*"]))
+                    .reason
+                    .contains("not a host name or IP address"),
+                "{host:?}"
+            );
+        }
+        for host in [
+            "web-01",
+            "web.corp.example",
+            "host_1",
+            "10.0.0.1",
+            "fe80::1",
+            "[fe80::1]",
+        ] {
+            assert!(host_allowed(host, &hosts(&["*"])), "{host:?}");
+        }
     }
 
     /// Непустой список не подмешивает loopback: оператор перечислил хосты сам.

@@ -718,14 +718,14 @@ mod tests {
         assert_eq!(
             environment["WINRIG_STATE_DIR"].as_str().unwrap(),
             state.to_string_lossy(),
-            "в конфиг уходит корень, без имени профиля"
+            "the config gets the root, without the profile name"
         );
         let token_reference = environment["WINRIG_TOKEN"].as_str().unwrap();
         let expected = state.join("corp").join("winrig-token");
         assert_eq!(
             token_reference,
             format!("{{file:{}}}", expected.display()),
-            "ссылка на токен указывает в каталог профиля"
+            "the token reference points into the profile directory"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -747,7 +747,11 @@ mod tests {
             .expect("write");
         let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let keys: Vec<&String> = value["mcp"].as_object().unwrap().keys().collect();
-        assert_eq!(keys, vec!["winrig-tm"], "ключ сохраняется, дубля нет");
+        assert_eq!(
+            keys,
+            vec!["winrig-tm"],
+            "the key is kept, with no duplicate"
+        );
         assert_eq!(
             value["mcp"]["winrig-tm"]["command"][0],
             "/usr/local/bin/winrig"
@@ -769,7 +773,7 @@ mod tests {
             .expect("write");
         let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let mcp = value["mcp"].as_object().unwrap();
-        assert_eq!(mcp.len(), 2, "профиль lab остаётся, corp добавляется");
+        assert_eq!(mcp.len(), 2, "the lab profile stays, corp is added");
         assert_eq!(mcp["winrig-lab"]["command"][2], "--profile");
         assert_eq!(mcp["winrig"]["command"][3], "corp");
     }

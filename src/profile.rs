@@ -610,9 +610,9 @@ mod tests {
         let text = error.to_string();
         assert!(
             text.contains("DOMAIN\\user"),
-            "отказ называет ожидаемую форму: {text}"
+            "the refusal names the expected form: {text}"
         );
-        assert!(!path.exists(), "профиль не создан");
+        assert!(!path.exists(), "the profile is not created");
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -667,26 +667,30 @@ mod tests {
     /// `to_digit(16)`, is the only thing that rejects a non-hex character.
     #[test]
     fn hex_decode_rejects_odd_length_and_non_hex() {
-        assert_eq!(hex_decode(""), Some(vec![]), "пустая строка — ноль байт");
+        assert_eq!(hex_decode(""), Some(vec![]), "empty string is zero bytes");
         assert_eq!(hex_decode("00ff10"), Some(vec![0x00, 0xff, 0x10]));
-        assert_eq!(hex_decode("AbCd"), Some(vec![0xab, 0xcd]), "регистр любой");
+        assert_eq!(hex_decode("AbCd"), Some(vec![0xab, 0xcd]), "either case");
 
-        assert_eq!(hex_decode("a"), None, "нечётная длина: одна цифра");
+        assert_eq!(hex_decode("a"), None, "odd length: one digit");
         assert_eq!(
             hex_decode("abc"),
             None,
-            "нечётная длина: хвост не отбросить"
+            "odd length: the trailing byte must not be dropped"
         );
 
         // All inputs below are of even length IN BYTES, otherwise the guard
         // above would drop them and the `to_digit` branch would stay untested.
-        assert_eq!(hex_decode("zz"), None, "не-hex буква");
-        assert_eq!(hex_decode("0g"), None, "не-hex во второй цифре пары");
-        assert_eq!(hex_decode("00 1"), None, "пробел как цифра не проходит");
+        assert_eq!(hex_decode("zz"), None, "non-hex letter");
+        assert_eq!(
+            hex_decode("0g"),
+            None,
+            "non-hex in the second digit of a pair"
+        );
+        assert_eq!(hex_decode("00 1"), None, "a space does not pass as a digit");
         assert_eq!(
             hex_decode("é"),
             None,
-            "не-ASCII: два байта, ни один не цифра"
+            "non-ASCII: two bytes, neither is a digit"
         );
     }
 

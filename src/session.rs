@@ -1318,14 +1318,17 @@ mod tests {
         ));
         assert!(!rejected.is_auth_failure());
         let text = rejected.to_string();
-        assert!(text.contains("5986"), "нужна подсказка про HTTPS: {text}");
+        assert!(
+            text.contains("5986"),
+            "a hint about HTTPS is required: {text}"
+        );
         assert!(
             text.contains("AllowUnencrypted"),
-            "нужна подсказка про AllowUnencrypted: {text}"
+            "a hint about AllowUnencrypted is required: {text}"
         );
         assert!(
             !text.contains("authentication failed"),
-            "это не отказ учётных данных: {text}"
+            "this is not a credential failure: {text}"
         );
     }
 
@@ -1338,10 +1341,10 @@ mod tests {
         ));
         assert!(!rejected.is_auth_failure());
         let text = rejected.to_string();
-        assert!(text.contains("503"), "статус должен сохраниться: {text}");
+        assert!(text.contains("503"), "the status must be kept: {text}");
         assert!(
             !text.contains("AllowUnencrypted"),
-            "лишняя подсказка: {text}"
+            "no extra hint expected: {text}"
         );
     }
 
@@ -1366,7 +1369,7 @@ mod tests {
         let reply = registry.connect(&identity, "host1", None, None, true).await;
         assert!(
             reply.get("auth_failed").is_none(),
-            "не отказ учётных данных: {reply}"
+            "not a credential failure: {reply}"
         );
         assert!(registry.has_cached_password("alice"));
     }
@@ -1397,7 +1400,7 @@ mod tests {
         }
         assert!(
             !registry.is_profile_refused("alice"),
-            "профиль не должен быть отвергнут"
+            "the profile must not be refused"
         );
         // The transport was called all six times: the lockout never stepped in.
         assert_eq!(transport.calls().len(), 6);
@@ -1752,7 +1755,7 @@ mod tests {
         }
         assert!(
             registry.is_profile_refused("alice"),
-            "профиль должен быть отвергнут"
+            "the profile must be refused"
         );
         let before = transport.calls().len();
         let identity = UserIdentity::from_profile("alice", SecretString::from("wrong"));

@@ -94,23 +94,78 @@ pub fn neutralize_separator(body: &str) -> String {
     body.replace(SEPARATOR, "[separator]")
 }
 
+/// True for a character that must not reach the prompt: the categories Cc, Cf,
+/// Zl and Zp (TR-SEC-19).
+///
+/// Bidi controls (U+202A..U+202E, U+2066..U+2069), zero-width characters and the
+/// other format characters are in Cf, so a value cannot reorder or hide the text.
+/// `char::is_control` covers Cc, which holds NEL U+0085, ESC, VT and FF.
+fn is_prompt_control(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{2028}' | '\u{2029}' // Zl, Zp
+            | '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}'
+            | '\u{0890}'..='\u{0891}' | '\u{08E2}' | '\u{180E}'
+            | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}' | '\u{110CD}' | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}' | '\u{E0020}'..='\u{E007F}'
+        )
+}
+
+/// Collapses the prompt-forbidden characters to a space and the audit separator to
+/// `-` (TR-SEC-19, ADR-0008 §11).
+fn flatten_for_prompt(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c == '═' {
+                '-'
+            } else if is_prompt_control(c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// Makes a confirmation prompt value unable to forge its structure.
 ///
 /// Service names, PIDs, registry keys, paths and software versions come from tool
-/// arguments and reach the elicitation message. Line breaks collapse to a space,
-/// the `═` separator becomes `-`, and the length is capped, so an argument cannot
-/// insert its own dialog "line" or break the dialog into a wrong consent (DR-5).
+/// arguments and reach the elicitation message. The control categories collapse to
+/// a space, the `═` separator becomes `-`, and the length is capped, so an argument
+/// cannot insert its own dialog "line", reorder the text or break the dialog into a
+/// wrong consent (DR-5). A cut value carries the visible marker `...` inside the
+/// cap: the head keeps `AUDIT_FIELD_MAX_CHARS - 3` characters (TR-SEC-19, Q-24).
 #[must_use]
 pub fn sanitize_prompt_value(value: &str) -> String {
-    let cleaned: String = value
-        .chars()
-        .map(|c| match c {
-            '\r' | '\n' => ' ',
-            '═' => '-',
-            other => other,
-        })
-        .collect();
-    cleaned.chars().take(AUDIT_FIELD_MAX_CHARS).collect()
+    let cleaned = flatten_for_prompt(value);
+    if cleaned.chars().count() <= AUDIT_FIELD_MAX_CHARS {
+        return cleaned;
+    }
+    let head: String = cleaned.chars().take(AUDIT_FIELD_MAX_CHARS - 3).collect();
+    format!("{head}...")
+}
+
+/// Caps a path-like field in the middle: the head and the tail stay visible, so a
+/// long path still shows its file name. The marker `...` counts inside the cap
+/// (TR-SEC-19, Q-24).
+#[must_use]
+pub fn sanitize_path_value(value: &str) -> String {
+    let cleaned = flatten_for_prompt(value);
+    let count = cleaned.chars().count();
+    if count <= AUDIT_FIELD_MAX_CHARS {
+        return cleaned;
+    }
+    let head_len = (AUDIT_FIELD_MAX_CHARS - 3) / 2;
+    let tail_len = AUDIT_FIELD_MAX_CHARS - 3 - head_len;
+    let head: String = cleaned.chars().take(head_len).collect();
+    let tail: String = cleaned.chars().skip(count - tail_len).collect();
+    format!("{head}...{tail}")
 }
 
 #[cfg(test)]
@@ -231,6 +286,52 @@ mod tests {
     #[test]
     fn sanitize_prompt_value_truncates_long_value() {
         assert!(sanitize_prompt_value(&"x".repeat(500)).chars().count() <= 200);
+    }
+
+    /// TR-SEC-19, Q-24: a cut field carries `...` inside the cap, and a value at
+    /// the cap is left unchanged.
+    #[test]
+    fn sanitize_prompt_value_marks_a_cut_field() {
+        let cut = sanitize_prompt_value(&"x".repeat(500));
+        assert_eq!(cut.chars().count(), AUDIT_FIELD_MAX_CHARS);
+        assert!(cut.ends_with("..."), "{cut}");
+        let at_cap = sanitize_prompt_value(&"x".repeat(AUDIT_FIELD_MAX_CHARS));
+        assert_eq!(at_cap.chars().count(), AUDIT_FIELD_MAX_CHARS);
+        assert!(!at_cap.ends_with("..."), "a value at the cap is not cut");
+    }
+
+    /// TR-SEC-19: every character of Cc, Cf, Zl and Zp becomes a space, so a value
+    /// cannot hide, reorder or break the dialog.
+    #[test]
+    fn sanitize_prompt_value_replaces_every_control_category() {
+        for c in [
+            '\u{0000}', '\u{000B}', '\u{000C}', '\u{001B}', '\u{007F}', '\u{0085}', '\u{2028}',
+            '\u{2029}', '\u{200B}', '\u{200E}', '\u{202A}', '\u{202E}', '\u{2066}', '\u{2069}',
+            '\u{FEFF}', '\u{00AD}',
+        ] {
+            let result = sanitize_prompt_value(&format!("a{c}b"));
+            assert_eq!(
+                result, "a b",
+                "U+{:04X} is not replaced: {result:?}",
+                c as u32
+            );
+        }
+    }
+
+    /// TR-SEC-19: a path field is cut in the middle, so the tail stays visible.
+    #[test]
+    fn sanitize_path_value_keeps_the_tail_visible() {
+        let path = format!("C:\\{}", "d".repeat(300));
+        let result = sanitize_path_value(&path);
+        assert_eq!(result.chars().count(), AUDIT_FIELD_MAX_CHARS);
+        assert!(result.starts_with("C:\\"), "{result}");
+        assert!(result.contains("..."), "{result}");
+        let tail: String = path.chars().skip(path.chars().count() - 40).collect();
+        assert!(
+            result.ends_with(&tail),
+            "the last 40 characters must stay visible: {result}"
+        );
+        assert_eq!(sanitize_path_value("C:\\a"), "C:\\a");
     }
 
     #[test]

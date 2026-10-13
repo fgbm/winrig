@@ -87,12 +87,14 @@ The directory write (slices W20–W21) stays intentionally outside the first wav
 
 These tools change the host and they require confirmation.
 
+Each confirmation names the host of the session, the user of the request and the tool. It names the target and the operation with the details that are available before the call, and it holds one plain line that states the effect and whether the operator can undo it. A hidden value appears only as `hidden`: the old and new values of `set_registry` and the content of `write_file` are hidden values, and `kill_process` does not read the command line at all. The server sanitizes each field and caps it at 200 characters; a cut path keeps its tail, and a cut field carries the marker `...` inside the cap. The text is English and does not depend on the language of the host.
+
 | Tool | Description |
 |------|-------------|
 | `restart_service` / `stop_service` / `start_service` | Manage the services with the state before and after. `stop_service` verifies the stop: it waits `wait_seconds` (15 by default), reads the state and the System events 7031/7034/7036, and reports an error when the service runs again. With `disable=true` it sets the start type to Disabled before the stop |
 | `set_service_start_type` | Set the start type (Automatic, AutomaticDelayed, Manual or Disabled). The confirmation shows the current and the new start type. The tool refuses a service that is critical for the remote session |
-| `kill_process` | Kill a process by PID |
-| `set_registry` | Write a registry value and show the old value and the new value |
+| `kill_process` | Terminate a process by PID. The confirmation shows the name, the executable path (with no arguments) and the start time. The command line is never read, so a secret in it cannot leak (DR-4) |
+| `set_registry` | Write a registry value. The old value and the new value appear only as `hidden`; the prompt shows whether the old value is present and its type |
 | `delete_file` / `delete_directory` | Delete with a confirmation prompt; the tool rejects protected paths, including by the actual location of the system on the host |
 | `flush_dns` | Clear the DNS client cache |
 | `write_file` | Write a file with a full replacement. **Off by default**: set `WINRIG_ALLOW_FILE_WRITE=true`, or the server does not declare the tool and no call can reach it |

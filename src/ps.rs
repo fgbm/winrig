@@ -304,7 +304,7 @@ pub fn delete_file_scan(path: &str) -> String {
         "$item = Get-Item -LiteralPath '{safe}' -Force -ErrorAction Stop; \
          [PSCustomObject]@{{ FullName=$item.FullName; IsDirectory=[bool]$item.PSIsContainer; \
          SizeBytes=if($item.PSIsContainer){{$null}}else{{$item.Length}}; \
-         Modified=$item.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'); {HOST_ROOTS} }} \
+         Modified=$item.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss',[Globalization.CultureInfo]::InvariantCulture); {HOST_ROOTS} }} \
          | ConvertTo-Json -Compress"
     )
 }
@@ -1405,6 +1405,31 @@ pub fn get_registry(key: &str, value_name: &str, subkeys: bool, depth: i64) -> S
          [PSCustomObject]@{{ values=$v; error=$e; subkeys=$keys; \
          truncated=$truncated; skipped=$skipped }} | ConvertTo-Json -Compress -Depth 3",
         over = limit + 1,
+    )
+}
+
+/// Whether a registry value exists, and its type, without reading the data
+/// (DR-4, TR-SEC-18).
+///
+/// The old value can be a secret, so the pre-confirmation read never returns it:
+/// the command reports only the state (`present`, `absent`, `unknown`) and the
+/// `RegistryValueKind` name. An access-denied or unreadable key gives `unknown`,
+/// not `absent`; the branch is on the .NET exception type, so it does not depend on
+/// the host locale.
+#[must_use]
+pub fn registry_value_presence(key: &str, value_name: &str) -> String {
+    let mut k = key.trim().to_owned();
+    if k.to_uppercase().starts_with("HKEY_") {
+        k = format!("Registry::{k}");
+    }
+    let safe_key = escape(&k);
+    let safe_val = escape(value_name.trim());
+    format!(
+        "$state='unknown';$type=$null;$k=$null; \
+         try {{ $k=Get-Item -LiteralPath '{safe_key}' -ErrorAction Stop }} \
+         catch {{ if ($_.Exception -is [System.Management.Automation.ItemNotFoundException]) {{ $state='absent' }} }}; \
+         if ($k) {{ try {{ if (@($k.GetValueNames()) -contains '{safe_val}') {{ $state='present'; $type=[string]$k.GetValueKind('{safe_val}') }} else {{ $state='absent' }} }} catch {{ $state='unknown' }} }}; \
+         [PSCustomObject]@{{ state=$state; type=$type }} | ConvertTo-Json -Compress"
     )
 }
 
@@ -2952,6 +2977,27 @@ mod tests {
                  | Select-Object * -ExcludeProperty PS* | ConvertTo-Json -Compress"
             ),
             "{cmd}"
+        );
+    }
+
+    /// DR-4, TR-SEC-18: the pre-confirmation read returns only the state and the
+    /// type, so the old value never reaches the prompt or the audit. An access
+    /// denied read is `unknown`, and the branch is on the .NET exception type, not
+    /// on a localized message.
+    #[test]
+    fn registry_value_presence_reads_no_data() {
+        let cmd = registry_value_presence("HKLM:\\SOFTWARE\\MyApp", "Password");
+        assert!(cmd.contains("GetValueNames"), "{cmd}");
+        assert!(cmd.contains("GetValueKind"), "{cmd}");
+        assert!(cmd.contains("state='present'"), "{cmd}");
+        assert!(cmd.contains("state='absent'"), "{cmd}");
+        assert!(
+            cmd.contains("System.Management.Automation.ItemNotFoundException"),
+            "the absence branch is not on the exception type: {cmd}"
+        );
+        assert!(
+            !cmd.contains("Get-ItemProperty"),
+            "the presence read must not read the value data: {cmd}"
         );
     }
 

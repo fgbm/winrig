@@ -28,7 +28,7 @@ use winrig::session::{
 };
 
 const HOST: &str = "host1";
-const USER: &str = "domain\\alice";
+const USER: &str = "contoso\\alice";
 const PASSWORD: &str = "s3cret";
 /// Signature of the mutating `flush_dns` command in the script sent to the host.
 const MUTATION: &str = "Clear-DnsClientCache";
@@ -1665,5 +1665,663 @@ async fn protected_services_are_refused_before_the_network() {
             "the refused service reached the host"
         );
     }
+    harness.client.cancel().await.ok();
+}
+
+// ---------------------------------------------------------------------------
+// Confirmation text: the host, the user, the tool, the target and the effect
+// ---------------------------------------------------------------------------
+
+/// One `kill_process` call in an open session.
+fn kill_process(pid: i64) -> CallToolRequestParams {
+    CallToolRequestParams::new("kill_process").with_arguments(args(&serde_json::json!({
+        "session_id": HOST,
+        "pid": pid
+    })))
+}
+
+/// One `set_registry` call in an open session.
+fn set_registry_call(key: &str, name: &str, data: &str) -> CallToolRequestParams {
+    CallToolRequestParams::new("set_registry").with_arguments(args(&serde_json::json!({
+        "session_id": HOST,
+        "key": key,
+        "value_name": name,
+        "value_data": data,
+        "value_type": "String"
+    })))
+}
+
+/// One `write_file` call in an open session.
+fn write_file_call(path: &str, content: &str, overwrite: bool) -> CallToolRequestParams {
+    CallToolRequestParams::new("write_file").with_arguments(args(&serde_json::json!({
+        "session_id": HOST,
+        "path": path,
+        "content": content,
+        "overwrite": overwrite
+    })))
+}
+
+/// One `delete_file` call in an open session.
+fn delete_file_call(path: &str) -> CallToolRequestParams {
+    CallToolRequestParams::new("delete_file").with_arguments(args(&serde_json::json!({
+        "session_id": HOST,
+        "path": path
+    })))
+}
+
+/// Every confirmation carries the header lines (TR-SEC-16, AC-SEC16-1).
+fn assert_header(message: &str, tool: &str) {
+    assert!(message.contains(&format!("Tool: {tool}")), "{message}");
+    assert!(message.contains(&format!("Host: {HOST}")), "{message}");
+    assert!(message.contains(&format!("User: {USER}")), "{message}");
+}
+
+/// The calls the transport recorded after the given index.
+fn calls_from(harness: &Harness, from: usize) -> Vec<String> {
+    harness
+        .transport
+        .calls
+        .lock()
+        .expect("lock")
+        .iter()
+        .skip(from)
+        .cloned()
+        .collect()
+}
+
+/// The captured audit text, and it clears the thread sink.
+fn take_audit(buffer: &Arc<Mutex<Vec<u8>>>) -> String {
+    let text = String::from_utf8_lossy(&buffer.lock().expect("lock")).into_owned();
+    SINK.with(|sink| sink.borrow_mut().take());
+    text
+}
+
+/// AC-SEC16-1, AC-SEC20-1: `flush_dns` names the host, the user and the tool, and
+/// the whole prompt is stable English. The exact text is checked, so a change of
+/// the wording or a host-localized string fails the test.
+#[tokio::test]
+async fn flush_dns_confirmation_is_stable_english() {
+    let harness = connected(Answer::Accept, &[]).await;
+    harness.call(flush_dns()).await;
+    let message = harness.last_confirmation();
+    assert_eq!(
+        message,
+        format!(
+            "Confirm FLUSH DNS CACHE?\n\nTool: flush_dns\nHost: {HOST}\nUser: {USER}\n\n\
+             This clears the whole DNS client cache. You cannot undo it."
+        ),
+        "the prompt must be the stable English text"
+    );
+    assert!(
+        message.is_ascii(),
+        "the prompt must hold no host locale: {message}"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// AC-SEC17-1: `restart_service` names the service, the plain state before the call
+/// and the intended state `Running`.
+#[tokio::test]
+async fn restart_service_confirmation_shows_the_intended_state() {
+    let harness = connected(Answer::Accept, &[]).await;
+    harness
+        .transport
+        .respond("Select-Object -First 1", r#"{"Status":"Stopped"}"#);
+    harness
+        .call(
+            CallToolRequestParams::new("restart_service").with_arguments(args(
+                &serde_json::json!({ "session_id": HOST, "name": "Spooler" }),
+            )),
+        )
+        .await;
+    let message = harness.last_confirmation();
+    assert_header(&message, "restart_service");
+    assert!(message.contains("Service: Spooler"), "{message}");
+    assert!(message.contains("State before: Stopped"), "{message}");
+    assert!(message.contains("Intended state: Running"), "{message}");
+    assert!(
+        message.contains("This restarts the service. To undo it, stop the service."),
+        "{message}"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// AC-SEC17-1: `stop_service` names the service, the plain state before the call and
+/// the intended state `Stopped`.
+#[tokio::test]
+async fn stop_service_confirmation_shows_the_intended_state() {
+    let harness = connected(Answer::Accept, &[]).await;
+    harness
+        .transport
+        .respond("Select-Object -First 1", r#"{"Status":"Running"}"#);
+    harness.transport.respond(
+        "FailureActionsOnNonCrashFailures",
+        r#"{"name":"Spooler","start_type":"Manual","status":"Stopped"}"#,
+    );
+    harness.call(stop_service("Spooler", false)).await;
+    let message = harness.last_confirmation();
+    assert_header(&message, "stop_service");
+    assert!(message.contains("Service: Spooler"), "{message}");
+    assert!(message.contains("State before: Running"), "{message}");
+    assert!(message.contains("Intended state: Stopped"), "{message}");
+    assert!(message.contains("Current start type: Manual"), "{message}");
+    assert!(!message.contains("New start type"), "{message}");
+    assert!(
+        message.contains("This stops the service. To undo it, start the service."),
+        "{message}"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// MAJOR: `stop_service` takes the current start type from `get_service_config`,
+/// which knows `AutomaticDelayed`; only the state comes from the state read. The
+/// value reaches the prompt and the recorded stop command.
+#[tokio::test]
+async fn stop_service_uses_the_configured_start_type() {
+    let harness = connected(Answer::Accept, &[]).await;
+    harness
+        .transport
+        .respond("Select-Object -First 1", r#"{"Status":"Running"}"#);
+    harness.transport.respond(
+        "FailureActionsOnNonCrashFailures",
+        r#"{"name":"Spooler","start_type":"AutomaticDelayed","status":"Running"}"#,
+    );
+    let before = harness.transport.calls.lock().expect("lock").len();
+    harness.call(stop_service("Spooler", true)).await;
+    let message = harness.last_confirmation();
+    assert!(
+        message.contains("Current start type: AutomaticDelayed"),
+        "{message}"
+    );
+    assert!(message.contains("New start type: Disabled"), "{message}");
+    let calls = calls_from(&harness, before);
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.contains("$prev='AutomaticDelayed'")),
+        "the stop command does not carry the configured start type: {calls:?}"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// AC-SEC17-2: the whole `stop_service(disable=true)` prompt is the stable English
+/// text with the service, the plain state, the current start type and the new start
+/// type `Disabled` (TR-SEC-15).
+#[tokio::test]
+async fn stop_service_disable_confirmation_is_exact() {
+    let harness = connected(Answer::Accept, &[]).await;
+    harness
+        .transport
+        .respond("Select-Object -First 1", r#"{"Status":"Running"}"#);
+    harness.transport.respond(
+        "FailureActionsOnNonCrashFailures",
+        r#"{"name":"Spooler","start_type":"Automatic","status":"Running"}"#,
+    );
+    harness.call(stop_service("Spooler", true)).await;
+    let message = harness.last_confirmation();
+    assert_eq!(
+        message,
+        format!(
+            "Confirm STOP SERVICE?\n\nTool: stop_service\nHost: {HOST}\nUser: {USER}\n\
+             Service: Spooler\nState before: Running\nCurrent start type: Automatic\n\
+             Intended state: Stopped\nNew start type: Disabled\n\n\
+             This sets the start type to Disabled, then stops the service. To undo it, set the \
+             start type again and start the service."
+        ),
+        "the prompt must be the stable English text"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// AC-SEC17-1: `start_service` names the service, the plain state before the call
+/// and the intended state `Running`.
+#[tokio::test]
+async fn start_service_confirmation_shows_the_intended_state() {
+    let harness = connected(Answer::Accept, &[]).await;
+    harness
+        .transport
+        .respond("Select-Object -First 1", r#"{"Status":"Stopped"}"#);
+    harness
+        .call(
+            CallToolRequestParams::new("start_service").with_arguments(args(
+                &serde_json::json!({ "session_id": HOST, "name": "Spooler" }),
+            )),
+        )
+        .await;
+    let message = harness.last_confirmation();
+    assert_header(&message, "start_service");
+    assert!(message.contains("Service: Spooler"), "{message}");
+    assert!(message.contains("State before: Stopped"), "{message}");
+    assert!(message.contains("Intended state: Running"), "{message}");
+    assert!(
+        message.contains("This starts the service. To undo it, stop the service."),
+        "{message}"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// AC-SEC17-1, DR-4: `kill_process` names the PID, the name, the executable path
+/// and the start time, and it states that the child processes continue to run. The
+/// command line is never read, so a secret in it never reaches the prompt or the
+/// audit.
+#[tokio::test]
+async fn kill_process_confirmation_never_reads_the_command_line() {
+    let buffer = capture();
+    let harness = connected(Answer::Accept, &[]).await;
+    // A host that would return the command line if the read asked for it.
+    harness.transport.respond(
+        "CommandLine",
+        r#"{"Name":"evil.exe","ExecutablePath":"C:\\evil.exe","Started":"2026-01-01T09:00:00Z","CommandLine":"evil.exe -P S3cr3t"}"#,
+    );
+    harness.transport.respond(
+        "Win32_Process",
+        r#"{"Name":"evil.exe","ExecutablePath":"C:\\evil.exe","Started":"2026-01-01T09:00:00Z"}"#,
+    );
+    let before = harness.transport.calls.lock().expect("lock").len();
+    harness.call(kill_process(4242)).await;
+    let message = harness.last_confirmation();
+    assert_header(&message, "kill_process");
+    assert!(message.contains("PID: 4242"), "{message}");
+    assert!(message.contains("Name: evil.exe"), "{message}");
+    assert!(
+        message.contains("Executable path: C:\\evil.exe"),
+        "{message}"
+    );
+    assert!(
+        message.contains("Started: 2026-01-01T09:00:00Z"),
+        "{message}"
+    );
+    assert!(!message.contains("Command line"), "{message}");
+    assert!(
+        message.contains("The child processes continue to run."),
+        "{message}"
+    );
+    assert!(
+        !message.contains("S3cr3t"),
+        "the secret leaked into the prompt: {message}"
+    );
+    // The pre-read must not select the command line at all, and it must name the
+    // fields it needs through -Property.
+    let calls = calls_from(&harness, before);
+    let pre = calls.first().expect("the pre-read reached the host");
+    assert!(
+        pre.contains("-Property"),
+        "the read does not bound the properties: {pre}"
+    );
+    assert!(
+        pre.contains("ExecutablePath") && pre.contains("CreationDate"),
+        "the read does not select the named fields: {pre}"
+    );
+    assert!(
+        calls.iter().all(|call| !call.contains("CommandLine")),
+        "the pre-read selected the command line: {calls:?}"
+    );
+    harness.client.cancel().await.ok();
+    let text = take_audit(&buffer);
+    assert!(
+        !text.contains("S3cr3t"),
+        "the secret leaked into the audit: {text}"
+    );
+}
+
+/// AC-SEC18-1: the whole `set_registry` prompt is the stable English text; the old
+/// value appears only as `present (hidden, String)` and the new value only as
+/// `hidden`. DR-4: the pre-read returns no data, so neither value reaches the
+/// prompt or the audit.
+#[tokio::test]
+async fn set_registry_confirmation_is_exact_and_hides_both_values() {
+    let buffer = capture();
+    let harness = connected(Answer::Accept, &[]).await;
+    // A host that would return the old data if the read asked for it.
+    harness.transport.respond(
+        "Select-Object -Property 'Password'",
+        r#"{"Password":"OldS3cret"}"#,
+    );
+    harness
+        .transport
+        .respond("GetValueNames", r#"{"state":"present","type":"String"}"#);
+    let before = harness.transport.calls.lock().expect("lock").len();
+    harness
+        .call(set_registry_call(
+            "HKLM:\\SOFTWARE\\MyApp",
+            "Password",
+            "NewS3cret",
+        ))
+        .await;
+    let message = harness.last_confirmation();
+    assert_eq!(
+        message,
+        format!(
+            "Confirm SET REGISTRY VALUE?\n\nTool: set_registry\nHost: {HOST}\nUser: {USER}\n\
+             Key: HKLM:\\SOFTWARE\\MyApp\nValue: Password\nType: String\n\
+             Old value: present (hidden, String)\nNew value: hidden\n\n\
+             This sets the registry value. To undo it, restore the previous value."
+        ),
+        "the prompt must be the stable English text"
+    );
+    assert!(
+        !message.contains("OldS3cret"),
+        "the old value leaked into the prompt: {message}"
+    );
+    assert!(
+        !message.contains("NewS3cret"),
+        "the new value leaked into the prompt: {message}"
+    );
+    // The pre-read returns only the presence and the type, never the value data.
+    let calls = calls_from(&harness, before);
+    let pre = calls.first().expect("the pre-read reached the host");
+    assert!(
+        pre.contains("GetValueNames"),
+        "the pre-read checks no presence: {pre}"
+    );
+    assert!(
+        !pre.contains("Select-Object -Property"),
+        "the pre-read reads the value data: {pre}"
+    );
+    harness.client.cancel().await.ok();
+    let text = take_audit(&buffer);
+    assert!(
+        !text.contains("OldS3cret"),
+        "the old value leaked into the audit: {text}"
+    );
+}
+
+/// AC-SEC18-1: an absent old value shows `not present`.
+#[tokio::test]
+async fn set_registry_confirmation_shows_an_absent_old_value() {
+    let harness = connected(Answer::Accept, &[]).await;
+    harness
+        .transport
+        .respond("GetValueNames", r#"{"state":"absent","type":null}"#);
+    harness
+        .call(set_registry_call("HKLM:\\SOFTWARE\\MyApp", "New", "x"))
+        .await;
+    let message = harness.last_confirmation();
+    assert!(message.contains("Old value: not present"), "{message}");
+    harness.client.cancel().await.ok();
+}
+
+/// AC-SEC18-1: a read that failed for another reason (access denied) shows
+/// `unknown`, not `not present`.
+#[tokio::test]
+async fn set_registry_confirmation_shows_unknown_for_a_failed_read() {
+    let harness = connected(Answer::Accept, &[]).await;
+    harness
+        .transport
+        .respond("GetValueNames", r#"{"state":"unknown","type":null}"#);
+    harness
+        .call(set_registry_call("HKLM:\\SOFTWARE\\MyApp", "New", "x"))
+        .await;
+    let message = harness.last_confirmation();
+    assert!(message.contains("Old value: unknown"), "{message}");
+    assert!(!message.contains("Old value: not present"), "{message}");
+    harness.client.cancel().await.ok();
+}
+
+/// AC-SEC18-1: `write_file` names the path, the resolved path, the size and the
+/// encoding, and shows the content only as `hidden`; the content itself is absent.
+#[tokio::test]
+async fn write_file_confirmation_hides_the_content() {
+    let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_FILE_WRITE", "true")]).await;
+    harness.transport.respond(
+        "GetUnresolvedProviderPathFromPSPath",
+        r#"{"FullName":"C:\\App\\config.json","DotNetFullName":"C:\\App\\config.json","Exists":false,"Roots":{"SystemRoot":"C:\\Windows"}}"#,
+    );
+    let secret = "TOPSECRET";
+    harness
+        .call(write_file_call("C:\\App\\config.json", secret, false))
+        .await;
+    let message = harness.last_confirmation();
+    assert_header(&message, "write_file");
+    assert!(message.contains("Path: C:\\App\\config.json"), "{message}");
+    assert!(
+        message.contains("Resolved: C:\\App\\config.json"),
+        "{message}"
+    );
+    assert!(message.contains("Bytes: 9"), "{message}");
+    assert!(message.contains("Encoding: utf8"), "{message}");
+    assert!(message.contains("Existing file: no"), "{message}");
+    assert!(message.contains("Content: hidden"), "{message}");
+    assert!(
+        !message.contains(secret),
+        "the content leaked into the prompt: {message}"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// AC-SEC17-1: the `write_file` effect line depends on the existence of the file.
+#[tokio::test]
+async fn write_file_effect_depends_on_existence() {
+    let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_FILE_WRITE", "true")]).await;
+    harness.transport.respond(
+        "GetUnresolvedProviderPathFromPSPath",
+        r#"{"FullName":"C:\\App\\new.json","DotNetFullName":"C:\\App\\new.json","Exists":false,"Roots":{"SystemRoot":"C:\\Windows"}}"#,
+    );
+    harness
+        .call(write_file_call("C:\\App\\new.json", "x", false))
+        .await;
+    let message = harness.last_confirmation();
+    assert!(message.contains("Existing file: no"), "{message}");
+    assert!(
+        message.contains("This creates the file. To undo it, delete the file."),
+        "{message}"
+    );
+    harness.client.cancel().await.ok();
+
+    let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_FILE_WRITE", "true")]).await;
+    harness.transport.respond(
+        "GetUnresolvedProviderPathFromPSPath",
+        r#"{"FullName":"C:\\App\\old.json","DotNetFullName":"C:\\App\\old.json","Exists":true,"Roots":{"SystemRoot":"C:\\Windows"}}"#,
+    );
+    harness
+        .call(write_file_call("C:\\App\\old.json", "x", true))
+        .await;
+    let message = harness.last_confirmation();
+    assert!(message.contains("Existing file: yes"), "{message}");
+    assert!(
+        message.contains("This replaces the whole file. You cannot undo it"),
+        "{message}"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// AC-SEC17-1: `delete_file` names the path, the resolved path, the size and the
+/// modification time, and it states that the deletion is permanent.
+#[tokio::test]
+async fn delete_file_confirmation_shows_the_path_and_the_metadata() {
+    let harness = connected(Answer::Accept, &[]).await;
+    harness.transport.respond(
+        "PSIsContainer",
+        r#"{"FullName":"C:\\App\\old.log","IsDirectory":false,"SizeBytes":123,"Modified":"2026-01-01 00:00:00","Roots":{"SystemRoot":"C:\\Windows"}}"#,
+    );
+    harness.call(delete_file_call("C:\\App\\old.log")).await;
+    let message = harness.last_confirmation();
+    assert_header(&message, "delete_file");
+    assert!(message.contains("Path: C:\\App\\old.log"), "{message}");
+    assert!(message.contains("Resolved: C:\\App\\old.log"), "{message}");
+    assert!(message.contains("Size: 123 bytes"), "{message}");
+    assert!(
+        message.contains("Modified: 2026-01-01 00:00:00"),
+        "{message}"
+    );
+    assert!(
+        message.contains("This deletes one file permanently. You cannot undo it."),
+        "{message}"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// AC-SEC17-1: `delete_directory` names the path, the resolved path and the item
+/// counts, and it states the second check of the reparse points after the
+/// confirmation.
+#[tokio::test]
+async fn delete_directory_confirmation_shows_the_counts_and_the_reparse_check() {
+    let harness = connected(Answer::Accept, &[]).await;
+    harness.transport.respond(
+        "IsReparsePoint",
+        r#"{"FullName":"C:\\App\\logs","IsReparsePoint":false,"NestedReparsePoint":false,"FileCount":3,"DirCount":2,"TotalItems":5,"Roots":{"SystemRoot":"C:\\Windows"}}"#,
+    );
+    harness
+        .call(
+            CallToolRequestParams::new("delete_directory").with_arguments(args(
+                &serde_json::json!({ "session_id": HOST, "path": "C:\\App\\logs" }),
+            )),
+        )
+        .await;
+    let message = harness.last_confirmation();
+    assert_header(&message, "delete_directory");
+    assert!(message.contains("Path: C:\\App\\logs"), "{message}");
+    assert!(message.contains("Resolved: C:\\App\\logs"), "{message}");
+    assert!(
+        message.contains("Items: 3 files + 2 directories"),
+        "{message}"
+    );
+    assert!(
+        message.contains("reparse points again after the confirmation"),
+        "{message}"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// AC-SEC17-2: `set_service_start_type` names the service, the current start type
+/// and the new start type, and it names the host, the user and the tool.
+#[tokio::test]
+async fn set_service_start_type_confirmation_names_the_header() {
+    let harness = connected(Answer::Accept, &[]).await;
+    harness.transport.respond(
+        "FailureActionsOnNonCrashFailures",
+        r#"{"name":"Spooler","start_type":"Manual","status":"Stopped"}"#,
+    );
+    harness
+        .call(set_start_type("Spooler", "AutomaticDelayed"))
+        .await;
+    let message = harness.last_confirmation();
+    assert_header(&message, "set_service_start_type");
+    assert!(message.contains("Service: Spooler"), "{message}");
+    assert!(message.contains("Current start type: Manual"), "{message}");
+    assert!(
+        message.contains("New start type: AutomaticDelayed"),
+        "{message}"
+    );
+    assert!(message.contains("set the start type again"), "{message}");
+    harness.client.cancel().await.ok();
+}
+
+/// AC-SEC19-1: a long path is cut in the middle, so the tail stays visible and the
+/// dialog structure stays intact.
+#[tokio::test]
+async fn a_long_path_keeps_its_tail_visible() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let long = format!("C:\\App\\{}", "d".repeat(300));
+    harness.transport.respond(
+        "PSIsContainer",
+        &format!(
+            r#"{{"FullName":"{}","IsDirectory":false,"SizeBytes":1,"Modified":"2026-01-01 00:00:00","Roots":{{"SystemRoot":"C:\\Windows"}}}}"#,
+            long.replace('\\', "\\\\")
+        ),
+    );
+    harness.call(delete_file_call("C:\\App\\x.log")).await;
+    let message = harness.last_confirmation();
+    assert_header(&message, "delete_file");
+    assert!(message.contains("Path: C:\\App\\x.log"), "{message}");
+    let resolved = message
+        .lines()
+        .find(|line| line.starts_with("Resolved: "))
+        .expect("a resolved line");
+    let value = resolved.trim_start_matches("Resolved: ");
+    assert_eq!(value.chars().count(), 200, "the field must sit at the cap");
+    assert!(value.contains("..."), "the cut carries the marker: {value}");
+    assert!(
+        value.ends_with(&"d".repeat(40)),
+        "the last 40 characters must stay visible: {value}"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// AC-SEC19-1: a line break inside a field collapses to a space, so the value
+/// cannot forge its own dialog line.
+#[tokio::test]
+async fn a_line_break_in_a_field_does_not_forge_a_line() {
+    let harness = connected(Answer::Accept, &[]).await;
+    harness
+        .transport
+        .respond("GetValueNames", r#"{"state":"absent","type":null}"#);
+    harness
+        .call(set_registry_call(
+            "HKLM:\\SOFTWARE\\a\nNew value: evil",
+            "v",
+            "x",
+        ))
+        .await;
+    let message = harness.last_confirmation();
+    assert_header(&message, "set_registry");
+    let forged = message
+        .lines()
+        .filter(|line| *line == "New value: evil")
+        .count();
+    assert_eq!(forged, 0, "the injected text forged a line: {message}");
+    assert_eq!(
+        message.matches("New value: hidden").count(),
+        1,
+        "the genuine hidden marker must stay the only one: {message}"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// AC-SEC16-1: the host of the prompt is the session host, without the port of a
+/// non-default session.
+#[tokio::test]
+async fn confirmation_host_is_the_session_host_without_the_port() {
+    let harness = started(Answer::Accept, &[]).await;
+    let connect = harness
+        .call(
+            CallToolRequestParams::new("connect").with_arguments(args(&serde_json::json!({
+                "host": HOST,
+                "port": 5986
+            }))),
+        )
+        .await;
+    assert_eq!(
+        status_of(&connect).as_deref(),
+        Some("connected"),
+        "{:?}",
+        connect.structured_content
+    );
+    let result = harness
+        .call(
+            CallToolRequestParams::new("flush_dns").with_arguments(args(&serde_json::json!({
+                "session_id": "host1:5986"
+            }))),
+        )
+        .await;
+    assert_eq!(error_of(&result), None, "{:?}", result.structured_content);
+    let message = harness.last_confirmation();
+    assert!(message.contains(&format!("Host: {HOST}\n")), "{message}");
+    assert!(!message.contains("Host: host1:5986"), "{message}");
+    harness.client.cancel().await.ok();
+}
+
+/// DR-5: a call without an open session is refused before the prompt, with the same
+/// error `run_ps` gives.
+#[tokio::test]
+async fn unknown_session_is_refused_before_the_prompt() {
+    let harness = started(Answer::Accept, &[]).await;
+    let result = harness
+        .call(
+            CallToolRequestParams::new("flush_dns").with_arguments(args(&serde_json::json!({
+                "session_id": "nope"
+            }))),
+        )
+        .await;
+    assert_eq!(
+        harness.elicitations(),
+        0,
+        "the server asked about an unknown session"
+    );
+    assert!(
+        error_of(&result).is_some_and(|error| error.contains("Session not found: nope")),
+        "{:?}",
+        result.structured_content
+    );
     harness.client.cancel().await.ok();
 }

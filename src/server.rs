@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::config::AppConfig;
-use crate::executor::sanitize_prompt_value;
+use crate::executor::{sanitize_path_value, sanitize_prompt_value};
 use crate::identity::RequestIdentity;
 use crate::policy::{
     DeleteScan, FileScan, PolicyDecision, WriteScan, decide_delete_path, decide_delete_scan,
@@ -49,6 +49,93 @@ struct ConfirmResponse {
 }
 
 rmcp::elicit_safe!(ConfirmResponse);
+
+/// The header and the body of the dialog that an operator answers before a
+/// modifying operation runs (TR-SEC-16..19).
+///
+/// The header names the tool, the host of the session and the user of the request
+/// (DR-2). Each field is sanitized and capped on its own, so a value cannot forge
+/// a line or the dialog structure (TR-SEC-19).
+struct Confirmation {
+    tool: String,
+    action: String,
+    host: String,
+    user: String,
+    fields: Vec<(String, String)>,
+    effect: String,
+}
+
+impl Confirmation {
+    fn new(tool: &str, action: &str, host: &str, user: &str) -> Self {
+        Self {
+            tool: tool.to_owned(),
+            action: action.to_owned(),
+            host: host.to_owned(),
+            user: user.to_owned(),
+            fields: Vec::new(),
+            effect: String::new(),
+        }
+    }
+
+    /// Adds one target or operation line as `label: value`.
+    fn field(mut self, label: &str, value: &str) -> Self {
+        self.fields.push((label.to_owned(), value.to_owned()));
+        self
+    }
+
+    /// Adds a path-like field: a long value is cut in the middle, so its file name
+    /// stays visible (TR-SEC-19).
+    fn path(mut self, label: &str, value: &str) -> Self {
+        self.fields
+            .push((label.to_owned(), sanitize_path_value(value)));
+        self
+    }
+
+    /// Adds the plain line that states the effect and whether the operator can
+    /// undo it (TR-SEC-16).
+    fn effect(mut self, text: &str) -> Self {
+        self.effect = text.to_owned();
+        self
+    }
+
+    fn render(&self) -> String {
+        let mut message = format!("Confirm {}?\n\n", sanitize_prompt_value(&self.action));
+        message.push_str(&format!("Tool: {}\n", sanitize_prompt_value(&self.tool)));
+        message.push_str(&format!("Host: {}\n", sanitize_prompt_value(&self.host)));
+        message.push_str(&format!("User: {}", sanitize_prompt_value(&self.user)));
+        for (label, value) in &self.fields {
+            message.push_str(&format!("\n{label}: {}", sanitize_prompt_value(value)));
+        }
+        if !self.effect.is_empty() {
+            message.push_str(&format!("\n\n{}", sanitize_prompt_value(&self.effect)));
+        }
+        message
+    }
+}
+
+/// The plain effect line of each modifying tool (TR-SEC-16, TR-SEC-20). Each one
+/// states what the operation does and whether the operator can undo it.
+const EFFECT_FLUSH_DNS: &str = "This clears the whole DNS client cache. You cannot undo it.";
+const EFFECT_RESTART_SERVICE: &str = "This restarts the service. To undo it, stop the service.";
+const EFFECT_STOP_SERVICE: &str = "This stops the service. To undo it, start the service.";
+const EFFECT_STOP_SERVICE_DISABLE: &str = "This sets the start type to Disabled, then stops the \
+                                            service. To undo it, set the start type again and \
+                                            start the service.";
+const EFFECT_START_SERVICE: &str = "This starts the service. To undo it, stop the service.";
+const EFFECT_KILL_PROCESS: &str = "This terminates the process by PID. The child processes \
+                                   continue to run. You cannot undo it.";
+const EFFECT_SET_REGISTRY: &str =
+    "This sets the registry value. To undo it, restore the previous value.";
+const EFFECT_WRITE_NEW: &str = "This creates the file. To undo it, delete the file.";
+const EFFECT_WRITE_REPLACE: &str =
+    "This replaces the whole file. You cannot undo it; the previous content is lost.";
+const EFFECT_DELETE_FILE: &str = "This deletes one file permanently. You cannot undo it.";
+const EFFECT_DELETE_DIRECTORY: &str = "This deletes the directory and all its contents, \
+                                       recursively. The host checks the reparse points again after \
+                                       the confirmation. You cannot undo it.";
+const EFFECT_SET_START_TYPE: &str = "This changes the start type. The service stays in its \
+                                     current state; the change applies at the next start. To undo \
+                                     it, set the start type again.";
 
 impl WinrigServer {
     #[must_use]
@@ -201,8 +288,12 @@ impl WinrigServer {
             .map(str::to_owned)
     }
 
-    /// Read-only, and it runs before the confirmation: if it fails, the prompt
-    /// still shows, just without the state block.
+    /// Reads the current status for the prompt, as a plain word.
+    ///
+    /// Read-only, and it runs before the confirmation. A failed read gives
+    /// `unknown` with a short reason class, never the raw JSON (TR-SEC-17). The
+    /// start type comes from [`ps::get_service_config`], which knows
+    /// `AutomaticDelayed`.
     async fn service_state(
         &self,
         identity: &RequestIdentity,
@@ -217,10 +308,13 @@ impl WinrigServer {
                 "get_services",
             )
             .await;
-        Self::successful_stdout(&reply)
-            .map(|stdout| stdout.trim().to_owned())
-            .filter(|stdout| !stdout.is_empty())
-            .unwrap_or_else(|| "(state unavailable)".to_owned())
+        let Some(stdout) = Self::successful_stdout(&reply) else {
+            return unknown_word("unavailable");
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
+            return unknown_word("unreadable");
+        };
+        plain_word(value.get("Status"))
     }
 
     /// Read-only, and it runs before the confirmation: it gives the current value of
@@ -238,56 +332,51 @@ impl WinrigServer {
             .run_value(identity, session_id, &command, "get_service_config")
             .await;
         let Some(stdout) = Self::successful_stdout(&reply) else {
-            return Ok("(unknown)".to_owned());
+            return Ok(unknown_word("unavailable"));
         };
         let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
-            return Ok("(unknown)".to_owned());
+            return Ok(unknown_word("unreadable"));
         };
-        Ok(value
-            .get(field)
-            .and_then(serde_json::Value::as_str)
-            .filter(|text| !text.is_empty())
-            .unwrap_or("(unknown)")
-            .to_owned())
+        Ok(plain_word(value.get(field)))
     }
 
-    /// An empty PID or a missing process yields an honest string, not an empty
-    /// one: the prompt must show the target even when it no longer exists.
+    /// The name, the executable path and the start time of the process. The command
+    /// line is never fetched, so it can carry no secret to the prompt or the audit
+    /// (DR-4). A missing process yields an honest object, not an empty one
+    /// (TR-SEC-17).
     async fn process_details(
         &self,
         identity: &RequestIdentity,
         session_id: &str,
         pid: i64,
-    ) -> String {
+    ) -> serde_json::Value {
         let command = format!(
-            "$p = Get-Process -Id {pid} -ErrorAction SilentlyContinue; \
-             if ($p) {{ [PSCustomObject]@{{ Name=$p.ProcessName; \
-             Started=if($p.StartTime){{$p.StartTime.ToString('yyyy-MM-dd HH:mm:ss')}}else{{'N/A'}} }} \
-             | ConvertTo-Json -Compress }} else {{ Write-Output 'process not found' }}"
+            "$c = Get-CimInstance Win32_Process -Property Name,ExecutablePath,CreationDate \
+             -Filter \"ProcessId={pid}\" -ErrorAction SilentlyContinue; \
+             if ($c) {{ [PSCustomObject]@{{ Name=$c.Name; \
+             ExecutablePath=if($c.ExecutablePath){{$c.ExecutablePath}}else{{'N/A'}}; \
+             Started=if($c.CreationDate){{$c.CreationDate.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ',[Globalization.CultureInfo]::InvariantCulture)}}else{{'N/A'}} }} \
+             | ConvertTo-Json -Compress }} else {{ 'process not found' }}"
         );
         let reply = self
             .run_value(identity, session_id, &command, "list_processes")
             .await;
         Self::successful_stdout(&reply)
-            .map(|stdout| stdout.trim().to_owned())
-            .filter(|stdout| !stdout.is_empty())
-            .unwrap_or_else(|| "process details unavailable".to_owned())
+            .and_then(|stdout| serde_json::from_str::<serde_json::Value>(stdout.trim()).ok())
+            .unwrap_or_else(|| json!({ "Name": "process not found" }))
     }
 
     /// `Ok(())` means the user agreed explicitly. `Err(result)` means the
     /// operation does not run: refusal, cancellation, timeout, or no
     /// confirmation channel (DR-5, fail-closed); `result` is a ready tool
-    /// reply. The arguments are sanitized so a value cannot forge the dialog
-    /// structure.
+    /// reply.
     async fn confirm(
         ctx: &RequestContext<RoleServer>,
-        action: &str,
-        details: &str,
+        confirmation: Confirmation,
         timeout: Duration,
     ) -> Result<(), CallToolResult> {
-        let action = sanitize_prompt_value(action);
-        let details = sanitize_prompt_value(details);
-        let message = format!("Confirm {action}?\n\n{details}");
+        let action = sanitize_prompt_value(&confirmation.action);
+        let message = confirmation.render();
         match ctx
             .peer
             .elicit_with_timeout::<ConfirmResponse>(message, Some(timeout))
@@ -313,6 +402,39 @@ impl WinrigServer {
                 ),
             }))),
         }
+    }
+
+    /// Builds the header of the prompt that an operator answers: the tool name,
+    /// the host of the session and the user of the request (TR-SEC-16, DR-2).
+    fn confirmation(
+        &self,
+        identity: &RequestIdentity,
+        session_id: &str,
+        tool: &str,
+        action: &str,
+    ) -> Confirmation {
+        let host = self
+            .registry
+            .session_host(&identity.username, session_id)
+            .unwrap_or_else(|| "(unknown)".to_owned());
+        Confirmation::new(tool, action, &host, &identity.username)
+    }
+
+    /// The refusal that `run_ps` gives for an unknown session, before any prompt:
+    /// the operator is not asked about an operation that cannot run (DR-5).
+    fn missing_session(
+        &self,
+        identity: &RequestIdentity,
+        session_id: &str,
+    ) -> Option<CallToolResult> {
+        self.registry
+            .session_host(&identity.username, session_id)
+            .is_none()
+            .then(|| {
+                CallToolResult::structured(json!({
+                    "error": format!("Session not found: {session_id}. Use connect first.")
+                }))
+            })
     }
 }
 
@@ -357,11 +479,10 @@ fn cancelled(action: &str) -> CallToolResult {
 
 /// Returns a ready tool reply when confirmation is not obtained.
 macro_rules! require_confirmation {
-    ($self:expr, $ctx:expr, $action:expr, $details:expr) => {
+    ($self:expr, $ctx:expr, $confirmation:expr) => {
         if let Err(result) = WinrigServer::confirm(
             $ctx,
-            $action,
-            $details,
+            $confirmation,
             std::time::Duration::from_secs($self.config.confirm_timeout_seconds),
         )
         .await
@@ -1730,11 +1851,19 @@ impl WinrigServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let identity = self.identity(&ctx)?;
+        if let Some(result) = self.missing_session(&identity, &params.session_id) {
+            return Ok(result);
+        }
         require_confirmation!(
             &self,
             &ctx,
-            "FLUSH DNS CACHE",
-            "This will clear all cached DNS entries on the host."
+            self.confirmation(
+                &identity,
+                &params.session_id,
+                "flush_dns",
+                "FLUSH DNS CACHE"
+            )
+            .effect(EFFECT_FLUSH_DNS)
         );
         let command = "$before = (Get-DnsClientCache -ErrorAction SilentlyContinue | Measure-Object).Count; \
              Clear-DnsClientCache; \
@@ -1766,17 +1895,25 @@ impl WinrigServer {
             Ok(command) => command,
             Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
         };
+        if let Some(result) = self.missing_session(&identity, &params.session_id) {
+            return Ok(result);
+        }
         let before = self
             .service_state(&identity, &params.session_id, &params.name)
             .await;
         require_confirmation!(
             &self,
             &ctx,
-            "RESTART SERVICE",
-            &format!(
-                "Service: {}\nState before: {before}\nAfter restart: the tool reads the state again and returns it.",
-                params.name
+            self.confirmation(
+                &identity,
+                &params.session_id,
+                "restart_service",
+                "RESTART SERVICE"
             )
+            .field("Service", &params.name)
+            .field("State before", &before)
+            .field("Intended state", "Running")
+            .effect(EFFECT_RESTART_SERVICE)
         );
         Ok(self
             .run(&identity, &params.session_id, &command, "restart_service")
@@ -1810,6 +1947,9 @@ impl WinrigServer {
                 ),
             })));
         }
+        if let Some(result) = self.missing_session(&identity, &params.session_id) {
+            return Ok(result);
+        }
         let before = self
             .service_state(&identity, &params.session_id, &params.name)
             .await;
@@ -1829,20 +1969,25 @@ impl WinrigServer {
             Ok(command) => command,
             Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
         };
-        let details = if params.disable {
-            format!(
-                "Service: {}\nState before: {before}\nCurrent start type: {start_type}\nNew start type: Disabled\n\n\
-                 The tool sets the start type to Disabled, then stops the service. The service cannot start again until the start type is changed.",
-                params.name
+        let mut confirmation = self
+            .confirmation(
+                &identity,
+                &params.session_id,
+                "stop_service",
+                "STOP SERVICE",
             )
+            .field("Service", &params.name)
+            .field("State before", &before)
+            .field("Current start type", &start_type)
+            .field("Intended state", "Stopped");
+        confirmation = if params.disable {
+            confirmation
+                .field("New start type", "Disabled")
+                .effect(EFFECT_STOP_SERVICE_DISABLE)
         } else {
-            format!(
-                "Service: {}\nState before: {before}\nCurrent start type: {start_type}\n\n\
-                 The tool stops the service, waits {}s, then checks whether the service started again.",
-                params.name, params.wait_seconds
-            )
+            confirmation.effect(EFFECT_STOP_SERVICE)
         };
-        require_confirmation!(&self, &ctx, "STOP SERVICE", &details);
+        require_confirmation!(&self, &ctx, confirmation);
         let reply = self
             .run_value(&identity, &params.session_id, &command, "stop_service")
             .await;
@@ -1942,6 +2087,9 @@ impl WinrigServer {
             Ok(command) => command,
             Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
         };
+        if let Some(result) = self.missing_session(&identity, &params.session_id) {
+            return Ok(result);
+        }
         let current = match self
             .service_field(&identity, &params.session_id, &params.name, "start_type")
             .await
@@ -1952,12 +2100,16 @@ impl WinrigServer {
         require_confirmation!(
             &self,
             &ctx,
-            "SET SERVICE START TYPE",
-            &format!(
-                "Service: {}\nCurrent start type: {current}\nNew start type: {label}\n\n\
-                 The tool changes the start type. The service stays in its current state; the change applies at the next start.",
-                params.name
+            self.confirmation(
+                &identity,
+                &params.session_id,
+                "set_service_start_type",
+                "SET SERVICE START TYPE"
             )
+            .field("Service", &params.name)
+            .field("Current start type", &current)
+            .field("New start type", label)
+            .effect(EFFECT_SET_START_TYPE)
         );
         Ok(self
             .run(
@@ -1979,6 +2131,9 @@ impl WinrigServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let identity = self.identity(&ctx)?;
+        if let Some(result) = self.missing_session(&identity, &params.session_id) {
+            return Ok(result);
+        }
         let command = format!(
             "Start-Service -Name '{}' -ErrorAction Stop; Start-Sleep -Seconds 2; {}",
             ps::escape(&params.name),
@@ -1990,8 +2145,16 @@ impl WinrigServer {
         require_confirmation!(
             &self,
             &ctx,
-            "START SERVICE",
-            &format!("Service: {}\nState before: {before}", params.name)
+            self.confirmation(
+                &identity,
+                &params.session_id,
+                "start_service",
+                "START SERVICE"
+            )
+            .field("Service", &params.name)
+            .field("State before", &before)
+            .field("Intended state", "Running")
+            .effect(EFFECT_START_SERVICE)
         );
         Ok(self
             .run(&identity, &params.session_id, &command, "start_service")
@@ -2009,6 +2172,9 @@ impl WinrigServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let identity = self.identity(&ctx)?;
         let pid = params.pid;
+        if let Some(result) = self.missing_session(&identity, &params.session_id) {
+            return Ok(result);
+        }
         let command = format!(
             "Stop-Process -Id {pid} -Force -ErrorAction Stop; \
              Write-Output 'Process {pid} terminated'; Start-Sleep -Milliseconds 500; \
@@ -2016,14 +2182,28 @@ impl WinrigServer {
              if ($still) {{ Write-Output 'WARNING: process still running' }} \
              else {{ Write-Output 'Confirmed: process no longer exists' }}"
         );
-        // Show exactly what will be terminated: a PID without a name is a
-        // blind confirmation.
-        let details = format!(
-            "PID: {pid}\n{}",
-            self.process_details(&identity, &params.session_id, pid)
-                .await
+        // Show exactly what will be terminated: a PID without a name is a blind
+        // confirmation (TR-SEC-17). The command line stays out of the prompt and
+        // the audit (DR-4).
+        let details = self
+            .process_details(&identity, &params.session_id, pid)
+            .await;
+        let process_field = |key: &str| plain_word(details.get(key));
+        require_confirmation!(
+            &self,
+            &ctx,
+            self.confirmation(
+                &identity,
+                &params.session_id,
+                "kill_process",
+                "TERMINATE PROCESS"
+            )
+            .field("PID", &pid.to_string())
+            .field("Name", &process_field("Name"))
+            .field("Executable path", &process_field("ExecutablePath"))
+            .field("Started", &process_field("Started"))
+            .effect(EFFECT_KILL_PROCESS)
         );
-        require_confirmation!(&self, &ctx, "TERMINATE PROCESS", &details);
         Ok(self
             .run(&identity, &params.session_id, &command, "kill_process")
             .await)
@@ -2058,6 +2238,9 @@ impl WinrigServer {
         if key.to_uppercase().starts_with("HKEY_") {
             key = format!("Registry::{key}");
         }
+        if let Some(result) = self.missing_session(&identity, &params.session_id) {
+            return Ok(result);
+        }
         let safe_key = ps::escape(&key);
         let safe_value = ps::escape(&params.value_name);
         let safe_data = ps::escape(&params.value_data);
@@ -2068,30 +2251,32 @@ impl WinrigServer {
              [PSCustomObject]@{{ Key='{safe_key}'; Name='{safe_value}'; Value=[string]$v.'{safe_value}'; Type='{ps_type}' }} \
              | ConvertTo-Json -Compress"
         );
-        // Show the current value before the write: without the old value the
-        // operator cannot see what changes.
-        let read_command = ps::get_registry(&key, &params.value_name, false, 1);
+        // DR-4: the old value can be a secret, so the pre-read returns only its
+        // existence and its type, never its data.
+        let read_command = ps::registry_value_presence(&key, &params.value_name);
         let before_reply = self
-            .run_value_redacted(
-                &identity,
-                &params.session_id,
-                &read_command,
-                "get_registry",
-                std::slice::from_ref(&params.value_data),
-            )
+            .run_value(&identity, &params.session_id, &read_command, "get_registry")
             .await;
         let before = Self::successful_stdout(&before_reply)
-            .map(|stdout| stdout.trim().to_owned())
-            .filter(|stdout| !stdout.is_empty())
-            .unwrap_or_else(|| "(value not present)".to_owned());
+            .and_then(|stdout| serde_json::from_str::<serde_json::Value>(stdout.trim()).ok())
+            .map_or_else(|| "unknown".to_owned(), |value| old_value_label(&value));
         require_confirmation!(
             &self,
             &ctx,
-            "SET REGISTRY VALUE",
-            &format!(
-                "Key: {key}\nValue: {}\nType: {ps_type}\nOld value: {before}",
-                params.value_name
+            self.confirmation(
+                &identity,
+                &params.session_id,
+                "set_registry",
+                "SET REGISTRY VALUE"
             )
+            .path("Key", &key)
+            .field("Value", &params.value_name)
+            .field("Type", ps_type)
+            .field("Old value", &before)
+            // DR-4, TR-SEC-18: the new value may be a secret, so the prompt
+            // shows the marker only.
+            .field("New value", "hidden")
+            .effect(EFFECT_SET_REGISTRY)
         );
         // The value is treated as a secret: it may hold a password, and the
         // audit must not reveal it (DR-4).
@@ -2124,6 +2309,9 @@ impl WinrigServer {
             return Ok(CallToolResult::structured(
                 json!({ "error": decision.reason }),
             ));
+        }
+        if let Some(result) = self.missing_session(&identity, &params.session_id) {
+            return Ok(result);
         }
         // The plan is built entirely before the network: the size limit and an
         // unknown encoding refuse without leaving anything on the host
@@ -2190,19 +2378,29 @@ impl WinrigServer {
         require_confirmation!(
             &self,
             &ctx,
-            if exists {
-                "OVERWRITE FILE"
-            } else {
-                "WRITE FILE"
-            },
-            &format!(
-                "Path: {}\nResolved: {}\nBytes: {bytes}\nEncoding: {}\nExisting file: {}\n\n\
-                 The tool replaces the whole file.",
-                params.path,
-                scan.full_name,
-                params.encoding,
-                if exists { "yes" } else { "no" }
+            self.confirmation(
+                &identity,
+                &params.session_id,
+                "write_file",
+                if exists {
+                    "OVERWRITE FILE"
+                } else {
+                    "WRITE FILE"
+                }
             )
+            .path("Path", &params.path)
+            .path("Resolved", &scan.full_name)
+            .field("Bytes", &bytes.to_string())
+            .field("Encoding", &params.encoding)
+            .field("Existing file", if exists { "yes" } else { "no" })
+            // DR-4, TR-SEC-18: the content may be a secret, so the prompt shows
+            // the marker only. The size is a property of the call, not the value.
+            .field("Content", "hidden")
+            .effect(if exists {
+                EFFECT_WRITE_REPLACE
+            } else {
+                EFFECT_WRITE_NEW
+            })
         );
 
         // Chunks and the rename run as one sequence: a failure in the middle
@@ -2268,6 +2466,9 @@ impl WinrigServer {
                 json!({ "error": decision.reason }),
             ));
         }
+        if let Some(result) = self.missing_session(&identity, &params.session_id) {
+            return Ok(result);
+        }
         let safe = ps::escape(&params.path);
 
         // Host-side scan: it reveals the full path (8.3, reparse) and prevents
@@ -2304,14 +2505,16 @@ impl WinrigServer {
             })));
         }
 
+        let (size, modified) = scan_metadata(&stdout);
         require_confirmation!(
             &self,
             &ctx,
-            "DELETE FILE",
-            &format!(
-                "Path: {}\nResolved: {}\nMetadata: {}\n\nThis deletion is permanent.",
-                params.path, scan.full_name, stdout
-            )
+            self.confirmation(&identity, &params.session_id, "delete_file", "DELETE FILE")
+                .path("Path", &params.path)
+                .path("Resolved", &scan.full_name)
+                .field("Size", &size)
+                .field("Modified", &modified)
+                .effect(EFFECT_DELETE_FILE)
         );
         let command = format!(
             "Remove-Item -LiteralPath '{safe}' -Force -ErrorAction Stop; \
@@ -2340,6 +2543,9 @@ impl WinrigServer {
             return Ok(CallToolResult::structured(
                 json!({ "error": decision.reason }),
             ));
+        }
+        if let Some(result) = self.missing_session(&identity, &params.session_id) {
+            return Ok(result);
         }
         let cap = params.max_items.clamp(1, 50_000);
         let safe = ps::escape(&params.path);
@@ -2386,11 +2592,19 @@ impl WinrigServer {
         require_confirmation!(
             &self,
             &ctx,
-            "DELETE DIRECTORY (recursive)",
-            &format!(
-                "Path: {}\nResolved: {}\nItems: {} files + {} directories\n\nThe tool deletes ALL the contents of this directory. This deletion is permanent.",
-                params.path, scan.full_name, scan.file_count, scan.dir_count
+            self.confirmation(
+                &identity,
+                &params.session_id,
+                "delete_directory",
+                "DELETE DIRECTORY (recursive)"
             )
+            .path("Path", &params.path)
+            .path("Resolved", &scan.full_name)
+            .field(
+                "Items",
+                &format!("{} files + {} directories", scan.file_count, scan.dir_count)
+            )
+            .effect(EFFECT_DELETE_DIRECTORY)
         );
         // TOCTOU: the tree can change between the scan and the delete, so the
         // delete command repeats the safety checks and refuses if the path
@@ -2412,12 +2626,57 @@ impl WinrigServer {
     }
 }
 
+/// The service state as a plain string, so the prompt shows a word (`Running`,
+/// `Stopped`), not the JSON of an enum (TR-SEC-17). The start type is read
+/// separately, because only `get_service_config` knows `AutomaticDelayed`.
 fn service_state_command(name: &str) -> String {
     let safe = ps::escape(name);
     format!(
-        "Get-Service -Name '{safe}' -ErrorAction Stop \
-         | Select-Object Name, Status, StartType | ConvertTo-Json -Compress"
+        "$s = Get-Service -Name '{safe}' -ErrorAction Stop | Select-Object -First 1; \
+         [PSCustomObject]@{{ Status=[string]$s.Status }} | ConvertTo-Json -Compress"
     )
+}
+
+/// The plain string of a prompt field, or `unknown` when the host gave none.
+fn plain_word(value: Option<&serde_json::Value>) -> String {
+    value
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.is_empty())
+        .unwrap_or("unknown")
+        .to_owned()
+}
+
+/// `unknown` with a short reason class, never the raw JSON of a failed read.
+fn unknown_word(reason: &str) -> String {
+    format!("unknown ({reason})")
+}
+
+/// `present (hidden)` with the old value's type, `not present`, or `unknown`. The
+/// data is never shown (DR-4, TR-SEC-18).
+fn old_value_label(value: &serde_json::Value) -> String {
+    match value.get("state").and_then(serde_json::Value::as_str) {
+        Some("present") => match value.get("type").and_then(serde_json::Value::as_str) {
+            Some(kind) if !kind.is_empty() => format!("present (hidden, {kind})"),
+            _ => "present (hidden)".to_owned(),
+        },
+        Some("absent") => "not present".to_owned(),
+        // An access-denied read is not "not present": the operator must not act on
+        // a wrong assumption.
+        _ => "unknown".to_owned(),
+    }
+}
+
+/// The size and the modification time of a scanned file, in the invariant format
+/// the scan emits (TR-SEC-17). A missing field gives `unknown`.
+fn scan_metadata(stdout: &str) -> (String, String) {
+    let Some(value) = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok() else {
+        return ("unknown".to_owned(), "unknown".to_owned());
+    };
+    let size = match value.get("SizeBytes").and_then(serde_json::Value::as_i64) {
+        Some(bytes) => format!("{bytes} bytes"),
+        None => "unknown".to_owned(),
+    };
+    (size, plain_word(value.get("Modified")))
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -2632,6 +2891,32 @@ mod tests {
     fn server_constructs_with_registry_and_config() {
         let server = server();
         assert_eq!(server.config.mcpo_port, 8005);
+    }
+
+    /// TR-SEC-16, TR-SEC-20: every effect sentence fits the 200-character prompt
+    /// cap, so no effect line is silently cut.
+    #[test]
+    fn every_effect_sentence_fits_the_prompt_cap() {
+        for effect in [
+            EFFECT_FLUSH_DNS,
+            EFFECT_RESTART_SERVICE,
+            EFFECT_STOP_SERVICE,
+            EFFECT_STOP_SERVICE_DISABLE,
+            EFFECT_START_SERVICE,
+            EFFECT_KILL_PROCESS,
+            EFFECT_SET_REGISTRY,
+            EFFECT_WRITE_NEW,
+            EFFECT_WRITE_REPLACE,
+            EFFECT_DELETE_FILE,
+            EFFECT_DELETE_DIRECTORY,
+            EFFECT_SET_START_TYPE,
+        ] {
+            assert!(!effect.is_empty(), "an effect line is empty");
+            assert!(
+                effect.chars().count() < 200,
+                "the effect is too long: {effect}"
+            );
+        }
     }
 
     /// Writes the full `tools/list` payload to the path in `WINRIG_DUMP_TOOLS`

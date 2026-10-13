@@ -683,6 +683,17 @@ impl SessionRegistry {
         json!({ "sessions": items, "count": items.len() })
     }
 
+    /// The target of an open connection, for the text of the prompt (TR-SEC-16).
+    ///
+    /// `None` when no such connection is open; the caller shows an honest placeholder
+    /// rather than an empty value.
+    #[must_use]
+    pub fn session_host(&self, username: &str, session_id: &str) -> Option<String> {
+        lock(&self.sessions)
+            .get(&(username.to_owned(), session_id.to_owned()))
+            .map(|session| session.target.host.clone())
+    }
+
     /// Runs a PowerShell command in an open session with redaction and audit.
     pub async fn run_ps(
         &self,

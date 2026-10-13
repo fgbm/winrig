@@ -2,6 +2,6 @@
 .env
 *.db
 /logs
-# Внутренний журнал мелких трений: ведётся локально, в публичный репозиторий не
-# попадает (содержит детали рабочего окружения и процесса).
+# The internal journal of small friction: kept locally, does not reach the public
+# repository (it holds details of the working environment and the process).
 PAPERCUTS.md

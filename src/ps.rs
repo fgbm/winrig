@@ -831,20 +831,63 @@ pub fn test_network(target: &str, port: i64) -> String {
     )
 }
 
-#[must_use]
-pub fn get_tcp_connections(state_filter: &str, port_filter: i64) -> String {
+/// The cap on the summary groups, so a single answer stays inside the executor
+/// output limit (TR-REL-13).
+const TCP_SUMMARY_LIMIT: usize = 100;
+
+/// The longest accepted process-name wildcard. The server refuses a longer value
+/// before any host call (TR-REL-13).
+pub const TCP_PROCESS_FILTER_MAX_CHARS: usize = 256;
+
+/// The accepted `state_filter` values and their `Get-NetTCPConnection` state.
+/// `All` is not in the table: it means "no state filter".
+const TCP_STATES: [(&str, &str); 8] = [
+    ("bound", "Bound"),
+    ("closewait", "CloseWait"),
+    ("established", "Established"),
+    ("finwait1", "FinWait1"),
+    ("finwait2", "FinWait2"),
+    ("listen", "Listen"),
+    ("synreceived", "SynReceived"),
+    ("timewait", "TimeWait"),
+];
+
+/// Escapes the wildcard characters `` ` ``, `[` and `]` with a backtick so the
+/// `-like` operator matches them literally. An unbalanced `[` throws on every
+/// row otherwise; the backtick stays literal inside the single-quoted pattern and
+/// reaches the wildcard engine.
+fn escape_like(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        if matches!(c, '`' | '[' | ']') {
+            out.push('`');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// # Errors
+///
+/// Returns an error text for a `state_filter` outside the accepted values.
+pub fn get_tcp_connections(
+    state_filter: &str,
+    port_filter: i64,
+    pid: i64,
+    process: &str,
+    summary: bool,
+) -> Result<String, String> {
     let mut where_parts: Vec<String> = Vec::new();
     let sf = state_filter.trim().to_lowercase();
     if sf != "all" {
-        let ps_state = match sf.as_str() {
-            "listen" => "Listen",
-            "timewait" => "TimeWait",
-            "closewait" => "CloseWait",
-            "finwait1" => "FinWait1",
-            "finwait2" => "FinWait2",
-            "synreceived" => "SynReceived",
-            "bound" => "Bound",
-            _ => "Established",
+        let Some((_, ps_state)) = TCP_STATES.iter().find(|(name, _)| *name == sf.as_str()) else {
+            let allowed = std::iter::once(String::from("All"))
+                .chain(TCP_STATES.iter().map(|(_, state)| (*state).to_owned()))
+                .collect::<Vec<String>>()
+                .join(", ");
+            return Err(format!(
+                "Invalid state_filter '{state_filter}'. Valid values: {allowed}"
+            ));
         };
         where_parts.push(format!("$_.State -eq '{ps_state}'"));
     }
@@ -853,19 +896,62 @@ pub fn get_tcp_connections(state_filter: &str, port_filter: i64) -> String {
             "($_.LocalPort -eq {port_filter} -or $_.RemotePort -eq {port_filter})"
         ));
     }
+    if pid > 0 {
+        where_parts.push(format!("$_.OwningProcess -eq {pid}"));
+    }
+    let trimmed_process = process.trim();
+    if !trimmed_process.is_empty() {
+        where_parts.push(format!(
+            "$names[[int]$_.OwningProcess] -like '{}'",
+            escape(&escape_like(trimmed_process))
+        ));
+    }
+    // The filter is a client-side `Where-Object` on purpose: the `-State`,
+    // `-LocalPort` and `-OwningProcess` parameters of `Get-NetTCPConnection`
+    // throw a localized non-terminating error when nothing matches, while an
+    // empty pipeline is already an empty result (TR-REL-13).
     let where_clause = if where_parts.is_empty() {
         String::new()
     } else {
         format!("| Where-Object {{ {} }} ", where_parts.join(" -and "))
     };
-    format!(
-        "Get-NetTCPConnection -ErrorAction SilentlyContinue {where_clause}\
+    // The owning process name is resolved once into a hashtable. A `Get-Process`
+    // call per row would issue one call for each connection, and a PID that
+    // vanished between the two commands reads a null name, not an error.
+    let name_table = "$names=@{}; Get-Process -ErrorAction SilentlyContinue \
+         | ForEach-Object { $names[[int]$_.Id]=$_.ProcessName }; ";
+    if summary {
+        let limit = TCP_SUMMARY_LIMIT;
+        // A `Listen` row holds the bound address. The local address stays in the
+        // group key: without it a listener on `127.0.0.1` and one on `::1` would
+        // merge into one group. The largest groups survive the cap.
+        return Ok(format!(
+            "{name_table}\
+             $groups=@(Get-NetTCPConnection -ErrorAction SilentlyContinue {where_clause}\
+             | Group-Object -Property {{ $names[[int]$_.OwningProcess] }}, {{ $_.LocalPort }}, \
+             {{ $_.LocalAddress }}, {{ $_.RemoteAddress }} \
+             | Sort-Object Count -Descending | Select-Object -First {over}); \
+             $truncated=$groups.Count -gt {limit}; \
+             $rows=@($groups | Select-Object -First {limit} | ForEach-Object {{ \
+             $first=$_.Group[0]; [PSCustomObject]@{{ \
+             process=$names[[int]$first.OwningProcess]; local_port=[int]$first.LocalPort; \
+             local_address=[string]$first.LocalAddress; remote_address=[string]$first.RemoteAddress; \
+             count=$_.Count }} }}); \
+             [PSCustomObject]@{{ groups=$rows; count=$rows.Count; truncated=$truncated }} \
+             | ConvertTo-Json -Compress -Depth 3",
+            over = limit + 1,
+        ));
+    }
+    Ok(format!(
+        "{name_table}\
+         Get-NetTCPConnection -ErrorAction SilentlyContinue {where_clause}\
          | Select-Object @{{N='Local';E={{\"$($_.LocalAddress):$($_.LocalPort)\"}}}}, \
-         @{{N='Remote';E={{\"$($_.RemoteAddress):$($_.RemotePort)\"}}}}, State, \
+         @{{N='Remote';E={{\"$($_.RemoteAddress):$($_.RemotePort)\"}}}}, \
+         @{{N='State';E={{[string]$_.State}}}}, \
          @{{N='PID';E={{$_.OwningProcess}}}}, \
-         @{{N='Process';E={{(Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName}}}} \
+         @{{N='Process';E={{$names[[int]$_.OwningProcess]}}}} \
          | Sort-Object Remote | Format-Table -AutoSize | Out-String -Width 300"
-    )
+    ))
 }
 
 /// # Errors
@@ -1514,8 +1600,143 @@ mod tests {
 
     #[test]
     fn tcp_connections_default_to_established() {
-        let cmd = get_tcp_connections("Established", 0);
+        let cmd = get_tcp_connections("Established", 0, 0, "", false).expect("valid");
         assert!(cmd.contains("$_.State -eq 'Established'"));
+        // The default output shape stays the tabular one (backward compatible).
+        assert!(cmd.contains("Format-Table"), "{cmd}");
+        assert!(!cmd.contains("Group-Object"), "{cmd}");
+    }
+
+    /// TR-REL-13: a `state_filter` outside the accepted values is refused with
+    /// the list, not silently mapped to `Established`.
+    #[test]
+    fn tcp_connections_reject_an_unknown_state() {
+        let error = get_tcp_connections("galaxy", 0, 0, "", false).expect_err("unknown state");
+        assert!(error.contains("Established"), "{error}");
+        assert!(error.contains("Listen"), "{error}");
+        assert!(error.contains("All"), "{error}");
+        assert!(
+            get_tcp_connections("all", 0, 0, "", false).is_ok(),
+            "All must stay accepted"
+        );
+        // The comparison is case-insensitive, as the state names are.
+        assert!(get_tcp_connections("lIsTeN", 0, 0, "", false).is_ok());
+    }
+
+    /// TR-REL-13: the `pid` and `process` filters narrow the rows, and the owning
+    /// process name is resolved once, not once per row.
+    #[test]
+    fn tcp_connections_apply_pid_and_process_filters() {
+        let cmd = get_tcp_connections("all", 0, 1234, "chrome*", false).expect("valid");
+        assert!(cmd.contains("$_.OwningProcess -eq 1234"), "{cmd}");
+        assert!(
+            cmd.contains("$names[[int]$_.OwningProcess] -like 'chrome*'"),
+            "{cmd}"
+        );
+        // One `Get-Process` call feeds the hashtable; a per-row call would be N.
+        assert_eq!(cmd.matches("Get-Process").count(), 1, "{cmd}");
+        // The value 0 means all the processes, so no filter is emitted.
+        let none = get_tcp_connections("all", 0, 0, "   ", false).expect("valid");
+        assert!(!none.contains("OwningProcess -eq"), "{none}");
+        assert!(!none.contains("-like"), "{none}");
+    }
+
+    /// TR-REL-13: the `[` of the process wildcard is escaped with a backtick, so
+    /// an unbalanced bracket reaches `-like` as a literal and does not throw on
+    /// every row.
+    #[test]
+    fn tcp_connections_escape_the_process_wildcard_brackets() {
+        let cmd = get_tcp_connections("all", 0, 0, "a[", false).expect("valid");
+        assert!(
+            cmd.contains("$names[[int]$_.OwningProcess] -like 'a`['"),
+            "{cmd}"
+        );
+        let both = get_tcp_connections("all", 0, 0, "a]b[", false).expect("valid");
+        assert!(both.contains("'a`]b`['"), "{both}");
+    }
+
+    /// AC-REL13-1: `state_filter='Listen'` with `summary=true` filters on the
+    /// state, groups the rows with a count, and a `Listen` row holds the bound
+    /// address (the local address).
+    #[test]
+    fn tcp_connections_summary_groups_listeners_with_the_bound_address() {
+        let cmd = get_tcp_connections("Listen", 0, 0, "", true).expect("valid");
+        assert!(cmd.contains("$_.State -eq 'Listen'"), "{cmd}");
+        assert!(cmd.contains("Group-Object"), "{cmd}");
+        assert!(cmd.contains("count=$_.Count"), "{cmd}");
+        assert!(
+            cmd.contains("local_address=[string]$first.LocalAddress"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("ConvertTo-Json"), "{cmd}");
+    }
+
+    /// TR-REL-13: the summary is capped and flags a truncation; it fetches one
+    /// group over the cap so a full result is not reported as truncated. `@()`
+    /// keeps a single group an array. The cap keeps the largest groups: the sort
+    /// by count runs before the slice.
+    #[test]
+    fn tcp_connections_summary_caps_the_largest_groups_and_flags_truncation() {
+        let cmd = get_tcp_connections("Established", 0, 0, "", true).expect("valid");
+        let take = format!("Select-Object -First {}", TCP_SUMMARY_LIMIT + 1);
+        assert!(cmd.contains(&take), "{cmd}");
+        assert!(
+            cmd.contains(&format!("$truncated=$groups.Count -gt {TCP_SUMMARY_LIMIT}")),
+            "{cmd}"
+        );
+        assert!(cmd.contains("$rows=@("), "the array form needs @(): {cmd}");
+        assert!(cmd.contains("truncated=$truncated"), "{cmd}");
+        let sort = cmd.find("Sort-Object Count -Descending").expect("sort");
+        let slice = cmd.find(&take).expect("slice");
+        assert!(sort < slice, "the sort must run before the cap: {cmd}");
+    }
+
+    /// Worst case for the WinRS command line: the process wildcard at the
+    /// 256-character limit in the summary form, with the most costly escaping —
+    /// `'` doubles to `''` and `[` becomes `` `[ ``. The command must still fit
+    /// one line.
+    #[test]
+    fn get_tcp_connections_command_fits_the_winrs_line_for_a_long_wildcard() {
+        for process in [
+            "[".repeat(TCP_PROCESS_FILTER_MAX_CHARS),
+            "'".repeat(TCP_PROCESS_FILTER_MAX_CHARS),
+        ] {
+            let cmd = get_tcp_connections("all", 0, 0, &process, true).expect("valid");
+            assert!(
+                command_line_chars(&cmd) < WINRS_COMMAND_LINE_LIMIT,
+                "chars: {}",
+                command_line_chars(&cmd)
+            );
+        }
+    }
+
+    /// The cap keeps the summary JSON inside the executor output limit even with
+    /// the longest plausible process names and addresses.
+    #[test]
+    fn tcp_connections_summary_fits_the_executor_cap() {
+        let rows: Vec<Value> = (0..TCP_SUMMARY_LIMIT)
+            .map(|_| {
+                serde_json::json!({
+                    "process": "A".repeat(255),
+                    "local_port": 65535,
+                    "local_address": "f".repeat(45),
+                    "remote_address": "f".repeat(45),
+                    "count": 9_999_999_i64,
+                })
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "groups": rows,
+            "count": TCP_SUMMARY_LIMIT,
+            "truncated": false,
+        });
+        let text = serde_json::to_string(&payload).expect("serialize");
+        assert!(
+            text.len() <= crate::executor::MAX_OUTPUT_CHARS,
+            "the capped summary is {} characters, over the {} limit",
+            text.len(),
+            crate::executor::MAX_OUTPUT_CHARS
+        );
     }
 
     #[test]
@@ -1788,6 +2009,45 @@ mod tests {
         }
     }
 
+    /// Every generator with `text` in each free-text slot, in every branch that
+    /// changes the emitted script. The escape check and the brace guard share it,
+    /// so a new generator is covered by both at once.
+    fn every_generator_command(text: &str) -> Vec<String> {
+        vec![
+            list_directory(text),
+            find_files(text, text, 5, true),
+            read_file(text, 1, 10, false, "UTF8").expect("valid"),
+            search_file_content(text, text, text, 10, 0, 0),
+            file_info(text),
+            compare_files(text, text, 5),
+            get_event_log(text, "error", 24, text, 10).expect("valid"),
+            list_event_logs(text),
+            get_services(text, "all", true),
+            list_processes(text, "memory", 10),
+            get_registry(text, text, false, 1),
+            get_registry(text, text, true, 2),
+            get_environment_variables(text, "machine").expect("valid"),
+            test_network(text, 443),
+            get_tcp_connections("established", 1, 0, text, false).expect("valid"),
+            get_tcp_connections("listen", 0, 0, text, true).expect("valid"),
+            resolve_dns_name(text, "A", text).expect("valid"),
+            get_perf_snapshot(2, text),
+            get_scheduled_tasks(text, false),
+            get_user_groups(text),
+            get_permissions(text),
+            get_dns_cache(text),
+            get_installed_software(text),
+            write_chunk(text, text, true),
+            write_chunk(text, text, false),
+            write_commit(text, text, "utf8").expect("valid"),
+            write_commit(text, text, "unicode").expect("valid"),
+            write_abort(text),
+            write_scan(text),
+            delete_file_scan(text),
+            delete_directory_scan(text, 10),
+        ]
+    }
+
     /// Injection: free text that enters a PowerShell single-quoted string must
     /// double the quote in every generator (AC-OBS02-1, AC-SEC12-1).
     fn assert_generators_escape(quote: char) {
@@ -1795,39 +2055,7 @@ mod tests {
         let evil = evil.as_str();
         let opened = format!("x{quote}");
         let doubled = format!("x{quote}{quote}");
-        let commands = vec![
-            list_directory(evil),
-            find_files(evil, evil, 5, true),
-            read_file(evil, 1, 10, false, "UTF8").expect("valid"),
-            search_file_content(evil, evil, evil, 10, 0, 0),
-            file_info(evil),
-            compare_files(evil, evil, 5),
-            get_event_log(evil, "error", 24, evil, 10).expect("valid"),
-            list_event_logs(evil),
-            get_services(evil, "all", true),
-            list_processes(evil, "memory", 10),
-            get_registry(evil, evil, false, 1),
-            get_registry(evil, evil, true, 2),
-            get_environment_variables(evil, "machine").expect("valid"),
-            test_network(evil, 443),
-            get_tcp_connections("established", 1),
-            resolve_dns_name(evil, "A", evil).expect("valid"),
-            get_perf_snapshot(2, evil),
-            get_scheduled_tasks(evil, false),
-            get_user_groups(evil),
-            get_permissions(evil),
-            get_dns_cache(evil),
-            get_installed_software(evil),
-            write_chunk(evil, evil, true),
-            write_chunk(evil, evil, false),
-            write_commit(evil, evil, "utf8").expect("valid"),
-            write_commit(evil, evil, "unicode").expect("valid"),
-            write_abort(evil),
-            write_scan(evil),
-            delete_file_scan(evil),
-            delete_directory_scan(evil, 10),
-        ];
-        for command in commands {
+        for command in every_generator_command(evil) {
             assert!(
                 !command.contains(evil),
                 "unescaped free text in command: {command}"
@@ -1839,6 +2067,36 @@ mod tests {
                 "single quote {quote:?} was not doubled: {command}"
             );
         }
+    }
+
+    /// A `format!` turns `{{` into `{`; a plain string literal keeps it. A stray
+    /// `{{` or `}}` reaches PowerShell as a doubled brace and breaks the script,
+    /// so no generator may emit one (the `name_table` bug).
+    /// A `format!` turns `{{` into `{`; a plain string literal keeps it, and the
+    /// doubled opening brace reaches PowerShell as a broken script — exactly the
+    /// `name_table` bug. A doubled closing brace `}}` is not checked: it is
+    /// legitimate where a scriptblock close meets a hashtable close (for example
+    /// `E={…}}` in `file_info`, `else{'N/A'} }}` in `resolve_dns_name`).
+    #[test]
+    fn every_generator_emits_no_doubled_open_braces() {
+        for command in every_generator_command("x") {
+            assert!(
+                !command.contains("{{"),
+                "a doubled opening brace reached the script: {command}"
+            );
+        }
+    }
+
+    /// The process-name hashtable is built by one `Get-Process` call with single
+    /// braces; a doubled brace would leave it empty and print junk per process
+    /// (TR-REL-13).
+    #[test]
+    fn tcp_connections_builds_the_process_table_with_single_braces() {
+        let cmd = get_tcp_connections("all", 0, 0, "chrome", false).expect("valid");
+        assert!(
+            cmd.contains("ForEach-Object { $names[[int]$_.Id]=$_.ProcessName }"),
+            "{cmd}"
+        );
     }
 
     /// AC-FS-07: the roots come from the host environment variables, not from

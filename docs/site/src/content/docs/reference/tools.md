@@ -57,7 +57,7 @@ The binary declares 38 tools, plus `write_file` when the operator enables it. Th
 
 | Tool | Description |
 |------|-------------|
-| `get_tcp_connections` | The active TCP connections with the owning process |
+| `get_tcp_connections` | The active TCP connections, filtered by state, port, PID or process name, with an optional grouped summary |
 | `get_dns_cache` | The local DNS client cache |
 | `get_installed_software` | The installed software from the 64-bit and 32-bit uninstall keys |
 | `resolve_dns_name` | The DNS resolution chain from the host |

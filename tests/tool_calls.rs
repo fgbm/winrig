@@ -613,6 +613,154 @@ async fn get_event_log_doubles_the_channel_quote_on_the_host() {
     harness.client.cancel().await.ok();
 }
 
+/// AC-REL13-1: `get_tcp_connections` with `state_filter='Listen'` and
+/// `summary=true` filters on the state, groups the rows with a count and a
+/// `Listen` row holds the bound address (TR-REL-13). The summary is read-only.
+#[tokio::test]
+async fn get_tcp_connections_summary_groups_listeners() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let before = harness.elicitations();
+    let result = harness
+        .call(
+            CallToolRequestParams::new("get_tcp_connections").with_arguments(args(
+                &serde_json::json!({
+                    "session_id": HOST,
+                    "state_filter": "Listen",
+                    "summary": true
+                }),
+            )),
+        )
+        .await;
+    assert_eq!(
+        error_of(&result),
+        None,
+        "the summary must not fail: {:?}",
+        result.structured_content
+    );
+    assert_eq!(
+        harness.elicitations(),
+        before,
+        "a read-only tool asked for confirmation"
+    );
+    assert!(
+        harness.transport.saw("$_.State -eq 'Listen'"),
+        "the state filter never reached the host"
+    );
+    assert!(
+        harness.transport.saw("Group-Object"),
+        "the summary does not group the rows"
+    );
+    assert!(
+        harness.transport.saw("count=$_.Count"),
+        "the summary groups carry no count"
+    );
+    assert!(
+        harness
+            .transport
+            .saw("local_address=[string]$first.LocalAddress"),
+        "a Listen row does not hold the bound address"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// TR-REL-13 backward compatibility: the default call still filters on
+/// `Established` and returns the tabular form, not the grouped summary.
+#[tokio::test]
+async fn get_tcp_connections_default_stays_tabular() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let result = harness
+        .call(
+            CallToolRequestParams::new("get_tcp_connections")
+                .with_arguments(args(&serde_json::json!({ "session_id": HOST }))),
+        )
+        .await;
+    assert_eq!(
+        error_of(&result),
+        None,
+        "the default read must not fail: {:?}",
+        result.structured_content
+    );
+    assert!(
+        harness.transport.saw("$_.State -eq 'Established'"),
+        "the default state filter never reached the host"
+    );
+    assert!(
+        harness.transport.saw("Format-Table"),
+        "the default output is not the tabular form"
+    );
+    assert!(
+        !harness.transport.saw("Group-Object"),
+        "the default call must not use the grouped summary"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// TR-REL-13: a `process` wildcard over 256 characters is refused before any
+/// host call, with the limit in the message.
+#[tokio::test]
+async fn get_tcp_connections_refuses_a_long_process_filter_before_the_network() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let result = harness
+        .call(
+            CallToolRequestParams::new("get_tcp_connections").with_arguments(args(
+                &serde_json::json!({
+                    "session_id": HOST,
+                    "process": "a".repeat(257)
+                }),
+            )),
+        )
+        .await;
+    let error = error_of(&result).expect("a refusal");
+    assert!(error.contains("256"), "the limit is not named: {error}");
+    assert!(
+        !harness.transport.saw("Get-NetTCPConnection"),
+        "the refused filter reached the host"
+    );
+    let at_limit = harness
+        .call(
+            CallToolRequestParams::new("get_tcp_connections").with_arguments(args(
+                &serde_json::json!({
+                    "session_id": HOST,
+                    "process": "a".repeat(256)
+                }),
+            )),
+        )
+        .await;
+    assert_eq!(
+        error_of(&at_limit),
+        None,
+        "a filter at the limit is valid: {:?}",
+        at_limit.structured_content
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// TR-REL-13: an unknown `state_filter` is refused with the list of the accepted
+/// values before any host call.
+#[tokio::test]
+async fn get_tcp_connections_refuses_an_unknown_state_before_the_network() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let result = harness
+        .call(
+            CallToolRequestParams::new("get_tcp_connections").with_arguments(args(
+                &serde_json::json!({
+                    "session_id": HOST,
+                    "state_filter": "galaxy"
+                }),
+            )),
+        )
+        .await;
+    let error = error_of(&result).expect("a refusal");
+    assert!(error.contains("Established"), "{error}");
+    assert!(error.contains("Listen"), "{error}");
+    assert!(error.contains("All"), "{error}");
+    assert!(
+        !harness.transport.saw("Get-NetTCPConnection"),
+        "the refused state reached the host"
+    );
+    harness.client.cancel().await.ok();
+}
+
 /// AC-SEC05-1, AC-SEC05-2: without `WINRIG_ALLOWED_HOSTS` a remote host is refused
 /// before the network, and loopback passes (TR-SEC-14).
 #[tokio::test]

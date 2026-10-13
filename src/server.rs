@@ -688,7 +688,7 @@ struct TcpConnectionsParams {
     #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
     #[schemars(
-        description = "Filter on the state: Established (default), Listen, TimeWait, CloseWait or All."
+        description = "Filter on the state: Established (default), Listen, TimeWait, CloseWait, FinWait1, FinWait2, SynReceived, Bound or All."
     )]
     #[serde(default = "default_established")]
     state_filter: String,
@@ -697,6 +697,21 @@ struct TcpConnectionsParams {
     )]
     #[serde(default)]
     port_filter: i64,
+    #[schemars(
+        description = "Show only the connections of this owning process ID. The value 0 means all the processes."
+    )]
+    #[serde(default)]
+    pid: i64,
+    #[schemars(
+        description = "A wildcard on the owning process name. An empty value means all the processes."
+    )]
+    #[serde(default)]
+    process: String,
+    #[schemars(
+        description = "Group the rows by process, local port, local address and remote address. The result is JSON with a count for each group and a truncation flag."
+    )]
+    #[serde(default)]
+    summary: bool,
 }
 
 fn default_established() -> String {
@@ -1391,7 +1406,7 @@ impl WinrigServer {
 
     #[tool(
         name = "get_tcp_connections",
-        description = "List the active TCP connections as tabular text with local and remote addresses, ports, state and owning process."
+        description = "List the active TCP connections with local and remote addresses, ports, state and owning process. Filter by state, port, PID or process name. The default output is a text table; the summary mode returns JSON with a count for each group."
     )]
     async fn get_tcp_connections(
         &self,
@@ -1399,11 +1414,32 @@ impl WinrigServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let identity = self.identity(&ctx)?;
+        // The wildcard is bounded before any host call: a long pattern would not
+        // fit the WinRS command line (TR-REL-13).
+        let process_chars = params.process.chars().count();
+        if process_chars > ps::TCP_PROCESS_FILTER_MAX_CHARS {
+            return Ok(CallToolResult::structured(json!({
+                "error": format!(
+                    "process is {process_chars} characters; the limit is {}",
+                    ps::TCP_PROCESS_FILTER_MAX_CHARS
+                )
+            })));
+        }
+        let command = match ps::get_tcp_connections(
+            &params.state_filter,
+            params.port_filter,
+            params.pid,
+            &params.process,
+            params.summary,
+        ) {
+            Ok(command) => command,
+            Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
+        };
         Ok(self
             .run(
                 &identity,
                 &params.session_id,
-                &ps::get_tcp_connections(&params.state_filter, params.port_filter),
+                &command,
                 "get_tcp_connections",
             )
             .await)

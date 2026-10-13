@@ -1,31 +1,31 @@
-# ADR-0003 — Границы модулей: config, policy, executor
+# ADR-0003 — Module boundaries: `config`, `policy`, `executor`
 
-- Статус: принято
-- Дата: 2026-09-19
-- Связано: AGENTS.md §2, DR-7, DR-8
+- Status: accepted
+- Date: 2026-09-19
+- Related: AGENTS.md §2, DR-7, DR-8
 
-## Контекст
+## Context
 
-Смешение валидации конфигурации, решений «можно/нельзя», неблокирующего исполнения и построения команд делает проверки неотделимыми от WinRM и мешает тестировать без Windows-хоста.
+A mix of the validation of the configuration, the "allowed/not allowed" decisions, non-blocking execution and the generation of commands makes the checks inseparable from WinRM. It also prevents a test without a Windows host.
 
-## Решение
+## Decision
 
-Ввести модули с теми же границами, что и в Python-версии:
+Introduce modules with the same boundaries as in the Python version:
 
-- `src/config.rs` — `AppConfig`, чтение и валидация всех переменных окружения, единый отказ старта (DR-8).
-- `src/policy.rs` — решения «можно/нельзя»: allowlist хостов, режим понижения TLS, нормализация и классификация путей, защищённые префиксы (DR-6, DR-7).
-- `src/executor.rs` — редактирование секретов, усечение, оформление аудита.
-- `src/session.rs` — пул WinRM-соединений за трейтом `WinRmTransport`; реальная реализация поверх `winrm-rs`, тестовая — записывающий фиктивный транспорт.
-- `src/ps.rs` — чистые генераторы PowerShell-команд.
-- `src/server.rs` — тонкий адаптер: валидация аргументов → `policy` → `session`.
+- `src/config.rs` — `AppConfig`, the read and the validation of all environment variables, one start failure (DR-8).
+- `src/policy.rs` — the "allowed/not allowed" decisions: the host allowlist, the TLS downgrade mode, the normalization and the classification of paths, protected prefixes (DR-6, DR-7).
+- `src/executor.rs` — the redaction of secrets, truncation, the format of the audit log.
+- `src/session.rs` — the pool of WinRM connections behind the `WinRmTransport` trait; the real implementation is on top of `winrm-rs`, and the test implementation is a recording dummy transport.
+- `src/ps.rs` — pure generators of PowerShell commands.
+- `src/server.rs` — a thin adapter: the validation of arguments → `policy` → `session`.
 
-Контракты ответов инструментов сохраняются совместимыми с Python-версией.
+The response contracts of the tools stay compatible with the Python version.
 
-## Последствия
+## Consequences
 
-- Появляются тестовые швы: `policy`, `executor` и `ps` тестируются без WinRM; `session` — на фиктивном транспорте.
-- Отдельная off-loop обёртка не нужна: WinRM-вызов асинхронен, один запрос не блокирует остальные (TR-REL-01).
+- Test seams appear: the tests of `policy`, `executor` and `ps` do not use WinRM; the tests of `session` use the dummy transport.
+- A separate off-loop wrapper is not necessary: a WinRM call is asynchronous, and one request does not block the others (TR-REL-01).
 
-## Уточнение (ADR-0008)
+## Clarification (ADR-0008)
 
-Формулировка «пул WinRM-соединений» в решении выше описывала намерение, а не реализацию: в коде пул не вводился, `WinrmTransportImpl` создаёт клиент на каждый вызов, а `winrm-rs` создаёт и удаляет shell внутри `run_command`. Уточнение зафиксировано в ADR-0008 §9; переиспользование клиента вынесено в ROADMAP.
+The phrase "pool of WinRM connections" in the decision above described an intention, not the implementation. The code did not introduce a pool. `WinrmTransportImpl` makes a client for each call. `winrm-rs` makes and deletes the shell inside `run_command`. ADR-0008 §9 records this clarification. The reuse of the client is in the ROADMAP.

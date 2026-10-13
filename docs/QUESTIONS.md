@@ -95,3 +95,31 @@ Named directly and accepted: with `WINRIG_ALLOW_AD_WRITE=true` and an empty `WIN
 Decided (ADR-0015): four security corrections in one decision. PowerShell quotes are escaped in all five forms (TR-SEC-12). `connect` by headers requires the password in the same request (TR-SEC-13). An empty host allowlist means only loopback, and `*` means any host. `WINRIG_ALLOW_INSECURE_TLS` defaults to `false`, and `setup --allowed-hosts` writes the list into the client entry (TR-SEC-14, TR-SEC-06, TR-PRF-17). A write and a deletion check the path against the roots from the host system variables (TR-FS-06, TR-SEC-04). Policy refusals go to the audit (TR-OBS-03). The change of the defaults breaks compatibility, so the release is 0.2.0.
 
 Named directly and accepted: an already open session runs commands without a repeated password. Junctions and symlinks in parent directories of a write target are not resolved. Both residual risks are recorded in ADR-0015.
+
+## Q-17. The CLIXML progress record in stderr
+
+Decided: every generated script sets `$ProgressPreference = 'SilentlyContinue'` in its preamble (TR-REL-10, slice W23, GitHub #22). The bug report offered two options — the preamble, or a result parser that drops the `S="progress"` records. The preamble removes the record at the cause, on the host, and it needs no change of the parser. The parser option stays available as a second line of defense, but it is not a requirement.
+
+## Q-18. Registry subkeys: a new tool or a parameter
+
+Decided: `get_registry` takes the parameters `subkeys: bool` (default `false`) and `depth: i64` (default 1, the range is 1 to 5) (TR-REL-11, slice W24, GitHub #18). The issue offered a new tool `list_registry_subkeys` or a parameter of `get_registry`. Both operations are read-only and of the same risk, and ADR-0014 §10 groups same-risk operations into one tool. A parameter also keeps the exact tool count stable.
+
+## Q-19. The parameter names of `get_tcp_connections`
+
+Decided: the existing `state_filter` and `port_filter` stay, and the slice adds `pid: i64` (default 0), `process` (a wildcard, default empty) and `summary: bool` (default `false`) (TR-REL-13, slice W26, GitHub #20). The issue used the names `state` and `local_port`. A rename would break the response contract of the ported tool (ADR-0003), so the slice keeps the existing names.
+
+## Q-20. Protected services for the service tools
+
+Decided: `set_service_start_type` and `stop_service` refuse a service that is critical for the remote session, for example `WinRM`, `RpcSs`, `LanmanServer` and the Service Control Manager (TR-SEC-15, AC-SEC15-3, slice W30, GitHub #10). The issue says "as `stop_service` does now, if it does". The code has no such refusal today: `src/server.rs` holds no service protection list. The conservative choice is to add the refusal. The exact set of names is an implementation detail of the slice and stays in the policy module.
+
+## Q-21. Personal data in the print job result
+
+Decided: `get_print_jobs` returns the document name and the owner only with `include_personal_data: bool` (default `false`) (TR-REL-15, AC-REL15-2, slice W28, GitHub #19). Without the flag the two fields are absent from the result. The issue asks to return them "only when the caller asks for them explicitly"; the default-off flag is that explicit request.
+
+## Q-22. The time filter of the log search
+
+Decided: `search_file_content` takes `since` and `until` (timestamps) and `timestamp_format` (a regular expression, default `yyyy-MM-dd HH:mm:ss` at the start of the line) (TR-REL-16, slice W29, GitHub #17). If the caller gives `since` or `until` without a format, the server uses the default format. The `exclude` pattern of the `read_file` tail mode is a literal string (the `-SimpleMatch` rule, as in `search_file_content`), not a regular expression.
+
+## Q-23. The form of `doctor`
+
+Decided: `doctor` is a read-only subcommand (TR-PRF-18, AC-PRF-69, slice W31, GitHub #24). The issue offered a command `winrig doctor` or an option of `setup`. The subcommand keeps `setup` a single responsibility for the client configuration write. The optional part of the issue — `setup` writes the same set of variables for each profile it adds — stays outside the slice: it changes the write of the client configuration and needs its own decision.

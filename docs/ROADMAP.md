@@ -26,6 +26,15 @@ Product: `winrig`. Canon: `AGENTS.md`. Cycle: `docs/IMPLEMENTATION_CYCLE.md`. St
 | W20 | Accounts and group membership | TR-AD-06..09/12..15, ADR-0014 | yes | pending |
 | W21 | Attribute editing by rules | TR-AD-10/11, ADR-0014 | yes | pending |
 | W22 | Safe defaults: PowerShell quotes, the password on `connect`, loopback and TLS by default, the host roots, the audit of refusals | TR-SEC-04/06/12/13/14, TR-FS-06, TR-OBS-03, TR-PRF-17, ADR-0015 | yes | accepted |
+| W23 | The progress stream of the generated scripts (CLIXML bug, GitHub #22) | TR-REL-10, AC-REL10-1 | no | pending |
+| W24 | Registry subkey listing (GitHub #18) | TR-REL-11, AC-REL11-1/2 | no | pending |
+| W25 | Any event log channel and a channel list (GitHub #16) | TR-REL-12, AC-REL12-1/2 | no | pending |
+| W26 | TCP connections: states, filters and a summary (GitHub #20) | TR-REL-13, AC-REL13-1 | no | pending |
+| W27 | Which process holds a file open (GitHub #21) | TR-REL-14, AC-REL14-1 | no | pending |
+| W28 | Printers and print jobs (GitHub #19) | TR-REL-15, AC-REL15-1/2 | no | pending |
+| W29 | Log search from the end, by time and by count (GitHub #17) | TR-REL-16, AC-REL16-1/2 | no | pending |
+| W30 | Service configuration, the start type and a verified stop (GitHub #10) | TR-REL-17/18, TR-SEC-15, AC-REL17-1, AC-REL18-1/2, AC-SEC15-1/2/3 | yes | pending |
+| W31 | Check that the environment agrees across project servers (`doctor`, GitHub #24) | TR-PRF-18, AC-PRF-69 | no | pending |
 
 ## Phase criteria
 
@@ -236,3 +245,84 @@ A mutation check: a disable of the root check fails three tests of the policy. A
 An independent review of the first draft of the slice returned it with two blockers. The host `evil.com/.corp.example` bypassed the suffix list, because `winrm-rs` cuts the string at `/`. The 8.3 names bypassed both the lexical list and the host roots. The slice closes both (ADR-0015 §7a, §13a) together with the remarks. The remarks hold a common grammar of the list with a start refusal and the administrative share as a local path. They hold the answer "a password is necessary" before the exposure of a foreign lockout. A second round found a bypass through the share `ADMIN$`, and the slice closes it together with `PRINT$`, `SYSVOL` and `NETLOGON`. A third round gave the verdict "accepted".
 
 Remaining risks (ADR-0015): an open session runs commands without a second password. A junction and a symlink in the parents of a write target stay unrevealed. Not verifiable by an automatic test: the behavior of `GetUnresolvedProviderPathFromPSPath` and of the environment variables on a live host (Q-08).
+
+## W23. The progress stream of the generated scripts
+
+Goal: remove the CLIXML progress record from the stderr of the tool calls. Bug: GitHub #22.
+
+Most results carried a block `<Objs ...><Obj S="progress" ...>` in stderr. The record is a PowerShell progress record, not an error. It added noise to each answer and used the output limit. On a non-English host the record is in the host language.
+
+The content: every generated script sets `$ProgressPreference = 'SilentlyContinue'` in its preamble (TR-REL-10, AC-REL10-1). The bug report offers two options — the preamble, or a parser that drops the `S="progress"` records. The slice takes the preamble, because it removes the record at the cause (Q-17). The test asserts the preamble in every command that reaches the fake transport. The slice adds no tool.
+
+## W24. Registry subkey listing
+
+Goal: give the agent the names of the subkeys of a registry key. GitHub #18.
+
+`get_registry` returned only the values of a key. To find the printers under `HKLM:\SYSTEM\CurrentControlSet\Control\Print\Printers` or the ports under the monitor key, the agent had to guess the subkey names.
+
+The content: the parameters `subkeys: bool` (default `false`) and `depth: i64` (default 1, the range is 1 to 5) on `get_registry` (TR-REL-11, AC-REL11-1/2). The slice takes a parameter of the existing tool instead of a new tool, because the operation is read-only and of the same risk, and the grouping of same-risk operations is the rule of ADR-0014 §10 (Q-18). The bounds of `depth` are the safety limit: a deeper walk is a slow call on a large key. The slice adds no tool, so the exact tool count does not change.
+
+## W25. Any event log channel and a channel list
+
+Goal: let `get_event_log` read an operational channel, and add the read-only tool `list_event_logs`. GitHub #16.
+
+`get_event_log` accepted only `System`, `Application` and `Security`. Many diagnostics need a channel such as `Microsoft-Windows-PrintService/Operational` or `Microsoft-Windows-Windows Defender/Operational`.
+
+The content: `get_event_log` accepts any channel that `Get-WinEvent -ListLog` returns (TR-REL-12). The server escapes the channel name by the rule for the single quote (TR-SEC-12), so the name cannot inject. The filters level, hours, source and count stay. The new read-only tool `list_event_logs(filter)` returns the channel name, the record count and the enabled state (AC-REL12-1/2). The tool count grows by one; AC-OBS02-2 and AC-PRF-48 and both exact-count tests take the new value into account.
+
+## W26. TCP connections: states, filters and a summary
+
+Goal: give the agent the listening sockets, a filter set and a count for each group. GitHub #20.
+
+`get_tcp_connections` returned only `Established` rows. The agent could not see that a web interface listened only on IPv4, and counted the connections of one remote address by hand.
+
+The content: the parameters `pid: i64` (default 0), `process` (a wildcard, default empty) and `summary: bool` (default `false`) on `get_tcp_connections` (TR-REL-13, AC-REL13-1). The existing `state_filter` and `port_filter` stay for compatibility (Q-19). With `summary=true` the result groups the rows by process, local port and remote address with a count. A `Listen` row holds the bound address. Read-only. The slice adds no tool.
+
+## W27. Which process holds a file open
+
+Goal: answer "which process holds this file" in one call. GitHub #21.
+
+A database file appeared again after each delete while the service looked stopped; the cause was a crash loop, and the agent found it only through the event log.
+
+The content: the read-only tool `get_open_handles(path)` returns the pid, the name and the start time of each process that holds the file, or a file under the directory (TR-REL-14, AC-REL14-1). On a host without the Sysinternals `handle.exe` the tool uses the Restart Manager (`RmGetList`), so it needs no third-party software. Read-only, no confirmation. The tool count grows by one.
+
+## W28. Printers and print jobs
+
+Goal: diagnose a print server: the printer queues and their jobs. GitHub #19.
+
+The agent read the printer state from the registry (`Status = 384`) and decoded the flags by hand.
+
+The content: the read-only tools `get_printers` and `get_print_jobs(printer)` (TR-REL-15, AC-REL15-1/2). `get_printers` returns the name, the share name, the driver, the port, the port host and number, the state as decoded flags and the job count. `get_print_jobs` returns the job id, the document name, the owner, the state, the size and the submit time. The document name and the owner are personal data, so the tool returns them only with `include_personal_data: bool` (default `false`) (Q-21). Read-only. The tool count grows by two.
+
+## W29. Log search from the end, by time and by count
+
+Goal: let the agent read the tail of a large log without a full download. GitHub #17.
+
+On a 50 MB log `search_file_content` returned the first matches from the morning; the agent needed the last ones. A wrong conclusion came from this. The tail mode of `read_file` cut the output at 60000 characters, a few seconds of a verbose log.
+
+The content: `search_file_content` takes `from_end: bool` (default `false`), `count_only: bool` (default `false`), `since` and `until` (timestamps) and `timestamp_format` (a regular expression, default `yyyy-MM-dd HH:mm:ss` at the start of the line). The tail mode of `read_file` takes `exclude` (a literal pattern) (TR-REL-16, AC-REL16-1/2, Q-22). The search streams the file and does not load it into the memory of the host. Read-only. The slice adds no tool.
+
+## W30. Service configuration, the start type and a verified stop
+
+Goal: let the operator stop a service and keep it stopped, and let the agent see why a service returns. GitHub #10.
+
+A service had the recovery action "Restart the service" after 10 seconds. `stop_service` returned `Stopped`; ten seconds later the service ran again. The failure counter reset each time, so a crash loop started. The agent could not stop the loop, because winrig cannot change the start type.
+
+The content: the read-only tool `get_service_config(name)` returns the start type, the account, the binary path and the recovery actions: the action of each failure, the delay and the reset period (the data of `sc qfailure`) (TR-REL-17, AC-REL17-1). The modifying tool `set_service_start_type(name, start_type)` takes `Automatic`, `AutomaticDelayed`, `Manual` and `Disabled`. The stop gets a verification: `stop_service` waits `wait_seconds` (default 15) and reads the state and the events 7031/7034/7036 of the `System` log for this service since the stop; if the service runs again, the tool returns an error that names the recovery restart (TR-REL-18, AC-REL18-1). `stop_service(disable=true)` sets the start type `Disabled` before the stop (AC-REL18-2). The modifying operations need the confirmation of DR-5, and the confirmation shows the current start type and the new start type (TR-SEC-15, AC-SEC15-1/2). The server refuses a service that is critical for the remote session before a call to the host (AC-SEC15-3, Q-20). The slice is risky: it changes the start type of a service, and a wrong value can keep a host in a bad state. The tool count grows by two.
+
+## W31. Check that the environment agrees across project servers
+
+Goal: show the effective settings of each winrig server in the client configuration, and mark the differences. GitHub #24.
+
+A project had two winrig servers in one client configuration. One had `WINRIG_ALLOW_INSECURE_TLS=true`, the other did not, and the documents said that both had it. The cause of a failed `connect(verify_cert=false)` took time to find.
+
+The content: the subcommand `winrig doctor` reads the client configuration, lists each winrig server with its effective settings (`WINRIG_ALLOWED_HOSTS`, `WINRIG_ALLOW_INSECURE_TLS`, `WINRIG_ALLOW_FILE_WRITE` and the other variables) and marks the differences between the servers (TR-PRF-18, AC-PRF-69). The command prints no token value (DR-4). The command is read-only (Q-23). The slice adds no MCP tool.
+
+## The next iteration
+
+These issues wait for a later iteration. They have no slice and no requirement yet, because each one needs a foundation that does not exist.
+
+- GitHub #13 (an operator allowlist for writes under the protected roots), GitHub #11 (file transfer in both directions) and GitHub #12 (copy, move and rename) come together. They need one new ADR about the write boundary under the protected paths: where an operator may permit a write, and how the confirmation and the audit show the exception. TR-FS-02, TR-FS-06 and DR-6 are the base (ADR-0015).
+- GitHub #14 (the `run_command` allowlist from the field) continues W16 on top of ADR-0013. It may change the form of `WINRIG_ALLOWED_COMMANDS` and add a read-only mode for a command.
+- GitHub #23 (a clear result when the host restarts during a session) continues inside W14, which owns the classification of the transport errors (TR-SEC-10).
+- GitHub #15 (a read-only HTTP request to a loopback port) needs the secret redaction design of TR-SEC-08, which has no coverage yet.

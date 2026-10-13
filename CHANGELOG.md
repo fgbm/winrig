@@ -17,7 +17,13 @@ A release goes out under the tag `vX.Y.Z`; the tag starts `.github/workflows/rel
 
 - The repository text is English by ASD-STE100 (ADR-0016).
 - The tool descriptions, the parameter descriptions and the CLI help are rewritten in STE.
+- The error messages, the log messages and the tool results are rewritten in STE.
+- The comment check is stricter. It also finds a first sentence that restates the name. It finds a short field doc without information and a repeated subject in a doc block.
 - The confirmation form describes its field in English.
+
+### Fixed
+
+- Two tests that capture the tracing output failed about one time in 300 runs. The capture now rebuilds the tracing interest cache (#9).
 
 ## [0.2.0] - 2026-09-22
 

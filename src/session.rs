@@ -115,7 +115,7 @@ pub struct SessionTarget {
     pub use_tls: bool,
     pub verify_cert: bool,
     pub username: String,
-    /// Zeroized on drop.
+    /// Zeroized on drop (DR-4).
     pub password: SecretString,
 }
 
@@ -194,7 +194,7 @@ impl WinRmTransport for WinrmTransportImpl {
     }
 }
 
-/// Hint for an empty 500: the listener rejected an unencrypted message.
+/// The listener rejected an unencrypted message when it answers HTTP 500 with an empty body.
 const UNENCRYPTED_HINT: &str = "the host returned HTTP 500 with an empty body. \
      The credentials were accepted, so this is not a password problem: WinRM answers \
      an unencrypted message this way when AllowUnencrypted is false. Connect over \
@@ -242,7 +242,7 @@ pub struct RegistryConfig {
     pub lockout_window: Duration,
     /// Redaction threshold in the reply to the agent.
     pub secret_redact_min_length: usize,
-    /// Output cap in the audit.
+    /// Output cap in the audit, in characters.
     pub audit_max_output_chars: usize,
     /// Whether to write the command and output body into the audit.
     pub audit_log_body: bool,
@@ -333,7 +333,7 @@ impl SessionRegistry {
         }
     }
 
-    /// Puts the password into the user's cache, dropping the sessions when the password changes.
+    /// Stores the password for the user and drops the user's sessions when it changes.
     pub fn cache_password(&self, username: &str, password: &str) {
         let now = Instant::now();
         let changed = {

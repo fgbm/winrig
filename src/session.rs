@@ -196,7 +196,7 @@ impl WinRmTransport for WinrmTransportImpl {
 
 /// The listener rejected an unencrypted message when it answers HTTP 500 with an empty body.
 const UNENCRYPTED_HINT: &str = "the host returned HTTP 500 with an empty body. \
-     The credentials were accepted, so this is not a password problem: WinRM answers \
+     The host accepted the credentials, so this is not a password problem: WinRM answers \
      an unencrypted message this way when AllowUnencrypted is false. Connect over \
      HTTPS (port 5986), or set AllowUnencrypted on the host.";
 
@@ -422,8 +422,8 @@ impl SessionRegistry {
             && lock(&self.profile_refused).contains(&username)
         {
             return json!({
-                "error": "The profile password was rejected twice; the profile is refused until \
-                          the process restarts. Run 'winrig setup' to update it.",
+                "error": "The host rejected the profile password twice. The server refuses the \
+                          profile until the process restarts. Run 'winrig setup' to update it.",
                 "auth_failed": true,
             });
         }
@@ -440,7 +440,7 @@ impl SessionRegistry {
             );
             return json!({
                 "error": "connect requires the AD password in the X-AD-Password header of the same \
-                          request; a cached password is not used to open a session."
+                          request. The server does not use a cached password to open a session."
             });
         };
 
@@ -576,7 +576,7 @@ impl SessionRegistry {
                         escape_log_field(&audit_stderr.chars().take(200).collect::<String>())
                     ),
                 );
-                json!({ "error": format!("Connection test failed: {reply_stderr}") })
+                json!({ "error": format!("The connect test failed: {reply_stderr}") })
             }
             Err(error) => {
                 if error.is_auth_failure() {
@@ -768,7 +768,7 @@ impl SessionRegistry {
                     reply.insert(
                         "error".to_owned(),
                         json!(format!(
-                            "Command failed with exit code {} and produced no output. A cmdlet most likely reported an error that the command suppressed — often because nothing matched the requested filter.",
+                            "The command failed with exit code {} and produced no output. A cmdlet most likely reported an error that the command suppressed, often because nothing matched the requested filter.",
                             output.exit_code
                         )),
                     );

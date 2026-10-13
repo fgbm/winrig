@@ -71,6 +71,25 @@ jobs:
         with:
           command: check
 
+  # The site is built on every pull request, so a broken page fails before the
+  # merge. The audit fails only on a high or critical advisory.
+  docs:
+    name: Docs site
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docs/site
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docs/site/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm audit --audit-level=high
+
   # The style job lints the Markdown that is already English. The translation
   # commits extend the path list.
   vale:

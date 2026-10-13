@@ -33,7 +33,7 @@ The binary declares 43 tools, plus `write_file` when the operator enables it. Th
 | `get_event_log` | The Windows event log: crashes, service failures, authentication errors |
 | `list_event_logs` | The event log channels with the record count and the enabled state |
 | `get_services` | A summary of the services, or the full details of each service in JSON |
-| `get_service_config` | One service: the start type (Automatic, AutomaticDelayed, Manual or Disabled), the account, the binary path and the recovery actions with the action, the delay and the reset period |
+| `get_service_config` | One service: the start type, the account, the binary path and the recovery actions. The start type is Automatic, AutomaticDelayed, Manual or Disabled. The recovery actions hold the action, the delay and the reset period |
 | `list_processes` | The processes with a sort by CPU, memory or handles |
 | `get_open_handles` | The processes that hold a file open, with the PID, the name and the start time. It uses the Restart Manager, so no Sysinternals `handle.exe` is needed |
 | `get_printers` | The printers with the share name, the driver, the port, the port host and number, the state as the PrinterStatus name and the job count |
@@ -87,7 +87,7 @@ The directory write (slices W20–W21) stays intentionally outside the first wav
 
 These tools change the host and they require confirmation.
 
-Each confirmation names the host of the session, the user of the request and the tool. It names the target and the operation with the details that are available before the call, and it holds one plain line that states the effect and whether the operator can undo it. A hidden value appears only as `hidden`: the old and new values of `set_registry` and the content of `write_file` are hidden values, and `kill_process` does not read the command line at all. The server sanitizes each field and caps it at 200 characters; a cut path keeps its tail, and a cut field carries the marker `...` inside the cap. The text is English and does not depend on the language of the host.
+Each confirmation names the host of the session, the user of the request and the tool. It names the target and the operation with the details that are available before the call. It holds one plain line that states the effect. The line states whether the operator can undo it. A hidden value appears only as `hidden`: the old and new values of `set_registry` and the content of `write_file` are hidden values. `kill_process` does not read the command line at all. The server sanitizes each field and caps it at 200 characters. A cut path keeps its tail, and a cut field carries the marker `...` inside the cap. The text is English and does not depend on the language of the host.
 
 | Tool | Description |
 |------|-------------|

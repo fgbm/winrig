@@ -261,7 +261,7 @@ Goal: give the agent the names of the subkeys of a registry key. GitHub #18.
 
 `get_registry` returned only the values of a key. To find the printers under `HKLM:\SYSTEM\CurrentControlSet\Control\Print\Printers` or the ports under the monitor key, the agent had to guess the subkey names.
 
-The content: the parameters `subkeys: bool` (default `false`) and `depth: i64` (default 1, the range is 1 to 5) on `get_registry` (TR-REL-11, AC-REL11-1/2). The slice takes a parameter of the existing tool instead of a new tool, because the operation is read-only and of the same risk, and the grouping of same-risk operations is the rule of ADR-0014 §10 (Q-18). The bounds of `depth` are the safety limit: a deeper walk is a slow call on a large key. The slice adds no tool, so the exact tool count does not change.
+The content: the parameters `subkeys: bool` (default `false`) and `depth: i64` (default 1, the range is 1 to 5) on `get_registry` (TR-REL-11, AC-REL11-1/2). The slice takes a parameter of the existing tool instead of a new tool. The operation is read-only and of the same risk, and the grouping of same-risk operations is the rule of ADR-0014 §10 (Q-18). The bounds of `depth` are the safety limit: a deeper walk is a slow call on a large key. The slice adds no tool, so the exact tool count does not change.
 
 ## W25. Any event log channel and a channel list
 
@@ -283,9 +283,9 @@ The content: the parameters `pid: i64` (default 0), `process` (a wildcard, defau
 
 Goal: answer "which process holds this file" in one call. GitHub #21.
 
-A database file appeared again after each delete while the service looked stopped; the cause was a crash loop, and the agent found it only through the event log.
+A database file appeared again after each delete while the service looked stopped. The cause was a crash loop, and the agent found it only through the event log.
 
-The content: the read-only tool `get_open_handles(path)` returns the pid, the name and the start time of each process that holds the file, or a file under the directory (TR-REL-14, AC-REL14-1). The tool uses the Restart Manager (`RmGetList`) through `Reflection.Emit`, so it needs no Sysinternals `handle.exe` and leaves no temporary file on the host. A directory is checked file by file, with caps on the files and the rows. Read-only, no confirmation. The tool count grows by one.
+The content: the read-only tool `get_open_handles(path)` returns the pid, the name and the start time of each process that holds the file. The path may also be a directory, and then the tool covers a file under the directory (TR-REL-14, AC-REL14-1). The tool uses the Restart Manager (`RmGetList`) through `Reflection.Emit`, so it needs no Sysinternals `handle.exe` and leaves no temporary file on the host. A directory is checked file by file, with caps on the files and the rows. Read-only, no confirmation. The tool count grows by one.
 
 ## W28. Printers and print jobs
 
@@ -309,7 +309,7 @@ Goal: let the operator stop a service and keep it stopped, and let the agent see
 
 A service had the recovery action "Restart the service" after 10 seconds. `stop_service` returned `Stopped`; ten seconds later the service ran again. The failure counter reset each time, so a crash loop started. The agent could not stop the loop, because winrig cannot change the start type.
 
-The content: the read-only tool `get_service_config(name)` returns the start type, the account, the binary path and the recovery actions: the action of each failure, the delay and the reset period (the data of `sc qfailure`) (TR-REL-17, AC-REL17-1). The modifying tool `set_service_start_type(name, start_type)` takes `Automatic`, `AutomaticDelayed`, `Manual` and `Disabled`. The stop gets a verification: `stop_service` waits `wait_seconds` (default 15) and reads the state and the events 7031/7034/7036 of the `System` log for this service since the stop; if the service runs again, the tool returns an error that names the recovery restart (TR-REL-18, AC-REL18-1). `stop_service(disable=true)` sets the start type `Disabled` before the stop (AC-REL18-2). The modifying operations need the confirmation of DR-5, and the confirmation shows the current start type and the new start type (TR-SEC-15, AC-SEC15-1/2). The server refuses a service that is critical for the remote session before a call to the host (AC-SEC15-3, Q-20). The slice is risky: it changes the start type of a service, and a wrong value can keep a host in a bad state. The tool count grows by two.
+The content: the read-only tool `get_service_config(name)` returns the start type, the account, the binary path and the recovery actions. The recovery actions hold the action of each failure, the delay and the reset period (the data of `sc qfailure`) (TR-REL-17, AC-REL17-1). The modifying tool `set_service_start_type(name, start_type)` takes `Automatic`, `AutomaticDelayed`, `Manual` and `Disabled`. The stop gets a verification. `stop_service` waits `wait_seconds` (default 15) and reads the state and the events 7031/7034/7036 of the `System` log for this service since the stop. If the service runs again, the tool returns an error that names the recovery restart (TR-REL-18, AC-REL18-1). `stop_service(disable=true)` sets the start type `Disabled` before the stop (AC-REL18-2). The modifying operations need the confirmation of DR-5, and the confirmation shows the current start type and the new start type (TR-SEC-15, AC-SEC15-1/2). The server refuses a service that is critical for the remote session before a call to the host (AC-SEC15-3, Q-20). The slice is risky: it changes the start type of a service, and a wrong value can keep a host in a bad state. The tool count grows by two.
 
 ## W31. Check that the environment agrees across project servers
 
@@ -317,7 +317,7 @@ Goal: show the effective settings of each winrig server in the client configurat
 
 A project had two winrig servers in one client configuration. One had `WINRIG_ALLOW_INSECURE_TLS=true`, the other did not, and the documents said that both had it. The cause of a failed `connect(verify_cert=false)` took time to find.
 
-The content: the subcommand `winrig doctor` reads the client configuration, lists each winrig server with its effective settings (`WINRIG_ALLOWED_HOSTS`, `WINRIG_ALLOW_INSECURE_TLS`, `WINRIG_ALLOW_FILE_WRITE` and the other variables) and marks the differences between the servers (TR-PRF-18, AC-PRF-69). The command prints no token value (DR-4). The command is read-only (Q-23). The slice adds no MCP tool.
+The content: the subcommand `winrig doctor` reads the client configuration. It lists each winrig server with its effective settings (`WINRIG_ALLOWED_HOSTS`, `WINRIG_ALLOW_INSECURE_TLS`, `WINRIG_ALLOW_FILE_WRITE` and the other variables). It marks the differences between the servers (TR-PRF-18, AC-PRF-69). The command prints no token value (DR-4). The command is read-only (Q-23). The slice adds no MCP tool.
 
 ## W32. Clear confirmation text
 
@@ -335,7 +335,7 @@ The complaint comes from live operation. The operator could not tell the target,
 
 The content:
 
-- **TR-SEC-16.** Every confirmation names the host, the identity and the tool, and it holds one plain line that states what the operation does and whether the operator can undo it.
+- **TR-SEC-16.** Every confirmation names the host, the identity and the tool. It holds one plain line that states what the operation does and whether the operator can undo it.
 - **TR-SEC-17.** Each modifying tool lists its target and the effective operation with the details that are available before the call. The table below is the per-tool list.
 - **TR-SEC-18.** A hidden value appears only as the marker `hidden`. The old value and the new value of `set_registry` and the content of `write_file` are hidden values (DR-4).
 - **TR-SEC-19.** The server sanitizes each field of the text (TR-SEC-09, ADR-0008 §11) and caps the field at 200 characters. A cut field carries a visible marker, and the marker counts inside the cap.
@@ -363,7 +363,7 @@ The slice changes no operation, only the text before the confirmation, so the ri
 
 These issues wait for a later iteration. They have no slice and no requirement yet, because each one needs a foundation that does not exist.
 
-- GitHub #13 (an operator allowlist for writes under the protected roots), GitHub #11 (file transfer in both directions) and GitHub #12 (copy, move and rename) come together. They need one new ADR about the write boundary under the protected paths: where an operator may permit a write, and how the confirmation and the audit show the exception. TR-FS-02, TR-FS-06 and DR-6 are the base (ADR-0015).
+- GitHub #13 (an operator allowlist for writes under the protected roots) and GitHub #11 (file transfer in both directions) come together. GitHub #12 (copy, move and rename) joins them. They need one new ADR about the write boundary under the protected paths. The ADR states where an operator may permit a write, and how the confirmation and the audit show the exception. TR-FS-02, TR-FS-06 and DR-6 are the base (ADR-0015).
 - GitHub #14 (the `run_command` allowlist from the field) continues W16 on top of ADR-0013. It may change the form of `WINRIG_ALLOWED_COMMANDS` and add a read-only mode for a command.
 - GitHub #23 (a clear result when the host restarts during a session) continues inside W14, which owns the classification of the transport errors (TR-SEC-10).
 - GitHub #15 (a read-only HTTP request to a loopback port) needs the secret redaction design of TR-SEC-08, which has no coverage yet.

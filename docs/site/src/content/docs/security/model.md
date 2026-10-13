@@ -23,7 +23,7 @@ The profile file is `corp.json` in the profile directory. It holds the format ve
 
 ## Confirmation, fail-closed
 
-Each modifying operation requires the explicit confirmation of the operator; without a confirmation channel the operation does not run. The modifying tools get confirmation through MCP elicitation, and they fail closed when the client cannot ask ([ADR-0006](https://github.com/fgbm/winrig/blob/main/docs/adr/0006-password-header-and-confirmation.md)). The confirmation names the host, the user and the tool, and it names the target and the effect. A hidden value appears only as `hidden`: the old and new values of `set_registry`, the content of `write_file` and the command line of `kill_process` stay hidden, and the server sanitizes each field and caps it at 200 characters.
+Each modifying operation requires the explicit confirmation of the operator; without a confirmation channel the operation does not run. The modifying tools get confirmation through MCP elicitation, and they fail closed when the client cannot ask ([ADR-0006](https://github.com/fgbm/winrig/blob/main/docs/adr/0006-password-header-and-confirmation.md)). The confirmation names the host, the user and the tool, and it names the target and the effect. A hidden value appears only as `hidden`. The old and new values of `set_registry`, the content of `write_file` and the command line of `kill_process` stay hidden. The server sanitizes each field and caps it at 200 characters.
 
 :::caution
 The password comes in a header, not in a dialog. winrig does not ask for passwords through elicitation. The MCP specification excludes secrets from elicitation, and the protocol revision `2026-07-28` removes elicitation completely.

@@ -1,13 +1,12 @@
-//! Чистые решения «можно/нельзя» без WinRM (ADR-0003, ADR-0005, DR-6, DR-7).
+//! Pure allow/deny decisions without WinRM (ADR-0003, ADR-0005, DR-6, DR-7).
 //!
-//! Модуль не касается сети и транспорта: он нормализует вход и выносит
-//! вердикт. Порт `agent/policy.py`; семантика нормализации путей повторяет
-//! `ntpath.normpath`/`ntpath.splitroot` из стандартной библиотеки CPython,
-//! потому что защита путей должна срабатывать для любой формы записи.
+//! The module does not touch the network or the transport: it normalizes the input and returns a verdict.
+//! Port of `agent/policy.py`; path normalization follows `ntpath.normpath`/`ntpath.splitroot` from the CPython
+//! standard library, because path protection must fire for any written form.
 
 use crate::config::{MAX_PORT, MIN_PORT};
 
-/// Системные каталоги в канонической форме (верхний регистр, один `\`).
+/// System directories in canonical form (uppercase, single `\`).
 const PROTECTED_DIRS: [&str; 6] = [
     "C:\\WINDOWS",
     "C:\\WINDOWS\\SYSTEM32",
@@ -17,12 +16,12 @@ const PROTECTED_DIRS: [&str; 6] = [
     "C:\\PROGRAMDATA",
 ];
 
-/// Префиксы устройств Windows, снимаемые перед нормализацией.
+/// Stripped from the front before normalization.
 const DEVICE_PREFIXES: [&str; 3] = ["\\\\?\\", "\\\\.\\", "\\??\\"];
-/// Префиксы UNC-устройств, приводящие к обычному UNC-пути.
+/// Map to a plain UNC path before normalization.
 const UNC_PREFIXES: [&str; 2] = ["\\\\?\\UNC\\", "\\??\\UNC\\"];
 
-/// Недопустимый ввод политики: сообщение называет параметр и ожидание.
+/// Invalid policy input; the message names the parameter and the expected form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyError(String);
 
@@ -40,14 +39,11 @@ impl std::fmt::Display for PolicyError {
 
 impl std::error::Error for PolicyError {}
 
-/// Вердикт политики: разрешение/отказ, причина и машинный код.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyDecision {
-    /// Разрешено ли действие.
     pub allow: bool,
-    /// Человекочитаемая причина.
     pub reason: String,
-    /// Стабильный машинный код (`OK`, `HOST_NOT_ALLOWED`, ...).
+    /// Stable machine-readable value such as `OK` or `HOST_NOT_ALLOWED`.
     pub code: &'static str,
 }
 
@@ -69,7 +65,6 @@ impl PolicyDecision {
     }
 }
 
-/// Схлопывает любую серию обратных слэшей в один.
 fn collapse_backslashes(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_backslash = false;
@@ -87,7 +82,7 @@ fn collapse_backslashes(s: &str) -> String {
     out
 }
 
-/// Разбивает путь на (диск, корень, хвост) по правилам `ntpath.splitroot`.
+/// Path pieces (drive, root, tail), like `ntpath.splitroot`.
 fn split_root(path: &str) -> (String, String, String) {
     const SEP: char = '\\';
     let normp: Vec<char> = path.replace('/', "\\").chars().collect();
@@ -137,7 +132,7 @@ fn split_root(path: &str) -> (String, String, String) {
     }
 }
 
-/// Лексическая нормализация Windows-пути (`ntpath.normpath`).
+/// Lexical normalization of a Windows path (`ntpath.normpath`).
 fn normpath(path: &str) -> String {
     let replaced = path.replace('/', "\\");
     let (drive, root, tail) = split_root(&replaced);
@@ -167,14 +162,13 @@ fn normpath(path: &str) -> String {
     prefix + &comps.join("\\")
 }
 
-/// Приводит путь к канонической форме для сравнения (DR-6).
+/// Canonical form for comparison (DR-6): protection must fire for any written form.
 ///
-/// `/` → `\`; снимаются префиксы `\\?\UNC\` и `\??\UNC\` (в обычный UNC
-/// `\\server\share`), затем `\\?\`, `\\.\` и `\??\`; повторные `\`
-/// схлопываются; `.` и `..` схлопываются лексически; хвостовые точки и пробелы
-/// отбрасываются у каждого компонента (Windows их не различает); завершающий
-/// `\` убирается, кроме корня тома; результат — в верхнем регистре. Для UNC
-/// `\\server\share` ведущие два `\` сохраняются.
+/// `/` becomes `\`; the `\\?\UNC\` and `\??\UNC\` prefixes are stripped (to a plain UNC
+/// `\\server\share`), then `\\?\`, `\\.\` and `\??\`; runs of `\` collapse; `.` and `..`
+/// collapse lexically; trailing dots and spaces are dropped from each component (Windows
+/// does not distinguish them); a trailing `\` is removed except at a volume root; the
+/// result is uppercase. For a UNC `\\server\share` the leading two `\` are kept.
 #[must_use]
 pub fn normalize_windows_path(path: &str) -> String {
     if path.is_empty() {
@@ -220,13 +214,13 @@ pub fn normalize_windows_path(path: &str) -> String {
     p.to_uppercase()
 }
 
-/// `^[A-Z]:\\$` — корень тома.
+/// `^[A-Z]:\\$` — a volume root.
 fn is_volume_root(norm: &str) -> bool {
     let bytes = norm.as_bytes();
     bytes.len() == 3 && bytes[0].is_ascii_uppercase() && bytes[1] == b':' && bytes[2] == b'\\'
 }
 
-/// `^VOLUME\{[^}]*\}$` — сам том в форме `Volume{GUID}`.
+/// `^VOLUME\{[^}]*\}$` — the volume itself as `Volume{GUID}`.
 fn is_volume_guid(norm: &str) -> bool {
     let Some(rest) = norm.strip_prefix("VOLUME{") else {
         return false;
@@ -237,7 +231,7 @@ fn is_volume_guid(norm: &str) -> bool {
     !inner.contains('}')
 }
 
-/// `^VOLUME\{[^}]*\}\\$` — корень тома в форме `Volume{GUID}\`.
+/// `^VOLUME\{[^}]*\}\\$` — the volume root as `Volume{GUID}\`.
 fn is_volume_guid_root(norm: &str) -> bool {
     let Some(rest) = norm.strip_prefix("VOLUME{") else {
         return false;
@@ -248,7 +242,7 @@ fn is_volume_guid_root(norm: &str) -> bool {
     !inner.contains('}')
 }
 
-/// `^\\\\[^\\]+\\[^\\]+$` — корень UNC-шара ровно на уровне шара.
+/// `^\\\\[^\\]+\\[^\\]+$` — a UNC share root exactly at the share level.
 fn is_unc_share_root(norm: &str) -> bool {
     let Some(rest) = norm.strip_prefix("\\\\") else {
         return false;
@@ -259,19 +253,19 @@ fn is_unc_share_root(norm: &str) -> bool {
     !server.is_empty() && !share.is_empty() && !share.contains('\\')
 }
 
-/// Истина для корней томов, UNC-корней шара и системных каталогов (DR-6).
+/// Volume roots, UNC share roots and system directories are protected (DR-6).
 ///
-/// Защищёнными считаются корни любых томов (`X:\`), корень UNC-шара
-/// `\\server\share` ровно на уровне шара (подкаталоги внутри шара не защищены),
-/// корень тома в форме `\\?\Volume{GUID}\` и системные каталоги вместе с их
-/// поддеревом (ADR-0005 §5, AC-SEC04-1).
+/// Protected: the roots of any volume (`X:\`), a UNC share root `\\server\share`
+/// exactly at the share level (subdirectories inside the share are not protected), a
+/// volume root as `\\?\Volume{GUID}\`, and the system directories with their subtrees
+/// (ADR-0005 §5, AC-SEC04-1).
 #[must_use]
 pub fn is_protected_path(path: &str) -> bool {
     let norm = normalize_windows_path(path);
     if norm.is_empty() {
         return false;
     }
-    // Административный шар `\\host\C$\...` — тот же `C:\...` (ADR-0015).
+    // The administrative share `\\host\C$\...` is the same as `C:\...` (ADR-0015).
     if let Some(local) = admin_share_local(&norm)
         && is_protected_path(&local)
     {
@@ -291,11 +285,11 @@ pub fn is_protected_path(path: &str) -> bool {
         .any(|protected| norm == *protected || norm.starts_with(&format!("{protected}\\")))
 }
 
-/// Локальная форма административного шара: `\\HOST\C$\REST` → `C:\REST`.
+/// Local form of an administrative share: `\\HOST\C$\REST` → `C:\REST`.
 ///
-/// Принимает нормализованный путь (`normalize_windows_path`). Шар `X$`
-/// указывает на корень тома `X:`, поэтому защита проверяет его как локальный
-/// путь; иначе `\\localhost\C$\Windows` прошёл бы мимо списка.
+/// Takes a normalized path (`normalize_windows_path`). A share `X$` points at the volume
+/// root `X:`, so protection checks it as a local path; otherwise `\\localhost\C$\Windows`
+/// would slip past the list.
 fn admin_share_local(norm: &str) -> Option<String> {
     let rest = norm.strip_prefix("\\\\")?;
     let mut parts = rest.splitn(3, '\\');
@@ -311,23 +305,23 @@ fn admin_share_local(norm: &str) -> Option<String> {
     Some(format!("{drive}:\\{}", parts.next().unwrap_or("")))
 }
 
-/// Истина для шаров, которые указывают внутрь системного каталога:
-/// `ADMIN$` — это `%SystemRoot%`, `PRINT$` — каталог драйверов внутри него,
-/// `SYSVOL` и `NETLOGON` на контроллере домена лежат в `%SystemRoot%\SYSVOL`.
+/// True for shares that point inside a system directory: `ADMIN$` is `%SystemRoot%`,
+/// `PRINT$` is the driver directory inside it, and `SYSVOL` and `NETLOGON` on a domain
+/// controller sit in `%SystemRoot%\SYSVOL`.
 ///
-/// Принимает нормализованный путь. Куда смотрит шар, знает только хост, но у
-/// этих двух назначение фиксировано, поэтому защищено всё их содержимое.
+/// Takes a normalized path. Only the host knows where a share points, but their target
+/// is fixed, so all their content is protected.
 fn is_system_share(norm: &str) -> bool {
     norm.strip_prefix("\\\\")
         .and_then(|rest| rest.split('\\').nth(1))
         .is_some_and(|share| matches!(share, "ADMIN$" | "PRINT$" | "SYSVOL" | "NETLOGON"))
 }
 
-/// Компонент пути в форме 8.3 (`PROGRA~1`), если он есть.
+/// Path component in 8.3 form (`PROGRA~1`), if present.
 ///
-/// Короткое имя нельзя сравнить со списком защищённых путей строкой:
-/// `C:\PROGRA~1` — это `C:\Program Files`, но узнать это может только хост.
-/// Признак — `~` после хотя бы одного символа и перед цифрой.
+/// A short name cannot be compared against the protected path list as a string:
+/// `C:\PROGRA~1` is `C:\Program Files`, but only the host can tell. The marker is `~`
+/// after at least one character and before a digit.
 #[must_use]
 pub fn short_name_component(path: &str) -> Option<String> {
     normalize_windows_path(path)
@@ -342,7 +336,7 @@ pub fn short_name_component(path: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Отказ для пути с 8.3-именем (ADR-0015, DR-6: «в любой форме записи пути»).
+/// Refusal for a path with an 8.3 name (ADR-0015, DR-6: "in any written form of the path").
 fn refuse_short_name(path: &str, requested: &str, verb: &str) -> Option<PolicyDecision> {
     short_name_component(path).map(|component| {
         PolicyDecision::deny(
@@ -355,14 +349,14 @@ fn refuse_short_name(path: &str, requested: &str, verb: &str) -> Option<PolicyDe
     })
 }
 
-/// Элемент списка хостов, разрешающий любой хост (ADR-0015 §7).
+/// `*` matches every host (ADR-0015 §7).
 pub const ANY_HOST: &str = "*";
 
-/// Истина для loopback-литерала: `localhost`, адрес из `127.0.0.0/8` или
-/// `::1` (в том числе в квадратных скобках).
+/// True for a loopback literal: `localhost`, an address in `127.0.0.0/8`, or `::1`
+/// (also in square brackets).
 ///
-/// DNS не разрешается: имя, которое лишь указывает на loopback, литералом не
-/// является, потому что ответ DNS контролирует не оператор (ADR-0015 §6).
+/// DNS is not resolved: a name that only resolves to loopback is not a literal, because
+/// the operator does not control the DNS answer (ADR-0015 §6).
 fn is_loopback_literal(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
@@ -375,10 +369,10 @@ fn is_loopback_literal(host: &str) -> bool {
         .is_ok_and(|address| address.is_loopback())
 }
 
-/// Истина для DNS-имени: метки из `[A-Za-z0-9_-]` через точку, без пустых.
+/// True for a DNS name: labels of `[A-Za-z0-9_-]` separated by dots, none empty.
 ///
-/// `_` допускается ради NetBIOS-имён; символов, которыми URL или `winrm-rs`
-/// режут строку (`/`, `?`, `#`, `@`, `:`), в имени быть не может.
+/// `_` is allowed for NetBIOS names; characters that a URL or `winrm-rs` split a string
+/// on (`/`, `?`, `#`, `@`, `:`) cannot appear in a name.
 fn is_host_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 253
@@ -391,12 +385,12 @@ fn is_host_name(value: &str) -> bool {
         })
 }
 
-/// Истина, если строка — имя хоста, IP-адрес или IPv6 в квадратных скобках.
+/// True if the string is a host name, an IP address, or an IPv6 address in square brackets.
 ///
-/// Проверка нужна до сравнения со списком: `winrm-rs` обрезает хост по `/`,
-/// `@`, `://` и `:порт`, а URL-парсер — по `?` и `#`, поэтому строка
-/// `evil.com/.corp.example` совпала бы с суффиксом `.corp.example`, а
-/// подключение ушло бы на `evil.com` (ADR-0015 §6).
+/// The check runs before the allowlist comparison: `winrm-rs` truncates the host at `/`,
+/// `@`, `://` and `:port`, and a URL parser at `?` and `#`, so `evil.com/.corp.example`
+/// would match the `.corp.example` suffix while the connection went to `evil.com`
+/// (ADR-0015 §6).
 #[must_use]
 pub fn is_valid_host(host: &str) -> bool {
     if let Some(inner) = host
@@ -408,17 +402,16 @@ pub fn is_valid_host(host: &str) -> bool {
     host.parse::<std::net::IpAddr>().is_ok() || is_host_name(host)
 }
 
-/// Разбирает список разрешённых хостов (ADR-0015 §6–7, §9).
+/// One grammar for `WINRIG_ALLOWED_HOSTS` and `setup --allowed-hosts` (ADR-0015 §6–7, §9).
 ///
-/// Одна грамматика для `WINRIG_ALLOWED_HOSTS` и `setup --allowed-hosts`:
-/// элементы через запятую, пустые пропускаются; элемент — `*`, суффикс с
-/// ведущей `.` или имя хоста, IP-адрес, IPv6 в скобках. Результат приведён к
-/// нижнему регистру без пробелов.
+/// Comma-separated entries, empty ones skipped; an entry is `*`, a suffix with a leading
+/// `.`, or a host name, an IP address, or an IPv6 in brackets. The result is
+/// lowercased and trimmed.
 ///
 /// # Errors
 ///
-/// Первый элемент, не подходящий под грамматику, — вызывающий называет в
-/// отказе свой источник (переменную или флаг).
+/// The first entry that does not fit the grammar; the caller names its source (the
+/// variable or the flag) in the refusal.
 pub fn parse_allowed_hosts(raw: &str) -> Result<Vec<String>, String> {
     let mut entries = Vec::new();
     for item in raw.split(',') {
@@ -438,19 +431,19 @@ pub fn parse_allowed_hosts(raw: &str) -> Result<Vec<String>, String> {
     Ok(entries)
 }
 
-/// Ожидаемая форма списка хостов для текста отказа.
+/// Host list form for the refusal text.
 pub const ALLOWED_HOSTS_FORM: &str =
     "a comma-separated list of host names or IPs, '.suffix' entries, or '*' for any host";
 
-/// Решает, разрешён ли хост (Q-03, ADR-0015 §6–7).
+/// Allowlist verdict for a host (Q-03, ADR-0015 §6–7).
 ///
-/// Строка, которая не является именем или IP, не разрешена никогда. Пустой
-/// список разрешает только loopback-литералы; `*` — любой хост; элемент с
-/// ведущей `.` — суффикс; иначе точное совпадение без учёта регистра.
+/// A string that is not a name or an IP is never allowed. An empty list allows only
+/// loopback literals; `*` allows any host; an entry with a leading `.` is a suffix;
+/// otherwise the match is exact and case-insensitive.
 #[must_use]
 pub fn host_allowed(host: &str, allowed_hosts: &[String]) -> bool {
-    // Только ASCII-свёртка: Unicode-свёртка превратила бы знак Кельвина
-    // U+212A в `k`, и не-ASCII имя прошло бы проверку синтаксиса.
+    // ASCII-only folding: Unicode folding would turn the Kelvin sign U+212A into `k`, and
+    // a non-ASCII name would pass the syntax check.
     let candidate = host.trim().to_ascii_lowercase();
     if !is_valid_host(&candidate) {
         return false;
@@ -477,11 +470,11 @@ pub fn host_allowed(host: &str, allowed_hosts: &[String]) -> bool {
     false
 }
 
-/// Возвращает порт без изменений или ошибку вне диапазона 1..65535.
+/// Range check for the port, then passthrough.
 ///
 /// # Errors
 ///
-/// [`PolicyError`], если порт вне `MIN_PORT..=MAX_PORT`.
+/// [`PolicyError`] if the port is outside `MIN_PORT..=MAX_PORT`.
 pub fn validate_port(port: Option<i64>) -> Result<Option<i64>, PolicyError> {
     let Some(value) = port else {
         return Ok(None);
@@ -494,7 +487,7 @@ pub fn validate_port(port: Option<i64>) -> Result<Option<i64>, PolicyError> {
     Ok(Some(value))
 }
 
-/// `None` — понижение проверки TLS допустимо; иначе причина отказа.
+/// `None` means the TLS check downgrade is acceptable; otherwise the refusal reason.
 #[must_use]
 pub fn tls_decision(verify_cert: bool, allow_insecure_tls: bool) -> Option<(bool, &'static str)> {
     if !verify_cert && !allow_insecure_tls {
@@ -507,7 +500,6 @@ pub fn tls_decision(verify_cert: bool, allow_insecure_tls: bool) -> Option<(bool
     None
 }
 
-/// Решение по хосту против allowlist.
 #[must_use]
 pub fn decide_host(host: &str, allowed_hosts: &[String]) -> PolicyDecision {
     if host_allowed(host, allowed_hosts) {
@@ -530,7 +522,6 @@ pub fn decide_host(host: &str, allowed_hosts: &[String]) -> PolicyDecision {
     }
 }
 
-/// Решение по диапазону порта.
 #[must_use]
 pub fn decide_port(port: Option<i64>) -> PolicyDecision {
     match validate_port(port) {
@@ -539,7 +530,6 @@ pub fn decide_port(port: Option<i64>) -> PolicyDecision {
     }
 }
 
-/// Решение по режиму проверки TLS.
 #[must_use]
 pub fn decide_tls(verify_cert: bool, allow_insecure_tls: bool) -> PolicyDecision {
     match tls_decision(verify_cert, allow_insecure_tls) {
@@ -548,7 +538,6 @@ pub fn decide_tls(verify_cert: bool, allow_insecure_tls: bool) -> PolicyDecision
     }
 }
 
-/// Решение по рекурсивному удалению пути.
 #[must_use]
 pub fn decide_delete_path(path: &str) -> PolicyDecision {
     if let Some(refusal) = refuse_short_name(path, path, "delete") {
@@ -564,10 +553,10 @@ pub fn decide_delete_path(path: &str) -> PolicyDecision {
     }
 }
 
-/// Вердикт на запись файла: защищённый путь отвергается до сети (TR-FS-02).
+/// File write verdict: a protected path is refused before the network (TR-FS-02).
 ///
-/// Список тот же, что у удаления: возможность перезаписать системный файл не
-/// отличается по последствиям от возможности его удалить.
+/// The list is the same as for delete: being able to overwrite a system file is no
+/// different in effect from being able to delete it.
 #[must_use]
 pub fn decide_write_path(path: &str) -> PolicyDecision {
     if let Some(refusal) = refuse_short_name(path, path, "write to") {
@@ -583,12 +572,11 @@ pub fn decide_write_path(path: &str) -> PolicyDecision {
     }
 }
 
-/// Вердикт на перезапись: существующий файл заменяется только по флагу
-/// (TR-FS-03).
+/// Overwrite verdict: an existing file is replaced only with the flag (TR-FS-03).
 ///
-/// Решение отделено от инструмента, потому что иначе его нельзя проверить:
-/// путь записи идёт через подтверждение и `RequestContext`, которого тесты не
-/// строят.
+/// The decision is separate from the tool because otherwise it cannot be tested: the
+/// write path goes through confirmation and a `RequestContext` that the tests do not
+/// build.
 #[must_use]
 pub fn decide_overwrite(path: &str, exists: bool, overwrite: bool) -> PolicyDecision {
     if exists && !overwrite {
@@ -601,10 +589,7 @@ pub fn decide_overwrite(path: &str, exists: bool, overwrite: bool) -> PolicyDeci
     }
 }
 
-/// Разбирает ответ скана хоста в JSON-объект.
-///
-/// Нечитаемый ответ — не «безопасно по умолчанию», а причина отказа
-/// (fail-closed).
+/// Fail-closed: an unreadable answer is a refusal reason, not "safe by default".
 fn scan_object(raw: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     let value: serde_json::Value = serde_json::from_str(raw.trim())
         .map_err(|error| format!("Pre-scan returned an unreadable result: {error}"))?;
@@ -614,7 +599,7 @@ fn scan_object(raw: &str) -> Result<serde_json::Map<String, serde_json::Value>, 
     }
 }
 
-/// Непустое строковое поле скана.
+/// Non-empty string field of the scan.
 fn required_str(
     object: &serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -627,7 +612,6 @@ fn required_str(
         .ok_or_else(|| format!("Pre-scan result is missing {key}."))
 }
 
-/// Булево поле скана.
 fn required_bool(
     object: &serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -638,19 +622,18 @@ fn required_bool(
         .ok_or_else(|| format!("Pre-scan result is missing {key}."))
 }
 
-/// Защищённые корни, которые хост прочитал из своих системных переменных
-/// (TR-FS-06, ADR-0015 §10–12).
+/// Protected system roots on the actual volume (TR-FS-06, ADR-0015 §10–12).
 ///
-/// Лексический список `PROTECTED_DIRS` знает только `C:`; эти корни называют
-/// фактическое расположение системы, на каком бы томе она ни стояла.
+/// The lexical `PROTECTED_DIRS` list knows only `C:`; these roots name the actual system
+/// location, on whatever volume it sits.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostRoots {
-    /// Пары (имя корня, путь на хосте).
+    /// Pairs of (name, path on the host).
     roots: Vec<(String, String)>,
 }
 
 impl HostRoots {
-    /// Имена корней в том порядке, в каком их отдаёт скан (`ps::HOST_ROOTS`).
+    /// Order of the roots as the scan returns them (`ps::HOST_ROOTS`).
     const NAMES: [&'static str; 5] = [
         "SystemRoot",
         "ProgramFiles",
@@ -659,11 +642,9 @@ impl HostRoots {
         "Users",
     ];
 
-    /// Читает свойство `Roots` из скана.
-    ///
-    /// Пустой корень пропускается: `ProgramFiles(x86)` на 32-битной системе
-    /// отсутствует законно. Пустой `SystemRoot` — отказ: без него проверка
-    /// теряет главный корень (ADR-0015 §11).
+    /// An empty optional root is skipped: `ProgramFiles(x86)` is legitimately absent on a
+    /// 32-bit system. An empty or missing `SystemRoot` is a refusal, because the check
+    /// would lose its main root (ADR-0015 §11).
     fn from_scan(object: &serde_json::Map<String, serde_json::Value>) -> Result<Self, String> {
         let roots = object
             .get("Roots")
@@ -691,14 +672,14 @@ impl HostRoots {
         Ok(Self { roots: out })
     }
 
-    /// Корень, внутри которого лежит путь: `(имя, путь корня)`.
+    /// Root holding the path: `(name, root path)`.
     #[must_use]
     pub fn containing(&self, path: &str) -> Option<(&str, &str)> {
         let norm = normalize_windows_path(path);
         if norm.is_empty() {
             return None;
         }
-        // Административный шар проверяется как локальный путь (ADR-0015).
+        // The administrative share is checked as a local path (ADR-0015).
         let norm = admin_share_local(&norm).unwrap_or(norm);
         self.roots.iter().find_map(|(name, root)| {
             let root_norm = normalize_windows_path(root);
@@ -716,8 +697,8 @@ impl HostRoots {
     }
 }
 
-/// Отказ, если путь, разрешённый хостом, защищён лексически или лежит внутри
-/// корня хоста (DR-6, TR-FS-06).
+/// Refusal if the host-resolved path is lexically protected or lies inside a host root
+/// (DR-6, TR-FS-06).
 fn refuse_resolved(
     resolved: &str,
     roots: &HostRoots,
@@ -746,42 +727,36 @@ fn refuse_resolved(
     })
 }
 
-/// Результат предварительного скана удаляемого каталога, полученный от хоста.
+/// Result of the pre-scan of a directory to delete, from the host.
 ///
-/// `full_name` — путь, как его разрешил сам Windows-хост: только он раскрывает
-/// короткие 8.3-имена и приводит точку повторной обработки к реальной цели.
+/// `full_name` is the path as the Windows host resolved it: only the host expands 8.3
+/// short names and maps a reparse point to its real target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteScan {
-    /// Канонический путь, возвращённый хостом.
+    /// Canonical path returned by the host.
     pub full_name: String,
-    /// Является ли каталог точкой повторной обработки (junction/symlink).
+    /// Directory is a junction or a symlink.
     pub is_reparse_point: bool,
-    /// Сколько всего элементов найдено в поддереве.
+    /// Items found in the subtree, files and directories together.
     pub total_items: i64,
-    /// Сколько файлов.
     pub file_count: i64,
-    /// Сколько подкаталогов.
     pub dir_count: i64,
-    /// Есть ли внутри поддерева точки повторной обработки.
+    /// Whether the subtree contains a reparse point.
     ///
-    /// `Remove-Item -Recurse` в Windows PowerShell 5.1 может пройти сквозь
-    /// junction и удалить его цель, поэтому вложенная точка — такая же причина
-    /// отказа, как и корневая (DR-6).
+    /// `Remove-Item -Recurse` in Windows PowerShell 5.1 can traverse a junction and delete
+    /// its target, so a nested point is as much a refusal reason as a root one (DR-6).
     pub nested_reparse_point: bool,
-    /// Защищённые корни хоста (TR-SEC-04, ADR-0015 §10).
+    /// Protected host locations (TR-SEC-04, ADR-0015 §10).
     pub roots: HostRoots,
 }
 
 impl DeleteScan {
-    /// Разбирает JSON-ответ предварительного скана.
-    ///
     /// # Errors
     ///
-    /// Возвращает текст ошибки, если ответ не JSON-объект или в нём нет
-    /// обязательных защитных полей `FullName`, `IsReparsePoint`, `TotalItems`,
-    /// `NestedReparsePoint` и `Roots` с непустым `SystemRoot`.
-    /// Отсутствующее защитное поле — не «безопасно по умолчанию», а признак
-    /// нечитаемого скана: вызывающая сторона обязана отказать (ADR-0005 §5,
+    /// Error text if the answer is not a JSON object or lacks the mandatory protective
+    /// fields `FullName`, `IsReparsePoint`, `TotalItems`, `NestedReparsePoint`, and
+    /// `Roots` with a non-empty `SystemRoot`. A missing protective field is not "safe by
+    /// default" but an unreadable scan, so the caller must refuse (ADR-0005 §5,
     /// fail-closed).
     pub fn from_json(raw: &str) -> Result<Self, String> {
         let object = scan_object(raw)?;
@@ -811,28 +786,25 @@ impl DeleteScan {
     }
 }
 
-/// Результат предварительного скана одного файла, полученный от хоста.
+/// Result of the pre-scan of a single file, from the host.
 ///
-/// Нужен, чтобы отказать до отправки удаления, если путь разрешился в
-/// защищённый или оказался каталогом (DR-6).
+/// Needed to refuse before sending the delete if the path resolved to a protected one or
+/// turned out to be a directory (DR-6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileScan {
-    /// Канонический путь, возвращённый хостом.
+    /// Canonical path returned by the host.
     pub full_name: String,
-    /// Является ли цель каталогом.
     pub is_directory: bool,
-    /// Защищённые корни хоста (TR-SEC-04, ADR-0015 §10).
+    /// Protected host locations (TR-SEC-04, ADR-0015 §10).
     pub roots: HostRoots,
 }
 
 impl FileScan {
-    /// Разбирает JSON-ответ предварительного скана файла.
     ///
     /// # Errors
     ///
-    /// Возвращает текст ошибки, если ответ не JSON-объект или в нём нет
-    /// обязательных полей `FullName`, `IsDirectory` и `Roots` с непустым
-    /// `SystemRoot`.
+    /// Error text if the answer is not a JSON object or lacks the mandatory fields
+    /// `FullName`, `IsDirectory`, and `Roots` with a non-empty `SystemRoot`.
     pub fn from_json(raw: &str) -> Result<Self, String> {
         let object = scan_object(raw)?;
         Ok(Self {
@@ -843,31 +815,28 @@ impl FileScan {
     }
 }
 
-/// Результат скана цели записи, полученный от хоста (TR-FS-06).
+/// Result of the scan of a write target, from the host (TR-FS-06).
 ///
-/// Путь разрешается дважды, потому что запись идёт двумя механизмами: куски
-/// пишет .NET (`[IO.File]`), который разрешает относительный путь от текущего
-/// каталога процесса, а цель заменяет `Move-Item`, который разрешает его от
-/// расположения PowerShell. Проверяются оба.
+/// The path is resolved twice because the write uses two mechanisms: .NET (`[IO.File]`)
+/// writes the chunks and resolves a relative path from the process current directory,
+/// while `Move-Item` replaces the target and resolves it from the PowerShell location.
+/// Both are checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteScan {
-    /// Путь, как его разрешит PowerShell для `-LiteralPath`.
+    /// Path as PowerShell resolves it for `-LiteralPath`.
     pub full_name: String,
-    /// Путь, как его разрешит .NET (`[IO.Path]::GetFullPath`).
+    /// Path as .NET (`[IO.Path]::GetFullPath`) resolves it.
     pub dotnet_full_name: String,
-    /// Существует ли цель.
     pub exists: bool,
-    /// Защищённые корни хоста.
     pub roots: HostRoots,
 }
 
 impl WriteScan {
-    /// Разбирает JSON-ответ скана записи.
     ///
     /// # Errors
     ///
-    /// Возвращает текст ошибки, если нет `FullName`, `DotNetFullName`,
-    /// `Exists` или `Roots` с непустым `SystemRoot` (fail-closed).
+    /// Error text if `FullName`, `DotNetFullName`, `Exists`, or `Roots` with a non-empty
+    /// `SystemRoot` is missing (fail-closed).
     pub fn from_json(raw: &str) -> Result<Self, String> {
         let object = scan_object(raw)?;
         Ok(Self {
@@ -879,8 +848,8 @@ impl WriteScan {
     }
 }
 
-/// Решение по скану записи: защищённый путь в любом из двух разрешений, затем
-/// правило перезаписи (TR-FS-03, TR-FS-06).
+/// Write scan verdict: a protected path in either of the two resolutions, then the
+/// overwrite rule (TR-FS-03, TR-FS-06).
 #[must_use]
 pub fn decide_write_scan(scan: &WriteScan, requested: &str, overwrite: bool) -> PolicyDecision {
     for resolved in [&scan.full_name, &scan.dotnet_full_name] {
@@ -891,7 +860,7 @@ pub fn decide_write_scan(scan: &WriteScan, requested: &str, overwrite: bool) -> 
     decide_overwrite(requested, scan.exists, overwrite)
 }
 
-/// Решение по результату скана одиночного файла (DR-6).
+/// Verdict on the single-file scan result (DR-6).
 #[must_use]
 pub fn decide_file_delete(scan: &FileScan, requested: &str) -> PolicyDecision {
     if scan.is_directory {
@@ -908,11 +877,10 @@ pub fn decide_file_delete(scan: &FileScan, requested: &str) -> PolicyDecision {
     PolicyDecision::allow("file delete scan is safe")
 }
 
-/// Решение по результату предварительного скана (DR-6, ADR-0005 §5).
+/// Verdict on the pre-scan result (DR-6, ADR-0005 §5).
 ///
-/// Проверяет канонический путь хоста (`FullName`) по лексическому списку и по
-/// корням хоста, точку повторной обработки и предохранительный лимит
-/// элементов. Любая непройденная проверка — отказ.
+/// Checks the host canonical path (`FullName`) against the lexical list and the host roots,
+/// the reparse point, and the safety item cap. Any failed check is a refusal.
 #[must_use]
 pub fn decide_delete_scan(scan: &DeleteScan, requested: &str, cap: i64) -> PolicyDecision {
     if let Some(refusal) = refuse_resolved(&scan.full_name, &scan.roots, requested, "delete") {
@@ -1077,8 +1045,8 @@ mod tests {
         assert!(is_protected_path("C:\\Windows\\System32\\config\\SAM"));
     }
 
-    /// AC-SEC05-1: пустой список разрешает только loopback-литералы; имя,
-    /// которое лишь разрешается в loopback, литералом не является (TR-SEC-14).
+    /// AC-SEC05-1: an empty list allows only loopback literals; a name that only resolves
+    /// to loopback is not a literal (TR-SEC-14).
     #[test]
     fn empty_allowlist_admits_only_loopback_literals() {
         for host in [
@@ -1107,8 +1075,7 @@ mod tests {
         }
     }
 
-    /// AC-SEC05-4: элемент `*` разрешает любой хост, но только отдельным
-    /// элементом (TR-SEC-14).
+    /// AC-SEC05-4: the `*` entry allows any host, but only as its own entry (TR-SEC-14).
     #[test]
     fn star_admits_any_host() {
         assert!(host_allowed("anything.example.com", &hosts(&["*"])));
@@ -1116,10 +1083,10 @@ mod tests {
         assert!(!host_allowed("web.example.com", &hosts(&["*.example.com"])));
     }
 
-    /// AC-SEC05-5: хост, который не является именем или IP, отвергается при
-    /// любом списке. `winrm-rs` обрезает строку по `/`, `@`, `://` и `:порт`, а
-    /// URL-парсер — по `?` и `#`, поэтому `evil.com/.corp.example` проходил
-    /// суффиксную проверку и уходил на `evil.com` (ADR-0015).
+    /// AC-SEC05-5: a host that is not a name or an IP is refused with any list. `winrm-rs`
+    /// truncates the string at `/`, `@`, `://` and `:port`, and a URL parser at `?` and
+    /// `#`, so `evil.com/.corp.example` passed the suffix check and went to `evil.com`
+    /// (ADR-0015).
     #[test]
     fn malformed_host_is_refused_by_any_allowlist() {
         for host in [
@@ -1160,7 +1127,7 @@ mod tests {
         }
     }
 
-    /// AC-SEC05-6: одна грамматика списка для переменной и флага `setup`.
+    /// AC-SEC05-6: one list grammar for the variable and the `setup` flag.
     #[test]
     fn allowed_hosts_grammar() {
         assert_eq!(
@@ -1185,7 +1152,7 @@ mod tests {
         }
     }
 
-    /// Непустой список не подмешивает loopback: оператор перечислил хосты сам.
+    /// A non-empty list does not add loopback: the operator listed the hosts himself.
     #[test]
     fn explicit_list_does_not_add_loopback() {
         assert!(!host_allowed("localhost", &hosts(&["web-server-01"])));
@@ -1221,8 +1188,8 @@ mod tests {
         assert!(tls_decision(true, false).is_none());
     }
 
-    /// TR-FS-02: запись охраняется тем же списком, что и удаление. Инструмент,
-    /// умеющий перезаписать системный файл, равносилен удалению.
+    /// TR-FS-02: write is guarded by the same list as delete. A tool that can overwrite a
+    /// system file is equal to delete.
     #[test]
     fn write_is_refused_on_protected_paths() {
         for path in [
@@ -1239,8 +1206,8 @@ mod tests {
         assert_eq!(decision.code, "OK");
     }
 
-    /// TR-FS-03: существующий файл заменяется только по явному флагу, а
-    /// создание нового не требует ничего.
+    /// TR-FS-03: an existing file is replaced only with an explicit flag, while creating a
+    /// new one needs nothing.
     #[test]
     fn overwrite_is_required_only_for_an_existing_file() {
         let denied = decide_overwrite("C:\\a.txt", true, false);
@@ -1258,8 +1225,8 @@ mod tests {
         assert!(decide_overwrite("C:\\a.txt", false, true).allow);
     }
 
-    /// TR-FS-02: отказ говорит про запись, а не про удаление — иначе агент
-    /// решит, что вызвал не тот инструмент.
+    /// TR-FS-02: the refusal names writing, not deleting — otherwise the agent thinks it
+    /// called the wrong tool.
     #[test]
     fn write_refusal_names_writing() {
         let decision = decide_write_path("C:\\Windows\\System32");
@@ -1308,7 +1275,7 @@ mod tests {
         assert!(DeleteScan::from_json("not json").is_err());
         assert!(DeleteScan::from_json(r#"{"IsReparsePoint":false}"#).is_err());
         assert!(DeleteScan::from_json(r#"{"FullName":""}"#).is_err());
-        // Fail-closed: отсутствие защитного поля — не «безопасно по умолчанию».
+        // Fail-closed: a missing protective field is not "safe by default".
         assert!(DeleteScan::from_json(r#"{"FullName":"C:\\App"}"#).is_err());
         assert!(DeleteScan::from_json(r#"{"FullName":"C:\\App","TotalItems":1}"#).is_err());
         assert!(DeleteScan::from_json(r#"{"FullName":"C:\\App","IsReparsePoint":false}"#).is_err());
@@ -1316,7 +1283,7 @@ mod tests {
 
     #[test]
     fn delete_scan_refuses_reparse_point() {
-        // DR-6/AC-SEC04-2: junction на защищённый каталог не должен удаляться.
+        // DR-6/AC-SEC04-2: a junction to a protected directory must not be deleted.
         let scan = DeleteScan {
             full_name: "C:\\App\\link".to_owned(),
             is_reparse_point: true,
@@ -1333,7 +1300,7 @@ mod tests {
 
     #[test]
     fn delete_scan_refuses_host_resolved_protected_path() {
-        // Лексическая форма не защищена, но хост разрешил путь в системный.
+        // The lexical form is not protected, but the host resolved the path into the system.
         let scan = DeleteScan {
             full_name: "C:\\Windows\\System32".to_owned(),
             is_reparse_point: false,
@@ -1380,8 +1347,8 @@ mod tests {
 
     #[test]
     fn delete_scan_refuses_nested_reparse_point() {
-        // Корень — обычный каталог, но внутри junction: рекурсивное удаление
-        // могло бы уйти в цель. DR-6 требует отказа.
+        // The root is an ordinary directory, but a junction sits inside: a recursive delete
+        // could escape into the target. DR-6 requires a refusal.
         let scan = DeleteScan {
             full_name: "C:\\App\\logs".to_owned(),
             is_reparse_point: false,
@@ -1398,7 +1365,7 @@ mod tests {
 
     #[test]
     fn delete_scan_requires_nested_reparse_field() {
-        // Fail-closed: скан без признака вложенной точки не читается.
+        // Fail-closed: a scan without the nested-point marker is not readable.
         assert!(
             DeleteScan::from_json(
                 r#"{"FullName":"C:\\App","IsReparsePoint":false,"TotalItems":1}"#
@@ -1462,8 +1429,8 @@ mod tests {
         }
     }
 
-    /// AC-FS-07: корни читаются из скана; пустой необязательный пропускается,
-    /// а пустой или отсутствующий `SystemRoot` — отказ (ADR-0015 §11).
+    /// AC-FS-07: the roots are read from the scan; an empty optional one is skipped, while
+    /// an empty or missing `SystemRoot` is a refusal (ADR-0015 §11).
     #[test]
     fn host_roots_parse_and_require_system_root() {
         let scan = FileScan::from_json(
@@ -1488,8 +1455,8 @@ mod tests {
         }
     }
 
-    /// AC-FS-07: система на `D:` защищена по фактическому расположению, хотя
-    /// лексический список знает только `C:`.
+    /// AC-FS-07: a system on `D:` is protected by its actual location, although the lexical
+    /// list knows only `C:`.
     #[test]
     fn host_roots_cover_the_actual_system_location() {
         let system = roots(&[
@@ -1514,9 +1481,9 @@ mod tests {
         assert_eq!(system.containing(""), None);
     }
 
-    /// AC-SEC04-6: путь с 8.3-именем не сравнить со списком строкой
-    /// (`C:\PROGRA~1` — это `C:\Program Files`), поэтому запись и удаление его
-    /// отвергают — и лексически, и после разрешения хостом (ADR-0015).
+    /// AC-SEC04-6: a path with an 8.3 name cannot be compared with the list as a string
+    /// (`C:\PROGRA~1` is `C:\Program Files`), so write and delete refuse it — both
+    /// lexically and after the host resolves it (ADR-0015).
     #[test]
     fn short_names_are_refused_for_write_and_delete() {
         for path in [
@@ -1548,7 +1515,7 @@ mod tests {
         assert_eq!(decide_write_scan(&write, "x", false).code, "PATH_PROTECTED");
     }
 
-    /// AC-SEC04-7: административный шар `\\host\C$\...` защищается как `C:\...`.
+    /// AC-SEC04-7: the administrative share `\\host\C$\...` is protected as `C:\...`.
     #[test]
     fn admin_share_is_checked_as_its_local_path() {
         for path in [
@@ -1559,7 +1526,7 @@ mod tests {
             assert!(is_protected_path(path), "{path}");
             assert_eq!(decide_write_path(path).code, "PATH_PROTECTED", "{path}");
         }
-        // `ADMIN$` — это `%SystemRoot%`, `PRINT$` лежит внутри него.
+        // `ADMIN$` is `%SystemRoot%`, `PRINT$` sits inside it.
         for path in [
             "\\\\localhost\\ADMIN$\\System32\\x.dll",
             "\\\\host\\admin$",
@@ -1579,7 +1546,7 @@ mod tests {
         );
     }
 
-    /// AC-SEC04-5: удаление отвергает путь внутри корня хоста.
+    /// AC-SEC04-5: delete refuses a path inside a host root.
     #[test]
     fn delete_scans_refuse_paths_inside_host_roots() {
         let system = roots(&[("SystemRoot", "D:\\Windows")]);
@@ -1623,8 +1590,8 @@ mod tests {
         }
     }
 
-    /// AC-FS-07: запись отвергается, если в корень хоста попадает любое из
-    /// двух разрешений пути, а обычный путь проходит к правилу перезаписи.
+    /// AC-FS-07: write is refused if either of the two path resolutions lands in a host
+    /// root, while an ordinary path passes to the overwrite rule.
     #[test]
     fn write_scan_checks_both_resolutions_and_then_overwrite() {
         let inside_ps = write_scan("D:\\Windows\\x.ps1", "D:\\App\\x.ps1", false);

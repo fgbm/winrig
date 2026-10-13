@@ -1728,19 +1728,22 @@ pub fn get_open_handles(path: &str) -> Result<String, String> {
     Ok(command)
 }
 
-/// The command that lists every printer with the decoded state flags and the job count (TR-REL-15).
+/// The command that lists every printer with the state name and the job count (TR-REL-15).
 ///
-/// The state is the printer-status flag mask. `Get-Printer`'s `PrinterStatus`
-/// is the primary source and uses the same `PRINTER_STATUS_*` bits; the registry
-/// value `Status` under `…\Control\Print\Printers` is the fallback. If neither can
-/// be read the state stays `Unknown` with `state_flags` null, so an unread state
-/// never looks healthy. The mask is decoded with a fixed English bit table, so
-/// the state does not depend on the host locale. The job count comes from
-/// `Get-Printer`; a missing value is null, not zero. Rows are kept while their
-/// compressed JSON stays under `@BUD@` characters, so the answer fits the executor
-/// output limit however many printers the host has. A stopped Print Spooler or a
-/// missing PrintManagement module gives a clear error, not an empty list.
-const PRINTERS_SCRIPT: &str = r#"$ErrorActionPreference='Stop';if($null -eq (Get-Command Get-Printer -ErrorAction SilentlyContinue)){throw "PrintManagement module is not available"};$svc=Get-Service -Name Spooler -ErrorAction Stop;if($svc.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Running){throw "The Print Spooler service is not running: $($svc.Status)"};function Cap($s,$n){$s=[string]$s;if($s.Length -gt $n){$s.Substring(0,$n)}else{$s}};$flags=@{1='Paused';2='Error';4='PendingDeletion';8='PaperJam';16='PaperOut';32='ManualFeed';64='PaperProblem';128='Offline';256='IOActive';512='Busy';1024='Printing';2048='OutputBinFull';4096='NotAvailable';8192='Waiting';16384='Processing';32768='Initializing';65536='WarmingUp';131072='TonerLow';262144='NoToner';524288='PagePunt';1048576='UserInterventionRequired';2097152='OutOfMemory';4194304='DoorOpen';8388608='ServerUnknown';16777216='PowerSave';33554432='ServerOffline';67108864='DriverUpdateNeeded'};$perr=@();$printers=@(Get-Printer -ErrorAction SilentlyContinue -ErrorVariable +perr|Sort-Object Name);if(-not $printers.Count -and $perr.Count){throw "Get-Printer failed: $([string]$perr[0])"};$total=$printers.Count;$rows=@();$len=0;$truncated=$false;foreach($printer in $printers){if($rows.Count -ge @LIM@){$truncated=$true;break};$name=Cap $printer.Name @NF@;$share=Cap $printer.ShareName @SF@;$driver=Cap $printer.DriverName @DF@;$portname=Cap $printer.PortName @PF@;$status=$null;if($null -ne $printer.PrinterStatus){$status=[int]$printer.PrinterStatus}else{try{$status=[int](Get-ItemProperty -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Control\Print\Printers\"+([string]$printer.Name)) -Name Status -ErrorAction Stop).Status}catch{$status=$null}};$state_text='Unknown';$state_flags=$null;if($null -ne $status){$state_flags=$status;$states=@($flags.Keys|Sort-Object|Where-Object{$status -band $_}|ForEach-Object{$flags[$_]});if($states.Count){$state_text=($states -join ', ')}else{$state_text='Normal'}};$ph=$null;$pnum=$null;try{$po=Get-PrinterPort -Name $printer.PortName -ErrorAction Stop;if($po){$ph=Cap $po.PrinterHostAddress @HF@;$pnum=[int]$po.PortNumber}}catch{};$row=[PSCustomObject]@{name=$name;share_name=$share;driver=$driver;port=$portname;port_host=$ph;port_number=$pnum;state=$state_text;state_flags=$state_flags;job_count=if($null -ne $printer.JobCount){[int]$printer.JobCount}else{$null}};$j=$row|ConvertTo-Json -Compress;if(($len+$j.Length+1+@ENV@) -gt @BUD@){$truncated=$true;break};$len=$len+$j.Length+1;$rows+=$row};[PSCustomObject]@{printers=$rows;count=$total;returned=$rows.Count;truncated=$truncated}|ConvertTo-Json -Compress -Depth 4"#;
+/// The state is the `Get-Printer` `PrinterStatus` enum name, for example
+/// `Normal` or `Offline`. On some hosts the value is an ordinal enum, so the name
+/// is read as a string and never decoded as the `PRINTER_STATUS_*` bit mask. The
+/// registry `Status` value under `…\Control\Print\Printers` is read next: it is
+/// reported as `state_flags` when it is readable, and when the name is absent it
+/// is decoded with a fixed English bit table into the state. If neither can be
+/// read the state stays `Unknown` with `state_flags` null, so an unread state
+/// never looks healthy. Both forms are independent of the host locale. The job
+/// count comes from `Get-Printer`; a missing value is null, not zero. Rows are
+/// kept while their compressed JSON stays under `@BUD@` characters, so the answer
+/// fits the executor output limit however many printers the host has. A stopped
+/// Print Spooler or a missing PrintManagement module gives a clear error, not an
+/// empty list.
+const PRINTERS_SCRIPT: &str = r#"$ErrorActionPreference='Stop';if($null -eq (Get-Command Get-Printer -ErrorAction SilentlyContinue)){throw "PrintManagement module is not available"};$svc=Get-Service -Name Spooler -ErrorAction Stop;if($svc.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Running){throw "The Print Spooler service is not running: $($svc.Status)"};function Cap($s,$n){$s=[string]$s;if($s.Length -gt $n){$s.Substring(0,$n)}else{$s}};$flags=@{1='Paused';2='Error';4='PendingDeletion';8='PaperJam';16='PaperOut';32='ManualFeed';64='PaperProblem';128='Offline';256='IOActive';512='Busy';1024='Printing';2048='OutputBinFull';4096='NotAvailable';8192='Waiting';16384='Processing';32768='Initializing';65536='WarmingUp';131072='TonerLow';262144='NoToner';524288='PagePunt';1048576='UserInterventionRequired';2097152='OutOfMemory';4194304='DoorOpen';8388608='ServerUnknown';16777216='PowerSave';33554432='ServerOffline';67108864='DriverUpdateNeeded'};$perr=@();$printers=@(Get-Printer -ErrorAction SilentlyContinue -ErrorVariable +perr|Sort-Object Name);if(-not $printers.Count -and $perr.Count){throw "Get-Printer failed: $([string]$perr[0])"};$total=$printers.Count;$rows=@();$len=0;$truncated=$false;foreach($printer in $printers){if($rows.Count -ge @LIM@){$truncated=$true;break};$name=Cap $printer.Name @NF@;$share=Cap $printer.ShareName @SF@;$driver=Cap $printer.DriverName @DF@;$portname=Cap $printer.PortName @PF@;$state=[string]$printer.PrinterStatus;$state_flags=$null;$mask=$null;try{$mask=[int](Get-ItemProperty -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Control\Print\Printers\"+([string]$printer.Name)) -Name Status -ErrorAction Stop).Status;$state_flags=$mask}catch{$mask=$null};if([string]::IsNullOrEmpty($state)){if($null -ne $mask){$states=@($flags.Keys|Sort-Object|Where-Object{$mask -band $_}|ForEach-Object{$flags[$_]});if($states.Count){$state=($states -join ', ')}else{$state='Normal'}}else{$state='Unknown'}};$ph=$null;$pnum=$null;try{$po=Get-PrinterPort -Name $printer.PortName -ErrorAction Stop;if($po){$ph=Cap $po.PrinterHostAddress @HF@;$pnum=[int]$po.PortNumber}}catch{};$row=[PSCustomObject]@{name=$name;share_name=$share;driver=$driver;port=$portname;port_host=$ph;port_number=$pnum;state=$state;state_flags=$state_flags;job_count=if($null -ne $printer.JobCount){[int]$printer.JobCount}else{$null}};$j=$row|ConvertTo-Json -Compress;if(($len+$j.Length+1+@ENV@) -gt @BUD@){$truncated=$true;break};$len=$len+$j.Length+1;$rows+=$row};[PSCustomObject]@{printers=$rows;count=$total;returned=$rows.Count;truncated=$truncated}|ConvertTo-Json -Compress -Depth 4"#;
 
 /// The command that lists the jobs of one printer (TR-REL-15).
 ///
@@ -1790,10 +1793,11 @@ const JOB_USER_CAP: usize = 64;
 /// of this length fits one WinRS command line.
 pub const PRINT_JOB_PRINTER_MAX_CHARS: usize = 512;
 
-/// The printers on the host, with the state as decoded flags and the job count (TR-REL-15).
+/// The printers on the host, with the state as the printer-status name and the job count (TR-REL-15).
 ///
-/// The state is the decoded printer-status flag mask, for example
-/// `Offline, IOActive`, or `Unknown` when the host did not report it. The share
+/// The state is the `PrinterStatus` enum name, for example `Normal` or `Offline`,
+/// the decoded registry `Status` mask when the name is absent, or `Unknown` when
+/// neither is readable. The share
 /// name, the driver, the port, the port host and number come from `Get-Printer`
 /// and `Get-PrinterPort`; the job count comes from `Get-Printer`. The answer is
 /// cut to the row cap or the size budget, and `truncated` shows the cut. A stopped
@@ -3555,8 +3559,9 @@ mod tests {
         );
     }
 
-    /// AC-REL15-1: the recorded command decodes the printer-status flag mask with
-    /// a fixed English table, so the state does not depend on the host locale.
+    /// AC-REL15-1: the state is the `Get-Printer` `PrinterStatus` enum name, and
+    /// the registry mask decodes with a fixed English table when the name is
+    /// absent, so the state does not depend on the host locale.
     #[test]
     fn get_printers_decodes_the_state_flags() {
         let cmd = get_printers();
@@ -3574,13 +3579,21 @@ mod tests {
             );
         }
         assert!(
-            cmd.contains("$states=@($flags.Keys|Sort-Object|Where-Object{$status -band $_}|ForEach-Object{$flags[$_]})"),
-            "the flags must be decoded by the bit mask: {cmd}"
+            cmd.contains("$state=[string]$printer.PrinterStatus"),
+            "the state must be the enum name, not a decoded mask: {cmd}"
         );
-        assert!(cmd.contains("$state_text=($states -join ', ')"), "{cmd}");
         assert!(
-            cmd.contains("$state_flags=$null;if($null -ne $status){$state_flags=$status;"),
-            "an unread state must stay null, not 0: {cmd}"
+            cmd.contains("$states=@($flags.Keys|Sort-Object|Where-Object{$mask -band $_}|ForEach-Object{$flags[$_]})"),
+            "the registry mask must decode by the bit table: {cmd}"
+        );
+        assert!(cmd.contains("$state=($states -join ', ')"), "{cmd}");
+        assert!(
+            cmd.contains("if([string]::IsNullOrEmpty($state)){if($null -ne $mask){"),
+            "the mask is a fallback only when the name is absent: {cmd}"
+        );
+        assert!(
+            cmd.contains("$state_flags=$mask"),
+            "the flag mask must come from the registry value: {cmd}"
         );
         assert!(
             !cmd.contains("else{0}"),
@@ -3596,18 +3609,16 @@ mod tests {
     fn get_printers_treats_unread_state_as_unknown() {
         let cmd = get_printers();
         assert!(
-            cmd.contains(
-                "if($null -ne $printer.PrinterStatus){$status=[int]$printer.PrinterStatus}"
-            ),
+            cmd.contains("$state=[string]$printer.PrinterStatus"),
             "PrinterStatus must be the primary source: {cmd}"
         );
         assert!(
             cmd.contains("-Name Status -ErrorAction Stop).Status"),
             "the registry Status value must stay the fallback: {cmd}"
         );
-        assert!(cmd.contains("$state_text='Unknown'"), "{cmd}");
+        assert!(cmd.contains("$state='Unknown'"), "{cmd}");
         assert!(
-            cmd.contains("state=$state_text;state_flags=$state_flags"),
+            cmd.contains("state=$state;state_flags=$state_flags"),
             "{cmd}"
         );
     }

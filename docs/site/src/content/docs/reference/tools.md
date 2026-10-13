@@ -36,7 +36,7 @@ The binary declares 43 tools, plus `write_file` when the operator enables it. Th
 | `get_service_config` | One service: the start type (Automatic, AutomaticDelayed, Manual or Disabled), the account, the binary path and the recovery actions with the action, the delay and the reset period |
 | `list_processes` | The processes with a sort by CPU, memory or handles |
 | `get_open_handles` | The processes that hold a file open, with the PID, the name and the start time. It uses the Restart Manager, so no Sysinternals `handle.exe` is needed |
-| `get_printers` | The printers with the share name, the driver, the port, the port host and number, the state as decoded flags and the job count |
+| `get_printers` | The printers with the share name, the driver, the port, the port host and number, the state as the PrinterStatus name and the job count |
 | `get_print_jobs` | The print jobs of one printer. The document name and the owner stay hidden unless `include_personal_data` is true |
 | `get_system_info` | The OS version, uptime, RAM, CPU count, domain, time zone |
 | `get_disk_space` | The free space on all fixed disks |

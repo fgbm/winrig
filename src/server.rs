@@ -1742,7 +1742,7 @@ impl WinrigServer {
 
     #[tool(
         name = "get_printers",
-        description = "List the printers on the host with the share name, the driver, the port, the port host and number, the state as decoded flags and the job count. The result is cut to fit the response size; truncated shows a cut. Read-only."
+        description = "List the printers on the host with the share name, the driver, the port, the port host and number, the state as the PrinterStatus name and the job count. The result is cut to fit the response size; truncated shows a cut. Read-only."
     )]
     async fn get_printers(
         &self,

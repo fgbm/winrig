@@ -12,7 +12,7 @@ use crate::client_config::{Client, Scope, ServerDefinition};
 #[derive(Debug, Parser)]
 #[command(
     name = "winrig",
-    about = "MCP server for remote Windows administration over WinRM/NTLM",
+    about = "MCP server for the remote administration of Windows hosts over WinRM/NTLM",
     version
 )]
 pub struct Cli {
@@ -50,81 +50,85 @@ impl std::str::FromStr for SecretArg {
 // User-facing text lives in explicit attributes, so doc comments never reach `--help`.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    #[command(about = "Run the HTTP server on /mcp (default when no subcommand is given)")]
+    #[command(
+        about = "Run the HTTP server on /mcp. This is the default when no subcommand is given"
+    )]
     Serve {
-        #[arg(long, help = "Profile name; omitted when exactly one profile exists")]
+        #[arg(long, help = "Profile name. Omit it when exactly one profile exists")]
         profile: Option<String>,
         #[arg(
             long,
             value_name = "PORT",
-            help = "Port to listen on; overrides WINRIG_PORT"
+            help = "Port to listen on. This flag overrides WINRIG_PORT"
         )]
         port: Option<u16>,
         #[arg(
             long,
             value_name = "ADDR",
-            help = "Bind address; overrides WINRIG_BIND_HOST"
+            help = "Bind address. This flag overrides WINRIG_BIND_HOST"
         )]
         host: Option<String>,
         #[arg(
             long,
             value_name = "TOKEN",
-            help = "Access token for the profile; overrides WINRIG_TOKEN. Passing a secret as an argument exposes it in the process list; prefer the environment or the client config when possible"
+            help = "Profile token. This flag overrides WINRIG_TOKEN. A secret in an argument is visible in the process list. Use the environment or the client configuration when possible"
         )]
         token: Option<SecretArg>,
         #[arg(
             long,
             value_name = "SECRET",
-            help = "Shared secret for the header path; overrides WINRIG_AUTH_TOKEN. Passing a secret as an argument exposes it in the process list"
+            help = "Shared secret for the header path. This flag overrides WINRIG_AUTH_TOKEN. A secret in an argument is visible in the process list"
         )]
         auth_token: Option<SecretArg>,
     },
-    #[command(about = "Run the MCP server over stdin/stdout; requires WINRIG_TOKEN")]
+    #[command(
+        about = "Run the MCP server over stdin/stdout. This subcommand requires WINRIG_TOKEN"
+    )]
     Stdio {
-        #[arg(long, help = "Profile name; omitted when exactly one profile exists")]
+        #[arg(long, help = "Profile name. Omit it when exactly one profile exists")]
         profile: Option<String>,
     },
-    #[command(about = "Create an encrypted profile, print its token once")]
+    #[command(about = "Create an encrypted profile and print its profile token one time")]
     Setup {
-        #[arg(help = "Profile name, e.g. 'corp'")]
+        #[arg(help = "Profile name, for example 'corp'")]
         name: String,
-        #[arg(long, help = "AD account in DOMAIN\\\\user form")]
+        #[arg(long, help = "AD account in the DOMAIN\\\\user form")]
         user: Option<String>,
         #[arg(long, help = "Replace an existing profile")]
         overwrite: bool,
         #[arg(
             long,
             value_name = "CLIENT",
-            help = "Write the server definition into this client's config"
+            help = "Write the server definition into the client configuration of this client"
         )]
         write_config: Option<String>,
         #[arg(
             long,
             value_name = "SCOPE",
             value_parser = parse_scope,
-            help = "Config level for --write-config: 'global' (user-wide) or 'project' (current project). Asked interactively when omitted; required in a non-interactive run"
+            help = "Level of the client configuration for --write-config: 'global' (user-wide) or 'project' (current project). The tool asks interactively when the value is omitted. The value is required in a non-interactive run"
         )]
         scope: Option<Scope>,
         #[arg(
             long,
             value_name = "NAME",
-            help = "Name of the MCP server entry. Defaults to the entry that already serves this profile, or 'winrig' when there is none"
+            help = "Name of the MCP server entry. The default is the entry that already serves this profile, or 'winrig' when there is no such entry"
         )]
         server_name: Option<String>,
         #[arg(
             long,
             value_name = "HOSTS",
             value_parser = parse_allowed_hosts,
-            help = "Hosts the server may connect to, written as WINRIG_ALLOWED_HOSTS: comma-separated names or IPs, '.suffix' entries, or '*' for any host. Without it the entry has no list and only loopback is allowed"
+            help = "Hosts the server can connect to, in the WINRIG_ALLOWED_HOSTS form: names or IPs separated by commas, '.suffix' entries, or '*' for any host. Without this flag the entry has no list and the server allows only loopback"
         )]
         allowed_hosts: Option<String>,
     },
-    #[command(about = "List profiles without secrets")]
+    #[command(about = "List the profiles without secrets")]
     List {
         #[arg(long, help = "Print the list as JSON instead of a table")]
         json: bool,
     },
-    #[command(about = "Re-encrypt a profile under a fresh token")]
+    #[command(about = "Encrypt a profile again under a new profile token")]
     Rotate {
         #[arg(help = "Profile name")]
         name: String,

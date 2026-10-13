@@ -64,4 +64,6 @@ The queue and the statuses are in `docs/ROADMAP.md`. These stay outside the slic
 - the tools of the Python version that are not ported (file transfer, archives, `invoke_http_request`, SFTP);
 - the move of the confirmation channel to `input_required` at the change to the revision `2026-07-28` (Q-10). Clients without elicitation (opencode 1.18.31) stay fail-closed on modifying tools;
 - the reuse of the WinRM client for a session and the duration in the audit record;
-- the OS keyring as an alternative to the profile file (Q-12).
+- the OS keyring as an alternative to the profile file (Q-12);
+- the move of the inline PowerShell in `src/server.rs` (`set_registry`, `kill_process` and the others) into `src/ps.rs`, so the shared guard tests cover them;
+- the verification on a live Windows host of the `PrinterStatus` semantics, the Restart Manager through `Reflection.Emit`, `-ErrorVariable +var` on PowerShell 5.1 and the CLIXML stderr format (Q-08).

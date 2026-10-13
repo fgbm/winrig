@@ -272,7 +272,7 @@ impl WinrigServer {
             Err(ElicitationError::Service(rmcp::service::ServiceError::Timeout { .. })) => {
                 Err(CallToolResult::structured(json!({
                     "error": format!(
-                        "Confirmation for {action} timed out after {}s and was not performed",
+                        "Confirmation for {action} timed out after {}s. The operation did not run.",
                         timeout.as_secs()
                     ),
                     "status": "timeout",
@@ -280,7 +280,7 @@ impl WinrigServer {
             }
             Err(error) => Err(CallToolResult::structured(json!({
                 "error": format!(
-                    "Cannot ask for confirmation, so {action} was not performed: {error}"
+                    "The server cannot ask for confirmation. It did not run {action}: {error}"
                 ),
             }))),
         }
@@ -318,7 +318,7 @@ fn base64_payloads(command: &str) -> Vec<String> {
 fn cancelled(action: &str) -> CallToolResult {
     CallToolResult::structured(json!({
         "status": "cancelled",
-        "message": format!("{action} cancelled by user"),
+        "message": format!("The operator cancelled {action}"),
     }))
 }
 
@@ -1593,7 +1593,7 @@ impl WinrigServer {
             other => {
                 return Ok(CallToolResult::structured(json!({
                     "error": format!(
-                        "Invalid value_type '{other}'. Valid: String, DWord, QWord, ExpandString, MultiString, Binary"
+                        "Invalid value_type '{other}'. Valid values: String, DWord, QWord, ExpandString, MultiString, Binary"
                     ),
                 })));
             }
@@ -1715,7 +1715,7 @@ impl WinrigServer {
             Ok(scan) => scan,
             Err(error) => {
                 return Ok(CallToolResult::structured(json!({
-                    "error": format!("{error} Refusing to write."),
+                    "error": format!("{error} The tool refuses to write."),
                     "scan": probe_stdout,
                 })));
             }
@@ -1778,7 +1778,7 @@ impl WinrigServer {
                     .await;
                 return Ok(CallToolResult::structured(json!({
                     "error": format!(
-                        "Write failed at step {} of {steps}; the target file was left unchanged",
+                        "The write failed at step {} of {steps}. The tool left the target file unchanged.",
                         index + 1
                     ),
                     "step": reply,
@@ -1834,7 +1834,7 @@ impl WinrigServer {
             Ok(scan) => scan,
             Err(error) => {
                 return Ok(CallToolResult::structured(json!({
-                    "error": format!("{error} Refusing to delete."),
+                    "error": format!("{error} The tool refuses to delete."),
                     "scan": stdout,
                 })));
             }
@@ -1913,7 +1913,7 @@ impl WinrigServer {
             Ok(scan) => scan,
             Err(error) => {
                 return Ok(CallToolResult::structured(json!({
-                    "error": format!("{error} Refusing to delete."),
+                    "error": format!("{error} The tool refuses to delete."),
                     "scan": stdout,
                 })));
             }

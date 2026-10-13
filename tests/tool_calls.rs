@@ -366,10 +366,10 @@ async fn client_without_elicitation_is_refused() {
         0,
         "the server asked a client that never declared elicitation"
     );
-    // "Nobody to ask", not "asked and timed out": the substring "was not
-    // performed" also appears in the timeout message.
+    // "Nobody to ask", not "asked and timed out": only the absent-channel
+    // message says "cannot ask for confirmation".
     assert!(
-        error_of(&result).is_some_and(|error| error.contains("Cannot ask for confirmation")),
+        error_of(&result).is_some_and(|error| error.contains("cannot ask for confirmation")),
         "a client without elicitation must be refused for the absent channel: {:?}",
         result.structured_content
     );

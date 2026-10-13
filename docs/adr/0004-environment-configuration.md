@@ -1,36 +1,36 @@
-# ADR-0004 — Конфигурация только через переменные окружения
+# ADR-0004 — Configuration only through environment variables
 
-- Статус: принято
-- Дата: 2026-09-19
-- Связано: AGENTS.md §5, ADR-0003
+- Status: accepted
+- Date: 2026-09-19
+- Related: AGENTS.md §5, ADR-0003
 
-## Контекст
+## Context
 
-Параметры (TTL, лимиты логов и др.) читаются из окружения. Новые параметры — порог и окно блокировки, минимальная длина редактирования, allowlist хостов, разрешение понижения TLS — должны поставляться единообразно.
+The code reads parameters (TTL, the log limits and others) from the environment. New parameters — the lockout threshold and window, the minimum redaction length, the host allowlist and the TLS downgrade permission — must come in the same way.
 
-## Решение
+## Decision
 
-Все параметры поставляются через переменные окружения. Полная таблица — в README. Секреты хранятся в `.env`; `.env`, `target/` и снапшоты не коммитятся. Валидация выполняется в `src/config.rs` (ADR-0003).
+All parameters come through environment variables. The README has the full table. Secrets are in `.env`. The repository does not commit `.env`, `target/` and snapshots. The validation is in `src/config.rs` (ADR-0003).
 
-Новые переменные (решения человека, перенесены из Python-версии):
+New variables (the decisions of the operator, moved from the Python version):
 
-| Переменная | Умолчание | Назначение |
+| Variable | Default | Purpose |
 |---|---|---|
-| `WINRIG_LOCKOUT_ATTEMPTS` | `3` | число отказов до блокировки |
-| `WINRIG_LOCKOUT_WINDOW_SECONDS` | `1800` | окно блокировки, сек |
-| `WINRIG_SECRET_REDACT_MIN_LENGTH` | `4` | минимальная длина секрета для редактирования |
-| `WINRIG_ALLOWED_HOSTS` | пусто | allowlist; пусто — разрешать всё |
-| `WINRIG_ALLOW_INSECURE_TLS` | `true` | разрешено ли `verify_cert=false` |
+| `WINRIG_LOCKOUT_ATTEMPTS` | `3` | the number of failures before lockout |
+| `WINRIG_LOCKOUT_WINDOW_SECONDS` | `1800` | the lockout window, seconds |
+| `WINRIG_SECRET_REDACT_MIN_LENGTH` | `4` | the minimum length of a secret for redaction |
+| `WINRIG_ALLOWED_HOSTS` | empty | the host allowlist; an empty value allows everything |
+| `WINRIG_ALLOW_INSECURE_TLS` | `true` | whether the server permits `verify_cert=false` |
 
-## Последствия
+## Consequences
 
-- Конфигурационный файл не вводится.
-- Значения по умолчанию сохраняют поведение Python-версии, кроме безопасности (умолчания разрешают всё, как было).
+- The project does not introduce a configuration file.
+- The default values keep the behavior of the Python version, apart from security (the defaults allow everything, as before).
 
-## Уточнение (ADR-0009)
+## Clarification (ADR-0009)
 
-Файл профиля учётной записи — не конфигурация, а хранилище аутентифицированного шифртекста пароля; ключ профиля на сервере не хранится. Параметры, включая имя профиля (`WINRIG_PROFILE`), токен (`WINRIG_TOKEN`), каталог профилей (`WINRIG_PROFILE_DIR`) и каталог состояния (`WINRIG_STATE_DIR`), по-прежнему поставляются переменными окружения. `WINRIG_AUTH_TOKEN` перестал быть обязательным: старт требует общего секрета либо токена профиля.
+The account profile file is not a configuration. It is the storage of the authenticated password ciphertext, and the server does not keep the profile key. Parameters still come through environment variables. The parameters include the profile name (`WINRIG_PROFILE`), the profile token (`WINRIG_TOKEN`), the profile directory (`WINRIG_PROFILE_DIR`) and the state directory (`WINRIG_STATE_DIR`). `WINRIG_AUTH_TOKEN` is no longer obligatory: the start needs a shared secret or a profile token.
 
-## Уточнение (ADR-0015)
+## Clarification (ADR-0015)
 
-Умолчания безопасности изменены: пустой `WINRIG_ALLOWED_HOSTS` разрешает только loopback-литералы, а элемент `*` — любой хост; `WINRIG_ALLOW_INSECURE_TLS` по умолчанию `false`. Фраза «умолчания разрешают всё, как было» к этим двум переменным больше не относится.
+The security defaults changed: an empty `WINRIG_ALLOWED_HOSTS` permits only loopback literals, and the element `*` permits any host. `WINRIG_ALLOW_INSECURE_TLS` is `false` by default. The phrase "the defaults allow everything, as before" no longer applies to these two variables.

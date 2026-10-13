@@ -1,25 +1,25 @@
-//! Единая точка чтения и валидации конфигурации (DR-8, ADR-0004).
+//! The single point that reads and validates the configuration (DR-8, ADR-0004).
 //!
-//! Любая невалидная переменная окружения останавливает старт: [`load_config`]
-//! возвращает [`ConfigError`] с именем переменной и ожидаемым форматом.
-//! Секреты в сообщениях не раскрываются. Значения читаются через замыкание
-//! `Fn(&str) -> Option<String>`, а не напрямую из `std::env`, чтобы
-//! конфигурацию можно было тестировать без изменения окружения процесса.
+//! Any invalid environment variable stops the start: [`load_config`] returns
+//! [`ConfigError`] with the variable name and the expected format. Secrets are
+//! not revealed in the messages. Values come through an `Fn(&str) ->
+//! Option<String>` closure, not directly from `std::env`, so the configuration
+//! can be tested without changing the process environment.
 
 use std::fmt;
 
-/// Минимальный допустимый номер TCP-порта.
+/// Smallest allowed TCP port number.
 pub const MIN_PORT: u16 = 1;
-/// Максимальный допустимый номер TCP-порта.
+/// Largest allowed TCP port number.
 pub const MAX_PORT: u16 = 65535;
 
 const TRUE_VALUES: [&str; 4] = ["1", "true", "yes", "on"];
 const FALSE_VALUES: [&str; 4] = ["0", "false", "no", "off"];
 
-/// Источник значений переменных окружения.
+/// Source of environment variable values.
 pub type Env = dyn Fn(&str) -> Option<String>;
 
-/// Невалидная конфигурация: сообщение называет переменную и формат.
+/// Invalid configuration: the message names the variable and the format.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigError(String);
 
@@ -37,7 +37,7 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// Уровень журнала сервера.
+/// Severity used by the server journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
     /// `DEBUG`.
@@ -53,7 +53,7 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
-    /// Каноническая запись для подсистемы логирования.
+    /// Canonical spelling for the logging subsystem.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -76,12 +76,12 @@ impl LogLevel {
         }
     }
 
-    /// Директива для `tracing_subscriber::EnvFilter`.
+    /// Directive for `tracing_subscriber::EnvFilter`.
     ///
-    /// `EnvFilter` знает уровни `trace/debug/info/warn/error`; `WARNING` и
-    /// `CRITICAL` для него — не уровень, а имя target, поэтому передавать
-    /// `as_str()` напрямую нельзя: фильтр принимает строку за target и глушит
-    /// весь остальной журнал. Здесь уровни отображаются явно.
+    /// `EnvFilter` knows the levels `trace/debug/info/warn/error`; `WARNING` and
+    /// `CRITICAL` are not a level for it but a target name, so `as_str()` cannot
+    /// be passed directly: the filter takes the string as a target and silences
+    /// the rest of the journal. Here the levels are mapped explicitly.
     #[must_use]
     pub fn filter_directive(self) -> &'static str {
         match self {
@@ -99,54 +99,56 @@ impl fmt::Display for LogLevel {
     }
 }
 
-/// Провалидированные параметры окружения.
+/// Validated environment parameters.
 ///
-/// `Debug` реализован вручную: секреты (`mcp_auth_token`, `profile_token`) не
-/// должны попасть в случайный вывод через `{:?}` (DR-4).
+/// `Debug` is implemented by hand: the secrets (`mcp_auth_token`,
+/// `profile_token`) must not reach an accidental `{:?}` output (DR-4).
 #[derive(Clone)]
 pub struct AppConfig {
-    /// Общий секрет для пути по заголовкам (`X-AD-User`); необязателен, если
-    /// используется профиль (DR-1, ADR-0009).
+    /// Shared secret for the header path (`X-AD-User`); optional when a profile
+    /// is used (DR-1, ADR-0009).
     pub mcp_auth_token: Option<String>,
-    /// Адрес, на котором слушает HTTP-сервер.
+    /// Address the HTTP server listens on.
     pub mcp_bind_host: String,
-    /// TCP-порт HTTP-сервера.
+    /// TCP port of the HTTP server.
     pub mcpo_port: u16,
-    /// Имя профиля; `None` — выбрать единственный доступный (ADR-0009).
+    /// Selected profile; `None` picks the only available one (ADR-0009).
     pub profile_name: Option<String>,
-    /// Токен доступа к профилю; в stdio-режиме обязателен (ADR-0009).
+    /// Secret that opens the profile; required in stdio mode (ADR-0009).
     pub profile_token: Option<String>,
-    /// Время жизни кэшированного пароля AD в покое, секунды (0 — без истечения).
+    /// Idle lifetime of the cached AD password, in seconds (0 means no expiry).
     pub ad_password_idle_ttl_seconds: u64,
-    /// Каталог журналов и аудита; `None` — каталог состояния профиля.
+    /// Directory for logs and audit; `None` means the profile state directory.
     pub log_dir: Option<String>,
-    /// Уровень серверного журнала.
+    /// Severity of the server journal.
     pub log_level: LogLevel,
-    /// Размер журнала до ротации, байты.
+    /// Journal size before rotation, in bytes.
     pub log_max_bytes: u64,
-    /// Сколько ротированных файлов хранить.
+    /// How many rotated files to keep.
     pub log_backup_count: u32,
-    /// Порог отказов AD, после которого пароль временно не предъявляется (TR-SEC-01).
+    /// AD failure threshold after which the password is not presented for a
+    /// while (TR-SEC-01).
     pub ad_lockout_max_attempts: u32,
-    /// Окно блокировки после отказов, секунды.
+    /// Lockout window after failures, in seconds.
     pub ad_lockout_window_seconds: u64,
-    /// Минимальная длина секрета, редактируемого в ответе агенту.
+    /// Smallest secret length that is redacted in the reply to the agent.
     pub secret_redact_min_length: usize,
-    /// Allowlist хостов; пустой список разрешает только loopback, `*` — любой хост (TR-SEC-14).
+    /// Host allowlist; an empty list allows loopback only, `*` allows any host
+    /// (TR-SEC-14).
     pub allowed_hosts: Vec<String>,
-    /// Разрешено ли понижение проверки TLS (TR-SEC-06).
+    /// Whether the TLS check downgrade is allowed (TR-SEC-06).
     pub allow_insecure_tls: bool,
-    /// Сколько символов вывода каждого вызова хранить в аудите.
+    /// How many output characters of each call to keep in the audit.
     pub audit_max_output_chars: usize,
-    /// Писать ли в аудит тело команды и вывода или только метаданные.
+    /// Whether to write the command and output body to the audit or only metadata.
     pub audit_log_body: bool,
-    /// Сколько секунд ждать ответа на запрос подтверждения модификации.
+    /// How many seconds to wait for the answer to a modification confirmation.
     pub confirm_timeout_seconds: u64,
-    /// Время жизни кэшированных SFTP-учётных данных в покое, секунды.
+    /// Idle lifetime of the cached SFTP credentials, in seconds.
     pub sftp_cred_idle_ttl_seconds: u64,
-    /// Разрешена ли запись файлов на хост (TR-FS-01, ADR-0013).
+    /// Whether writing files to the host is allowed (TR-FS-01, ADR-0013).
     pub allow_file_write: bool,
-    /// Предел размера записываемого содержимого, байты (TR-FS-04).
+    /// Size limit of the written content, in bytes (TR-FS-04).
     pub max_write_bytes: usize,
 }
 
@@ -190,7 +192,7 @@ impl fmt::Debug for AppConfig {
     }
 }
 
-/// Читает переменную, обрезая пробелы; пустая строка трактуется как отсутствие.
+/// Reads a variable and trims spaces; an empty string means absent.
 fn read(env: &Env, name: &str) -> Option<String> {
     env(name)
         .map(|value| value.trim().to_owned())
@@ -261,10 +263,10 @@ fn read_log_level(env: &Env, name: &str, default: LogLevel) -> Result<LogLevel, 
     })
 }
 
-/// Список разрешённых хостов по грамматике `policy::parse_allowed_hosts`.
+/// The host allowlist by the grammar of `policy::parse_allowed_hosts`.
 ///
-/// Неверный элемент — отказ старта (DR-8): иначе `*.corp.example` молча не
-/// разрешал бы ничего, и оператор не понял бы почему.
+/// A bad element refuses the start (DR-8): otherwise `*.corp.example` would
+/// silently allow nothing, and the operator would not see why.
 fn read_allowed_hosts(env: &Env) -> Result<Vec<String>, ConfigError> {
     let Some(raw) = read(env, "WINRIG_ALLOWED_HOSTS") else {
         return Ok(Vec::new());
@@ -281,20 +283,20 @@ fn load_auth_token(env: &Env) -> Option<String> {
     read(env, "WINRIG_AUTH_TOKEN")
 }
 
-/// Имя выбранного профиля; пустая строка трактуется как отсутствие.
+/// Name of the selected profile; an empty string means absent.
 fn read_profile_name(env: &Env) -> Option<String> {
     read(env, "WINRIG_PROFILE")
 }
 
-/// Токен доступа к профилю; в stdio-режиме обязателен.
+/// Profile access token; required in stdio mode.
 fn read_profile_token(env: &Env) -> Option<String> {
     read(env, "WINRIG_TOKEN")
 }
 
-/// Читает целое и преобразует его в целевой тип без паники.
+/// Reads an integer and converts it to the target type without panicking.
 ///
-/// Верхняя граница типа проверяется через `TryFrom`, поэтому слишком большое
-/// значение даёт [`ConfigError`] с именем переменной, а не панику (DR-8).
+/// The type upper bound is checked through `TryFrom`, so an oversized value
+/// gives [`ConfigError`] with the variable name, not a panic (DR-8).
 fn read_uint<T>(
     env: &Env,
     name: &str,
@@ -313,10 +315,10 @@ where
     })
 }
 
-/// Старые имена переменных, заменённые на нотацию `WINRIG_*` (ADR-0010).
+/// Old variable names replaced by the `WINRIG_*` notation (ADR-0010).
 ///
-/// Чистый разрыв: если задано старое имя, старт отказывает с указанием
-/// нового, чтобы оператор не думал, что значение применилось.
+/// A clean break: when an old name is set, the start refuses and names the new
+/// one, so the operator does not think the value took effect.
 pub const RENAMED_VARIABLES: &[(&str, &str)] = &[
     ("MCP_AUTH_TOKEN", "WINRIG_AUTH_TOKEN"),
     ("MCP_BIND_HOST", "WINRIG_BIND_HOST"),
@@ -343,10 +345,10 @@ pub const RENAMED_VARIABLES: &[(&str, &str)] = &[
     ("SFTP_CRED_IDLE_TTL_SECONDS", "WINRIG_SFTP_CRED_TTL_SECONDS"),
 ];
 
-/// Отказывает, если задано любое из старых имён переменных.
+/// Refuses when any of the old variable names is set.
 ///
-/// Проверяются все старые имена сразу, чтобы сообщение перечислило полный
-/// список найденных, а не первое.
+/// All old names are checked at once, so the message lists the full set of the
+/// ones found, not the first.
 fn reject_renamed_variables(env: &Env) -> Result<(), ConfigError> {
     let found: Vec<String> = RENAMED_VARIABLES
         .iter()
@@ -362,12 +364,12 @@ fn reject_renamed_variables(env: &Env) -> Result<(), ConfigError> {
     )))
 }
 
-/// Читает и валидирует переменные из переданного источника.
+/// Reads and validates the variables from the given source.
 ///
 /// # Errors
 ///
-/// Возвращает [`ConfigError`] при первом старом имени переменной или первой
-/// невалидной переменной, называя её.
+/// Returns [`ConfigError`] for the first old variable name or the first invalid
+/// variable, and names it.
 pub fn load_config_from(env: &Env) -> Result<AppConfig, ConfigError> {
     reject_renamed_variables(env)?;
     let mcp_auth_token = load_auth_token(env);
@@ -449,8 +451,8 @@ pub fn load_config_from(env: &Env) -> Result<AppConfig, ConfigError> {
             None,
         )?,
         allow_file_write: read_bool(env, "WINRIG_ALLOW_FILE_WRITE", false)?,
-        // Нижняя граница — один кусок: меньший предел означал бы инструмент,
-        // который отказывает всегда (ADR-0013 §8, §11).
+        // The lower bound is one chunk: a smaller limit would mean a tool that
+        // always refuses (ADR-0013 §8, §11).
         max_write_bytes: read_uint(
             env,
             "WINRIG_MAX_WRITE_BYTES",
@@ -461,11 +463,11 @@ pub fn load_config_from(env: &Env) -> Result<AppConfig, ConfigError> {
     })
 }
 
-/// Читает и валидирует переменные окружения процесса.
+/// Reads and validates the process environment variables.
 ///
 /// # Errors
 ///
-/// Возвращает [`ConfigError`] при первой невалидной переменной, называя её.
+/// Returns [`ConfigError`] for the first invalid variable, and names it.
 pub fn load_config() -> Result<AppConfig, ConfigError> {
     load_config_from(&|name| std::env::var(name).ok())
 }
@@ -475,10 +477,10 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    /// Источник значений: отсутствующие ключи дают `None`.
+    /// Missing keys give `None`.
     ///
-    /// `+ use<>` обязателен: в Rust 2024 `impl Trait` иначе захватывает
-    /// лайфтайм аргумента, и временный срез переживает вызов.
+    /// `+ use<>` is required: in Rust 2024 `impl Trait` otherwise captures the
+    /// lifetime of the argument, and the temporary slice outlives the call.
     fn source(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
         let map: BTreeMap<String, String> = pairs
             .iter()
@@ -513,20 +515,20 @@ mod tests {
         assert_eq!(config.ad_lockout_window_seconds, 1800);
         assert_eq!(config.secret_redact_min_length, 4);
         assert!(config.allowed_hosts.is_empty());
-        // AC-SEC06-1: понижение проверки TLS запрещено, пока оператор его не
-        // разрешил явно (TR-SEC-06, ADR-0015).
+        // AC-SEC06-1: the TLS check downgrade is forbidden until the operator
+        // allows it explicitly (TR-SEC-06, ADR-0015).
         assert!(!config.allow_insecure_tls);
         assert_eq!(config.audit_max_output_chars, 2000);
         assert!(config.audit_log_body);
         assert_eq!(config.sftp_cred_idle_ttl_seconds, 3600);
         assert_eq!(config.confirm_timeout_seconds, 300);
-        // TR-FS-01: запись файла выключена, пока оператор её не включил.
+        // TR-FS-01: file write is off until the operator turns it on.
         assert!(!config.allow_file_write);
-        // TR-FS-04: предел терпения, а не протокола (ADR-0013 §11).
+        // TR-FS-04: a patience limit, not a protocol limit (ADR-0013 §11).
         assert_eq!(config.max_write_bytes, 64 * 1024);
     }
 
-    /// TR-FS-01: настройка включается обычными булевыми значениями.
+    /// TR-FS-01: the setting is switched by the usual boolean values.
     #[test]
     fn file_write_is_switched_by_the_operator() {
         let env = source(&with(&[("WINRIG_ALLOW_FILE_WRITE", "true")]));
@@ -535,8 +537,8 @@ mod tests {
         assert!(!load_config_from(&env).expect("valid").allow_file_write);
     }
 
-    /// TR-FS-04: предел не может быть меньше одного куска — иначе инструмент
-    /// отказывал бы всегда, а причина читалась бы как ошибка размера.
+    /// TR-FS-04: the limit cannot be below one chunk; otherwise the tool would
+    /// always refuse, and the cause would read as a size error.
     #[test]
     fn max_write_bytes_must_hold_at_least_one_chunk() {
         let env = source(&with(&[("WINRIG_MAX_WRITE_BYTES", "100")]));
@@ -549,8 +551,8 @@ mod tests {
         assert_eq!(load_config_from(&env).expect("valid").max_write_bytes, 2000);
     }
 
-    /// AC-PRF-47: без профиля и без токена конфигурация читается, решение
-    /// «хотя бы один секрет» принимает точка входа.
+    /// AC-PRF-47: without a profile and without a token the config still reads,
+    /// and the entry point makes the "at least one secret" decision.
     #[test]
     fn no_secret_is_accepted_by_parser() {
         let env = source(&[]);
@@ -560,7 +562,7 @@ mod tests {
         assert_eq!(config.profile_token, None);
     }
 
-    /// AC-PRF-21: токены не выводятся через Debug.
+    /// AC-PRF-21: tokens are not printed through Debug.
     #[test]
     fn debug_redacts_tokens() {
         let env = source(&with(&[
@@ -573,7 +575,7 @@ mod tests {
         assert!(rendered.contains("[REDACTED]"));
     }
 
-    /// AC-PRF-04/42: имя профиля и токен читаются из окружения.
+    /// AC-PRF-04/42: the profile name and the token are read from the environment.
     #[test]
     fn profile_variables_are_read() {
         let env = source(&with(&[
@@ -585,7 +587,7 @@ mod tests {
         assert_eq!(config.profile_token.as_deref(), Some("secret-token"));
     }
 
-    /// AC-PRF-09: LOG_DIR остаётся явным переопределением.
+    /// AC-PRF-09: LOG_DIR stays an explicit override.
     #[test]
     fn log_dir_override_is_read() {
         let env = source(&with(&[("WINRIG_LOG_DIR", "/tmp/winrig-logs")]));
@@ -595,7 +597,7 @@ mod tests {
         );
     }
 
-    /// Чистый разрыв: старое имя переменной отказывает старту и называет новое.
+    /// Clean break: an old variable name refuses the start and names the new one.
     #[test]
     fn renamed_variables_are_rejected_with_the_new_name() {
         for (old, new) in [
@@ -613,7 +615,7 @@ mod tests {
         }
     }
 
-    /// Несколько старых имён перечисляются в одном сообщении.
+    /// Several old names are listed in one message.
     #[test]
     fn several_renamed_variables_are_listed_together() {
         let env = source(&with(&[("MCPO_PORT", "1"), ("LOG_LEVEL", "INFO")]));
@@ -625,7 +627,7 @@ mod tests {
         );
     }
 
-    /// Новые имена читаются, старые — нет.
+    /// The new names are read, the old ones are not.
     #[test]
     fn only_new_names_are_effective() {
         let env = source(&with(&[("WINRIG_PORT", "9000")]));
@@ -671,8 +673,8 @@ mod tests {
         assert_eq!(config.allowed_hosts, ["host1", ".example.com", "host2"]);
     }
 
-    /// AC-SEC05-6: неверный элемент списка хостов — отказ старта с именем
-    /// переменной и ожидаемой формой (DR-8).
+    /// AC-SEC05-6: a bad allowlist element refuses the start with the variable
+    /// name and the expected form (DR-8).
     #[test]
     fn invalid_allowed_hosts_entry_refuses_startup() {
         let env = source(&with(&[("WINRIG_ALLOWED_HOSTS", "host1,*.example.com")]));
@@ -765,8 +767,8 @@ mod tests {
 
     #[test]
     fn log_level_filter_directives_match_env_filter_levels() {
-        // `WARNING`/`CRITICAL` не существуют для EnvFilter: он принял бы их за
-        // target и отключил журнал. Директива обязана быть валидным уровнем.
+        // `WARNING`/`CRITICAL` do not exist for EnvFilter: it would take them as
+        // a target and turn the journal off. The directive must be a valid level.
         assert_eq!(LogLevel::Debug.filter_directive(), "debug");
         assert_eq!(LogLevel::Info.filter_directive(), "info");
         assert_eq!(LogLevel::Warning.filter_directive(), "warn");
@@ -834,7 +836,7 @@ mod tests {
 
     #[test]
     fn u32_overflow_reports_variable_instead_of_panicking() {
-        // DR-8: слишком большое значение не должно паниковать (было exit 101).
+        // DR-8: an oversized value must not panic (it used to exit 101).
         for name in ["WINRIG_LOG_BACKUP_COUNT", "WINRIG_LOCKOUT_ATTEMPTS"] {
             let env = source(&with(&[(name, "4294967296")]));
             let err = load_config_from(&env).expect_err("must fail");

@@ -44,9 +44,8 @@ pub struct AuthState {
 /// The token check value and the decrypted identity, held for the process
 /// lifetime.
 pub struct BoundProfile {
-    /// Location of the profile file.
     pub path: std::path::PathBuf,
-    /// HMAC of the first accepted secret, compared in constant time.
+    /// HMAC of the first accepted profile token, compared in constant time.
     token_mac: [u8; 32],
     /// Decrypted on the first check.
     identity: ProfileIdentity,

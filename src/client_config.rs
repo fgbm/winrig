@@ -120,21 +120,13 @@ impl Client {
 #[derive(Debug)]
 pub enum ClientConfigError {
     /// Unknown client name.
-    UnknownClient {
-        /// Client string the caller passed.
-        name: String,
-    },
+    UnknownClient { name: String },
     /// Home directory unavailable.
     NoHome,
     /// No state directory for the opencode token at the project scope.
     NoStateDir,
     /// Existing file that cannot be parsed.
-    Unreadable {
-        /// File that failed the parse.
-        path: PathBuf,
-        /// Cause of the failure.
-        reason: String,
-    },
+    Unreadable { path: PathBuf, reason: String },
     /// Input or output error.
     Io {
         path: PathBuf,

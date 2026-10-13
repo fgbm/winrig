@@ -33,7 +33,7 @@ pub const NONCE_LEN: usize = 24;
 pub const KEY_LEN: usize = 32;
 /// Generated access token length in bytes.
 pub const TOKEN_LEN: usize = 32;
-/// HKDF key-output context that separates this key from any other use.
+/// HKDF info string that separates this key from any other use.
 const HKDF_INFO: &[u8] = b"winrig-profile-v1";
 /// Failure in a profile operation.
 #[derive(Debug)]
@@ -44,44 +44,26 @@ pub enum ProfileError {
         source: std::io::Error,
     },
     /// The profile already exists and overwrite was not requested.
-    Exists {
-        /// File that already exists.
-        path: PathBuf,
-    },
+    Exists { path: PathBuf },
     /// Damaged file or a file that is not a profile.
-    Corrupt {
-        /// File that failed the parse.
-        path: PathBuf,
-        /// Cause of the failure.
-        reason: String,
-    },
+    Corrupt { path: PathBuf, reason: String },
     /// Format version newer than this build knows.
     UnsupportedVersion {
         /// File with the newer version.
         path: PathBuf,
-        /// Number read from the file.
         version: u32,
     },
     /// Decryption failed: wrong token or substituted data.
     InvalidToken {
-        /// File that could not be opened.
+        /// Profile file whose decryption failed.
         path: PathBuf,
     },
     /// Profile name that is not allowed.
-    InvalidName {
-        /// Rejected profile string.
-        name: String,
-    },
+    InvalidName { name: String },
     /// Empty password or user name.
-    EmptyInput {
-        /// Which input was empty.
-        field: &'static str,
-    },
+    EmptyInput { field: &'static str },
     /// An account with no domain: neither `DOMAIN\user` nor a UPN (TR-PRF-16).
-    InvalidAccount {
-        /// Login string without a domain.
-        account: String,
-    },
+    InvalidAccount { account: String },
 }
 
 impl std::fmt::Display for ProfileError {
@@ -139,7 +121,6 @@ pub struct ProfileSummary {
     pub username: String,
     /// Creation time in Unix seconds.
     pub created_at: u64,
-    /// Location of the profile file.
     pub path: PathBuf,
 }
 

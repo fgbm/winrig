@@ -15,7 +15,7 @@ const DIR_MODE: u32 = 0o700;
 #[cfg(unix)]
 const FILE_MODE: u32 = 0o600;
 
-/// Mode required for private data on this platform.
+/// Expected mode for private data on this platform; a wider mode warns but does not refuse (AC-PRF-25).
 #[cfg(unix)]
 pub const EXPECTED_FILE_MODE: u32 = FILE_MODE;
 

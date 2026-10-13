@@ -31,7 +31,6 @@ pub struct RequestIdentity {
     pub username: String,
     /// AD secret, given or recovered from the profile.
     pub password: Option<SecretString>,
-    /// Where it came from.
     pub source: IdentitySource,
 }
 

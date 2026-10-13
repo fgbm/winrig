@@ -624,8 +624,9 @@ fn required_bool(
 
 /// Protected system roots on the actual volume (TR-FS-06, ADR-0015 §10–12).
 ///
-/// The lexical `PROTECTED_DIRS` list knows only `C:`; these roots name the actual system
-/// location, on whatever volume it sits.
+/// The host reads the roots from its own system variables (`%SystemRoot%` and
+/// similar), so the roots name the actual system location, on whatever volume it
+/// sits. The lexical `PROTECTED_DIRS` list knows only `C:`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostRoots {
     /// Pairs of (name, path on the host).
@@ -1152,7 +1153,7 @@ mod tests {
         }
     }
 
-    /// A non-empty list does not add loopback: the operator listed the hosts himself.
+    /// A non-empty list does not add loopback: the operator listed the hosts explicitly.
     #[test]
     fn explicit_list_does_not_add_loopback() {
         assert!(!host_allowed("localhost", &hosts(&["web-server-01"])));

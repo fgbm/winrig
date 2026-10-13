@@ -6,7 +6,7 @@
 
 use serde_json::Value;
 
-/// Characters that PowerShell treats as a string delimiter (TR-SEC-12).
+/// Characters that PowerShell accepts as a single quote (TR-SEC-12).
 ///
 /// The PowerShell tokenizer ends a single-quoted string not only at the ASCII
 /// apostrophe but also at the typographic quotes: `‘` U+2018, `’` U+2019,
@@ -1194,7 +1194,7 @@ mod tests {
     /// UTF-8, and the limit must count bytes.
     #[test]
     fn plan_counts_bytes_not_characters() {
-        let content = "я".repeat(1500); // 3000 байт в UTF-8
+        let content = "я".repeat(1500); // 3000 bytes in UTF-8
         let error = write_plan("C:\\out.txt", "C:\\out.part", &content, "utf8", 2500)
             .expect_err("above the limit");
         assert!(error.contains("3000"), "{error}");

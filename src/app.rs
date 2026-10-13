@@ -785,7 +785,8 @@ fn setup_logging(
     Ok(())
 }
 
-/// Mirrors every record to stderr plus the log file.
+/// Mirrors every record to stderr plus the log file: stderr shows in the console,
+/// the file survives a restart.
 struct FileAndStderr {
     file: RotatingFile,
 }

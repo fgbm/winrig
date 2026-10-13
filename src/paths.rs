@@ -34,35 +34,26 @@ pub enum PathError {
     },
     /// Cannot create or open the directory.
     Io {
-        /// File the error occurred on.
+        /// Directory or file the error occurred on.
         path: PathBuf,
-        /// Underlying cause.
         source: std::io::Error,
     },
     /// The name violates a path character restriction.
     InvalidName {
-        /// Value that was rejected.
         name: String,
         /// Which restriction was violated.
         reason: &'static str,
     },
     /// The requested profile is absent from the profile directory.
     NotFound {
-        /// Requested profile.
         name: String,
         /// Directory that was searched.
         dir: PathBuf,
     },
     /// Several profiles exist and no name is given.
-    Ambiguous {
-        /// Profiles that were found.
-        names: Vec<String>,
-    },
+    Ambiguous { names: Vec<String> },
     /// The profile is already held by another process.
-    Locked {
-        /// Lock file location.
-        path: PathBuf,
-    },
+    Locked { path: PathBuf },
 }
 
 impl std::fmt::Display for PathError {
@@ -184,7 +175,6 @@ impl Locations {
         Ok(())
     }
 
-    /// Where the profiles are stored.
     #[must_use]
     pub fn profile_dir(&self) -> &Path {
         &self.profile_dir
@@ -312,7 +302,6 @@ impl ProcessLock {
         }
     }
 
-    /// Lock file location.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path

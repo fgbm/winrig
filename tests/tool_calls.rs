@@ -70,9 +70,7 @@ impl RecordingTransport {
 /// How the test client replies to a confirmation request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Answer {
-    /// User agreed.
     Accept,
-    /// Operator refused.
     Decline,
     /// The user never answers; the decision stays with the server timeout.
     Silent,

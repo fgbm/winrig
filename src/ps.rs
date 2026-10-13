@@ -1048,6 +1048,134 @@ pub fn get_open_handles(path: &str) -> Result<String, String> {
     Ok(command)
 }
 
+/// The command that lists every printer with the decoded state flags and the job count (TR-REL-15).
+///
+/// The state is the printer-status flag mask. `Get-Printer`'s `PrinterStatus`
+/// is the primary source and uses the same `PRINTER_STATUS_*` bits; the registry
+/// value `Status` under `…\Control\Print\Printers` is the fallback. If neither can
+/// be read the state stays `Unknown` with `state_flags` null, so an unread state
+/// never looks healthy. The mask is decoded with a fixed English bit table, so
+/// the state does not depend on the host locale. The job count comes from
+/// `Get-Printer`; a missing value is null, not zero. Rows are kept while their
+/// compressed JSON stays under `@BUD@` characters, so the answer fits the executor
+/// output limit however many printers the host has. A stopped Print Spooler or a
+/// missing PrintManagement module gives a clear error, not an empty list.
+const PRINTERS_SCRIPT: &str = r#"$ErrorActionPreference='Stop';if($null -eq (Get-Command Get-Printer -ErrorAction SilentlyContinue)){throw "PrintManagement module is not available"};$svc=Get-Service -Name Spooler -ErrorAction Stop;if($svc.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Running){throw "The Print Spooler service is not running: $($svc.Status)"};function Cap($s,$n){$s=[string]$s;if($s.Length -gt $n){$s.Substring(0,$n)}else{$s}};$flags=@{1='Paused';2='Error';4='PendingDeletion';8='PaperJam';16='PaperOut';32='ManualFeed';64='PaperProblem';128='Offline';256='IOActive';512='Busy';1024='Printing';2048='OutputBinFull';4096='NotAvailable';8192='Waiting';16384='Processing';32768='Initializing';65536='WarmingUp';131072='TonerLow';262144='NoToner';524288='PagePunt';1048576='UserInterventionRequired';2097152='OutOfMemory';4194304='DoorOpen';8388608='ServerUnknown';16777216='PowerSave';33554432='ServerOffline';67108864='DriverUpdateNeeded'};$perr=@();$printers=@(Get-Printer -ErrorAction SilentlyContinue -ErrorVariable +perr|Sort-Object Name);if(-not $printers.Count -and $perr.Count){throw "Get-Printer failed: $([string]$perr[0])"};$total=$printers.Count;$rows=@();$len=0;$truncated=$false;foreach($printer in $printers){if($rows.Count -ge @LIM@){$truncated=$true;break};$name=Cap $printer.Name @NF@;$share=Cap $printer.ShareName @SF@;$driver=Cap $printer.DriverName @DF@;$portname=Cap $printer.PortName @PF@;$status=$null;if($null -ne $printer.PrinterStatus){$status=[int]$printer.PrinterStatus}else{try{$status=[int](Get-ItemProperty -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Control\Print\Printers\"+([string]$printer.Name)) -Name Status -ErrorAction Stop).Status}catch{$status=$null}};$state_text='Unknown';$state_flags=$null;if($null -ne $status){$state_flags=$status;$states=@($flags.Keys|Sort-Object|Where-Object{$status -band $_}|ForEach-Object{$flags[$_]});if($states.Count){$state_text=($states -join ', ')}else{$state_text='Normal'}};$ph=$null;$pnum=$null;try{$po=Get-PrinterPort -Name $printer.PortName -ErrorAction Stop;if($po){$ph=Cap $po.PrinterHostAddress @HF@;$pnum=[int]$po.PortNumber}}catch{};$row=[PSCustomObject]@{name=$name;share_name=$share;driver=$driver;port=$portname;port_host=$ph;port_number=$pnum;state=$state_text;state_flags=$state_flags;job_count=if($null -ne $printer.JobCount){[int]$printer.JobCount}else{$null}};$j=$row|ConvertTo-Json -Compress;if(($len+$j.Length+1+@ENV@) -gt @BUD@){$truncated=$true;break};$len=$len+$j.Length+1;$rows+=$row};[PSCustomObject]@{printers=$rows;count=$total;returned=$rows.Count;truncated=$truncated}|ConvertTo-Json -Compress -Depth 4"#;
+
+/// The command that lists the jobs of one printer (TR-REL-15).
+///
+/// The personal-data fields (`document_name`, `user`) are substituted as the
+/// placeholder `@PERSONAL@` only when the caller asks for them (Q-21): without
+/// the flag the script does not read `DocumentName` and `UserName` on the host,
+/// so the values never leave it. The submit time is an invariant ISO string, and
+/// the job state is the enum name as a string, so neither depends on the host
+/// locale. Rows are kept while their compressed JSON stays under `@BUD@`
+/// characters. A stopped Print Spooler, a missing PrintManagement module or an
+/// unknown printer gives a clear error. The name enters a single-quoted string
+/// ([`escape`]) at `@PRINTER@`.
+const PRINT_JOBS_SCRIPT: &str = r#"$ErrorActionPreference='Stop';if($null -eq (Get-Command Get-Printer -ErrorAction SilentlyContinue)){throw "PrintManagement module is not available"};$svc=Get-Service -Name Spooler -ErrorAction Stop;if($svc.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Running){throw "The Print Spooler service is not running: $($svc.Status)"};function Cap($s,$n){$s=[string]$s;if($s.Length -gt $n){$s.Substring(0,$n)}else{$s}};$printer='@PRINTER@';$perr=@();$names=@(Get-Printer -ErrorAction SilentlyContinue -ErrorVariable +perr|ForEach-Object{[string]$_.Name});if(-not $names.Count -and $perr.Count){throw "Get-Printer failed: $([string]$perr[0])"};if($names -notcontains $printer){throw "Printer not found: $printer"};$jerr=@();$jobs=@(Get-PrintJob -PrinterName $printer -ErrorAction SilentlyContinue -ErrorVariable +jerr|Sort-Object Id);if(-not $jobs.Count -and $jerr.Count){throw "Get-PrintJob failed: $([string]$jerr[0])"};$total=$jobs.Count;$rows=@();$len=0;$truncated=$false;foreach($job in $jobs){if($rows.Count -ge @LIM@){$truncated=$true;break};$row=[PSCustomObject]@{
+job_id=[int]$job.Id;
+@PERSONAL@
+state=[string]$job.JobStatus;size=[long]$job.Size;submitted=if($job.SubmittedTime -is [datetime]){$job.SubmittedTime.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ',[Globalization.CultureInfo]::InvariantCulture)}elseif($job.SubmittedTime){[string]$job.SubmittedTime}else{$null}};$j=$row|ConvertTo-Json -Compress;if(($len+$j.Length+1+@ENV@) -gt @BUD@){$truncated=$true;break};$len=$len+$j.Length+1;$rows+=$row};[PSCustomObject]@{printer=$printer;jobs=$rows;count=$total;returned=$rows.Count;truncated=$truncated}|ConvertTo-Json -Compress -Depth 4"#;
+
+/// The row cap on the printers in one answer (TR-REL-15).
+const PRINTER_LIMIT: usize = 200;
+/// The cap on the print jobs of one printer in one answer.
+const PRINT_JOB_LIMIT: usize = 200;
+/// The most characters of the JSON rows in one answer (TR-REL-15).
+///
+/// The script keeps rows while the running total of their compressed JSON,
+/// the separators and the envelope stays under this budget, so the answer fits
+/// `executor::MAX_OUTPUT_CHARS` however many rows the host has. PowerShell 5.1
+/// `ConvertTo-Json` escapes `'`, `<`, `>` and `&` as six characters, so the
+/// budget covers that worst case.
+const PRINT_OUTPUT_BUDGET_CHARS: usize = 50_000;
+/// Allowance in characters for the JSON envelope around the rows.
+const PRINT_ENVELOPE_CHARS: usize = 256;
+/// The most characters of a printer name in the answer. The host caps the value,
+/// so a long name cannot push the JSON over the executor output limit.
+const PRINTER_NAME_CAP: usize = 128;
+/// The most characters of the share name, the driver and the port in the answer.
+const PRINTER_FIELD_CAP: usize = 64;
+/// The most characters of a port host address in the answer.
+const PORT_HOST_CAP: usize = 45;
+/// The most characters of a job document name in the answer.
+const DOCUMENT_NAME_CAP: usize = 128;
+/// The most characters of a job owner in the answer.
+const JOB_USER_CAP: usize = 64;
+/// Sanity upper bound in characters for a printer name (TR-REL-15).
+///
+/// A Windows printer name is at most about 220 characters; the bound only stops
+/// an absurd input before the command is built. Even a worst-case all-quote name
+/// of this length fits one WinRS command line.
+pub const PRINT_JOB_PRINTER_MAX_CHARS: usize = 512;
+
+/// The printers on the host, with the state as decoded flags and the job count (TR-REL-15).
+///
+/// The state is the decoded printer-status flag mask, for example
+/// `Offline, IOActive`, or `Unknown` when the host did not report it. The share
+/// name, the driver, the port, the port host and number come from `Get-Printer`
+/// and `Get-PrinterPort`; the job count comes from `Get-Printer`. The answer is
+/// cut to the row cap or the size budget, and `truncated` shows the cut. A stopped
+/// Print Spooler or a missing PrintManagement module gives a clear error, not an
+/// empty list.
+#[must_use]
+pub fn get_printers() -> String {
+    PRINTERS_SCRIPT
+        .replace("@NF@", &PRINTER_NAME_CAP.to_string())
+        .replace("@SF@", &PRINTER_FIELD_CAP.to_string())
+        .replace("@DF@", &PRINTER_FIELD_CAP.to_string())
+        .replace("@PF@", &PRINTER_FIELD_CAP.to_string())
+        .replace("@HF@", &PORT_HOST_CAP.to_string())
+        .replace("@ENV@", &PRINT_ENVELOPE_CHARS.to_string())
+        .replace("@BUD@", &PRINT_OUTPUT_BUDGET_CHARS.to_string())
+        .replace("@LIM@", &PRINTER_LIMIT.to_string())
+}
+
+/// The print jobs of one printer, with the personal data hidden by default (TR-REL-15, Q-21).
+///
+/// The document name and the owner are personal data. The script selects them on
+/// the host only with `include_personal_data`; without the flag it does not read
+/// the fields at all, so they never leave the host. The answer is cut to the row
+/// cap or the size budget, and `truncated` shows the cut. A stopped Print Spooler,
+/// a missing PrintManagement module or an unknown printer gives a clear error.
+///
+/// # Errors
+///
+/// A printer name above [`PRINT_JOB_PRINTER_MAX_CHARS`], or a command that does
+/// not fit one WinRS command line. Both refusals name the length and the limit.
+pub fn get_print_jobs(printer: &str, include_personal_data: bool) -> Result<String, String> {
+    let chars = printer.chars().count();
+    if chars > PRINT_JOB_PRINTER_MAX_CHARS {
+        return Err(format!(
+            "printer is {chars} characters; the limit is {PRINT_JOB_PRINTER_MAX_CHARS}"
+        ));
+    }
+    let personal = if include_personal_data {
+        format!(
+            "document_name=Cap $job.DocumentName {};user=Cap $job.UserName {}",
+            DOCUMENT_NAME_CAP, JOB_USER_CAP
+        )
+    } else {
+        String::new()
+    };
+    // The name is substituted last, so a `@…@` sequence inside it cannot match a
+    // later placeholder.
+    let command = PRINT_JOBS_SCRIPT
+        .replace("@ENV@", &PRINT_ENVELOPE_CHARS.to_string())
+        .replace("@BUD@", &PRINT_OUTPUT_BUDGET_CHARS.to_string())
+        .replace("@LIM@", &PRINT_JOB_LIMIT.to_string())
+        .replace("@PERSONAL@", &personal)
+        .replace("@PRINTER@", &escape(printer));
+    if !fits_command_line(&command) {
+        return Err(format!(
+            "printer is {chars} characters; the command does not fit the WinRS command line of \
+             {WINRS_COMMAND_LINE_LIMIT} characters; shorten the printer name"
+        ));
+    }
+    Ok(command)
+}
+
 #[must_use]
 pub fn json_str(value: &Value, key: &str) -> String {
     value
@@ -2195,6 +2323,426 @@ mod tests {
         );
     }
 
+    /// AC-REL15-1: the recorded command decodes the printer-status flag mask with
+    /// a fixed English table, so the state does not depend on the host locale.
+    #[test]
+    fn get_printers_decodes_the_state_flags() {
+        let cmd = get_printers();
+        for (bit, name) in [
+            (1, "Paused"),
+            (128, "Offline"),
+            (256, "IOActive"),
+            (1024, "Printing"),
+            (33554432, "ServerOffline"),
+            (67108864, "DriverUpdateNeeded"),
+        ] {
+            assert!(
+                cmd.contains(&format!("{bit}='{name}'")),
+                "missing flag {name}: {cmd}"
+            );
+        }
+        assert!(
+            cmd.contains("$states=@($flags.Keys|Sort-Object|Where-Object{$status -band $_}|ForEach-Object{$flags[$_]})"),
+            "the flags must be decoded by the bit mask: {cmd}"
+        );
+        assert!(cmd.contains("$state_text=($states -join ', ')"), "{cmd}");
+        assert!(
+            cmd.contains("$state_flags=$null;if($null -ne $status){$state_flags=$status;"),
+            "an unread state must stay null, not 0: {cmd}"
+        );
+        assert!(
+            !cmd.contains("else{0}"),
+            "a fallback must not make an unread value look healthy: {cmd}"
+        );
+    }
+
+    /// The state must not look healthy when the host did not report it:
+    /// `Get-Printer`'s `PrinterStatus` is the primary source, the registry
+    /// `Status` value the fallback, and an unread state stays `Unknown` with a
+    /// null flag mask (TR-REL-15).
+    #[test]
+    fn get_printers_treats_unread_state_as_unknown() {
+        let cmd = get_printers();
+        assert!(
+            cmd.contains(
+                "if($null -ne $printer.PrinterStatus){$status=[int]$printer.PrinterStatus}"
+            ),
+            "PrinterStatus must be the primary source: {cmd}"
+        );
+        assert!(
+            cmd.contains("-Name Status -ErrorAction Stop).Status"),
+            "the registry Status value must stay the fallback: {cmd}"
+        );
+        assert!(cmd.contains("$state_text='Unknown'"), "{cmd}");
+        assert!(
+            cmd.contains("state=$state_text;state_flags=$state_flags"),
+            "{cmd}"
+        );
+    }
+
+    /// AC-REL15-1: the result holds the share name, the driver, the port, the port
+    /// host and number and the job count (TR-REL-15).
+    #[test]
+    fn get_printers_returns_the_required_fields() {
+        let cmd = get_printers();
+        assert!(cmd.contains("share_name=$share"), "{cmd}");
+        assert!(cmd.contains("driver=$driver"), "{cmd}");
+        assert!(cmd.contains("port=$portname"), "{cmd}");
+        assert!(cmd.contains("port_host=$ph"), "{cmd}");
+        assert!(cmd.contains("port_number=$pnum"), "{cmd}");
+        assert!(
+            cmd.contains(
+                "job_count=if($null -ne $printer.JobCount){[int]$printer.JobCount}else{$null}"
+            ),
+            "the job count must come from Get-Printer with no silent 0: {cmd}"
+        );
+        assert!(
+            cmd.contains("Get-PrinterPort -Name $printer.PortName"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains("Get-Printer -ErrorAction SilentlyContinue"),
+            "{cmd}"
+        );
+        assert!(
+            !cmd.contains("Get-PrintJob"),
+            "the job count no longer needs a per-printer job query: {cmd}"
+        );
+    }
+
+    /// A host without the PrintManagement module gives a clear error before any
+    /// other host call (TR-REL-15).
+    #[test]
+    fn print_generators_report_a_missing_print_module() {
+        for cmd in [
+            get_printers(),
+            get_print_jobs("HQ-Printer", false).expect("valid"),
+        ] {
+            assert!(
+                cmd.contains("if($null -eq (Get-Command Get-Printer -ErrorAction SilentlyContinue)){throw \"PrintManagement module is not available\"}"),
+                "{cmd}"
+            );
+        }
+    }
+
+    /// A stopped Print Spooler gives a clear error, not an empty list. The branch
+    /// is on the service status enum, not on localized text (AGENTS.md §6).
+    #[test]
+    fn get_printers_gives_a_clear_error_when_the_spooler_is_stopped() {
+        let cmd = get_printers();
+        assert!(
+            cmd.contains(
+                "$svc.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Running"
+            ),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains("throw \"The Print Spooler service is not running: $($svc.Status)\""),
+            "{cmd}"
+        );
+    }
+
+    /// A `Get-Printer` that fails while the list is empty must abort with a clear
+    /// error, not look like an empty list (TR-REL-15).
+    #[test]
+    fn get_printers_throws_when_get_printer_fails() {
+        let cmd = get_printers();
+        assert!(cmd.contains("-ErrorVariable +perr"), "{cmd}");
+        assert!(
+            cmd.contains(
+                "if(-not $printers.Count -and $perr.Count){throw \"Get-Printer failed: $([string]$perr[0])\"}"
+            ),
+            "{cmd}"
+        );
+    }
+
+    /// The fixed printer list script always fits one WinRS command line (TR-REL-15).
+    #[test]
+    fn get_printers_command_fits_the_winrs_line() {
+        let cmd = get_printers();
+        assert!(
+            fits_command_line(&cmd),
+            "chars: {}",
+            command_line_chars(&cmd)
+        );
+    }
+
+    /// An empty printer list is an empty array, not an error, and the row cap and
+    /// the size budget both carry the `truncated` flag (TR-REL-15).
+    #[test]
+    fn get_printers_caps_the_rows_and_returns_an_empty_array() {
+        let cmd = get_printers();
+        assert!(cmd.contains("$rows=@()"), "{cmd}");
+        assert!(
+            cmd.contains(&format!(
+                "if($rows.Count -ge {PRINTER_LIMIT}){{$truncated=$true;break}}"
+            )),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains("count=$total;returned=$rows.Count;truncated=$truncated"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("printers=$rows"), "{cmd}");
+        assert!(cmd.contains("$total=$printers.Count"), "{cmd}");
+    }
+
+    /// The answer is cut on the host by a size budget, independent of the row cap:
+    /// each row is serialized with `ConvertTo-Json -Compress`, rows are kept while
+    /// the running total, the separators and the envelope stay under the budget,
+    /// and `count`/`returned`/`truncated` report the cut (TR-REL-15).
+    #[test]
+    fn print_generators_cut_by_the_size_budget() {
+        for cmd in [
+            get_printers(),
+            get_print_jobs("HQ-Printer", true).expect("valid"),
+        ] {
+            assert!(
+                cmd.contains("$j=$row|ConvertTo-Json -Compress"),
+                "each row must be serialized to measure it: {cmd}"
+            );
+            assert!(
+                cmd.contains(&format!(
+                    "if(($len+$j.Length+1+{PRINT_ENVELOPE_CHARS}) -gt {PRINT_OUTPUT_BUDGET_CHARS}){{$truncated=$true;break}}"
+                )),
+                "the size budget must stop the rows: {cmd}"
+            );
+            assert!(cmd.contains("$len=$len+$j.Length+1"), "{cmd}");
+            assert!(
+                cmd.contains("returned=$rows.Count"),
+                "the kept row count must be reported: {cmd}"
+            );
+        }
+        let jobs = get_print_jobs("HQ-Printer", false).expect("valid");
+        assert!(jobs.contains("$total=$jobs.Count"), "{jobs}");
+    }
+
+    /// AC-REL15-2, Q-21: without `include_personal_data` the script does not read
+    /// the document name and the owner on the host at all, so the values never
+    /// leave it. With the flag both fields appear.
+    #[test]
+    fn get_print_jobs_hides_personal_data_by_default() {
+        let hidden = get_print_jobs("HQ-Printer", false).expect("valid");
+        assert!(
+            !hidden.contains("DocumentName"),
+            "the document name must not be selected: {hidden}"
+        );
+        assert!(
+            !hidden.contains("UserName"),
+            "the owner must not be selected: {hidden}"
+        );
+        let shown = get_print_jobs("HQ-Printer", true).expect("valid");
+        assert!(
+            shown.contains(&format!(
+                "document_name=Cap $job.DocumentName {DOCUMENT_NAME_CAP}"
+            )),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(&format!("user=Cap $job.UserName {JOB_USER_CAP}")),
+            "{shown}"
+        );
+    }
+
+    /// An unknown printer gives a clear error, not an empty job list (TR-REL-15).
+    #[test]
+    fn get_print_jobs_reports_an_unknown_printer() {
+        let cmd = get_print_jobs("HQ-Printer", false).expect("valid");
+        assert!(cmd.contains("$names -notcontains $printer"), "{cmd}");
+        assert!(
+            cmd.contains("throw \"Printer not found: $printer\""),
+            "{cmd}"
+        );
+    }
+
+    /// A `Get-Printer` that fails while the name list is empty must abort with
+    /// `Get-Printer failed`, not with `Printer not found` (TR-REL-15).
+    #[test]
+    fn get_print_jobs_throws_when_get_printer_fails() {
+        let cmd = get_print_jobs("HQ-Printer", false).expect("valid");
+        assert!(
+            cmd.contains("-ErrorVariable +perr|ForEach-Object{[string]$_.Name}"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains(
+                "if(-not $names.Count -and $perr.Count){throw \"Get-Printer failed: $([string]$perr[0])\"}"
+            ),
+            "{cmd}"
+        );
+    }
+
+    /// A stopped Print Spooler gives a clear error, not an empty job list
+    /// (TR-REL-15).
+    #[test]
+    fn get_print_jobs_gives_a_clear_error_when_the_spooler_is_stopped() {
+        let cmd = get_print_jobs("HQ-Printer", false).expect("valid");
+        assert!(
+            cmd.contains("throw \"The Print Spooler service is not running: $($svc.Status)\""),
+            "{cmd}"
+        );
+    }
+
+    /// No print job is an empty array, not an error, and the cap is carried by
+    /// the `truncated` flag (TR-REL-15).
+    #[test]
+    fn get_print_jobs_caps_the_rows_and_returns_an_empty_array() {
+        let cmd = get_print_jobs("HQ-Printer", false).expect("valid");
+        assert!(cmd.contains("$rows=@()"), "{cmd}");
+        assert!(
+            cmd.contains(&format!(
+                "if($rows.Count -ge {PRINT_JOB_LIMIT}){{$truncated=$true;break}}"
+            )),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains("count=$total;returned=$rows.Count;truncated=$truncated"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("jobs=$rows"), "{cmd}");
+        assert!(cmd.contains("$total=$jobs.Count"), "{cmd}");
+    }
+
+    /// The submit time is an invariant ISO UTC string and the job state is the
+    /// enum name as a string, so neither depends on the host locale (TR-REL-15).
+    #[test]
+    fn get_print_jobs_uses_locale_independent_fields() {
+        let cmd = get_print_jobs("HQ-Printer", false).expect("valid");
+        assert!(cmd.contains("[string]$job.JobStatus"), "{cmd}");
+        assert!(
+            cmd.contains("$job.SubmittedTime.ToUniversalTime()"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains(
+                ".ToString('yyyy-MM-ddTHH:mm:ssZ',[Globalization.CultureInfo]::InvariantCulture)"
+            ),
+            "{cmd}"
+        );
+        assert!(cmd.contains("size=[long]$job.Size"), "{cmd}");
+    }
+
+    /// TR-SEC-12: the printer name enters a single-quoted string, so every
+    /// single-quote form is doubled (AC-OBS02-1).
+    #[test]
+    fn get_print_jobs_escapes_the_printer_name() {
+        for quote in SINGLE_QUOTES {
+            let name = format!("HQ{quote}Printer");
+            let cmd = get_print_jobs(&name, false).expect("valid");
+            let doubled = format!("HQ{quote}{quote}Printer");
+            assert!(cmd.contains(&doubled), "the quote must be doubled: {cmd}");
+        }
+    }
+
+    /// A printer name above the sanity bound is refused before any host call, and
+    /// the refusal names the length and the limit (TR-REL-15).
+    #[test]
+    fn get_print_jobs_refuses_a_name_above_the_sanity_bound() {
+        let name = "a".repeat(PRINT_JOB_PRINTER_MAX_CHARS + 1);
+        let error = get_print_jobs(&name, false).expect_err("above the sanity bound");
+        assert!(
+            error.contains(&(PRINT_JOB_PRINTER_MAX_CHARS + 1).to_string()),
+            "{error}"
+        );
+        assert!(
+            error.contains(&PRINT_JOB_PRINTER_MAX_CHARS.to_string()),
+            "{error}"
+        );
+    }
+
+    /// Worst case for the WinRS command line: a name whose every character is a
+    /// single quote, so the escape doubles it. The maximum name still fits one
+    /// command line (TR-REL-15).
+    #[test]
+    fn get_print_jobs_command_fits_the_winrs_line_for_the_worst_case() {
+        let name = "'".repeat(PRINT_JOB_PRINTER_MAX_CHARS);
+        let cmd = get_print_jobs(&name, true).expect("the worst case must fit one command line");
+        assert!(
+            fits_command_line(&cmd),
+            "chars: {}",
+            command_line_chars(&cmd)
+        );
+        assert!(
+            command_line_chars(&cmd) < WINRS_COMMAND_LINE_LIMIT,
+            "chars: {}",
+            command_line_chars(&cmd)
+        );
+    }
+
+    /// The error text must keep free of an unbraced `$name:` inside a string: the
+    /// registry path and the messages are safe (TR-REL-15).
+    #[test]
+    fn print_generators_have_no_scope_qualified_variable_in_a_string() {
+        assert_eq!(unbraced_variable_colon(&get_printers()), None);
+        assert_eq!(
+            unbraced_variable_colon(&get_print_jobs("HQ-Printer", true).expect("valid")),
+            None
+        );
+    }
+
+    /// The number of characters PowerShell 5.1 `ConvertTo-Json` writes for a value.
+    ///
+    /// 5.1 escapes `'`, `<`, `>` and `&` as `\uXXXX` (six characters, unlike
+    /// `serde_json`), so the JSON on the wire is longer than the bytes that
+    /// `serde_json` produces.
+    fn ps51_json_chars(value: &Value) -> usize {
+        let text = serde_json::to_string(value).expect("serialize");
+        let escapable = text.matches(&['\'', '<', '>', '&'][..]).count();
+        text.len() + 5 * escapable
+    }
+
+    /// The size budget makes the bound independent of the row count: the script
+    /// keeps rows only while their compressed JSON, the separators and the
+    /// envelope stay under the budget, so the answer always fits the executor
+    /// output limit (TR-REL-15). The worst-case single row must also fit the row
+    /// budget, or the tool would return nothing.
+    #[test]
+    fn print_results_fit_the_executor_cap() {
+        assert!(
+            std::hint::black_box(PRINT_OUTPUT_BUDGET_CHARS + PRINT_ENVELOPE_CHARS)
+                <= crate::executor::MAX_OUTPUT_CHARS,
+            "the budget plus the envelope must fit the {} executor limit",
+            crate::executor::MAX_OUTPUT_CHARS
+        );
+
+        let row_budget = PRINT_OUTPUT_BUDGET_CHARS - PRINT_ENVELOPE_CHARS;
+        let state_all = "Paused, Error, PendingDeletion, PaperJam, PaperOut, ManualFeed, \
+             PaperProblem, Offline, IOActive, Busy, Printing, OutputBinFull, NotAvailable, \
+             Waiting, Processing, Initializing, WarmingUp, TonerLow, NoToner, PagePunt, \
+             UserInterventionRequired, OutOfMemory, DoorOpen, ServerUnknown, PowerSave, \
+             ServerOffline, DriverUpdateNeeded";
+        let printer = serde_json::json!({
+            "name": "'".repeat(PRINTER_NAME_CAP),
+            "share_name": "'".repeat(PRINTER_FIELD_CAP),
+            "driver": "'".repeat(PRINTER_FIELD_CAP),
+            "port": "'".repeat(PRINTER_FIELD_CAP),
+            "port_host": "'".repeat(PORT_HOST_CAP),
+            "port_number": 65535,
+            "state": state_all,
+            "state_flags": 0x07FF_FFFF_i64,
+            "job_count": 9_999_999_i64,
+        });
+        assert!(
+            ps51_json_chars(&printer) <= row_budget,
+            "a worst-case printer row is {} characters, over the {row_budget} row budget",
+            ps51_json_chars(&printer)
+        );
+
+        let job = serde_json::json!({
+            "job_id": 9999999,
+            "document_name": "'".repeat(DOCUMENT_NAME_CAP),
+            "user": "'".repeat(JOB_USER_CAP),
+            "state": "UserInterventionRequired",
+            "size": 9_999_999_999_i64,
+            "submitted": "2099-12-31T23:59:59Z",
+        });
+        assert!(
+            ps51_json_chars(&job) <= row_budget,
+            "a worst-case job row is {} characters, over the {row_budget} row budget",
+            ps51_json_chars(&job)
+        );
+    }
+
     #[test]
     fn compare_files_does_not_interpolate_paths_in_double_quotes() {
         // Injection: a path in double quotes expands $(...) in PowerShell.
@@ -2542,6 +3090,9 @@ mod tests {
             get_tcp_connections("established", 1, 0, text, false).expect("valid"),
             get_tcp_connections("listen", 0, 0, text, true).expect("valid"),
             get_open_handles(text).expect("valid"),
+            get_printers(),
+            get_print_jobs(text, false).expect("valid"),
+            get_print_jobs(text, true).expect("valid"),
             resolve_dns_name(text, "A", text).expect("valid"),
             get_perf_snapshot(2, text),
             get_scheduled_tasks(text, false),

@@ -3,7 +3,7 @@ title: Tools
 description: The read-only tools and the modifying tools of winrig, with the switches that enable the modifying tools.
 ---
 
-The binary declares 39 tools, plus `write_file` when the operator enables it. The read-only tools need no confirmation. The modifying tools require the explicit confirmation of the operator (DR-5).
+The binary declares 41 tools, plus `write_file` when the operator enables it. The read-only tools need no confirmation. The modifying tools require the explicit confirmation of the operator (DR-5).
 
 ## Session
 
@@ -35,6 +35,8 @@ The binary declares 39 tools, plus `write_file` when the operator enables it. Th
 | `get_services` | A summary of the services, or the full details of each service in JSON |
 | `list_processes` | The processes with a sort by CPU, memory or handles |
 | `get_open_handles` | The processes that hold a file open, with the PID, the name and the start time. It uses the Restart Manager, so no Sysinternals `handle.exe` is needed |
+| `get_printers` | The printers with the share name, the driver, the port, the port host and number, the state as decoded flags and the job count |
+| `get_print_jobs` | The print jobs of one printer. The document name and the owner stay hidden unless `include_personal_data` is true |
 | `get_system_info` | The OS version, uptime, RAM, CPU count, domain, time zone |
 | `get_disk_space` | The free space on all fixed disks |
 | `get_perf_snapshot` | A snapshot of CPU, memory, disk I/O and network, independent of the locale |

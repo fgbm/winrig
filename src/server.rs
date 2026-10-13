@@ -729,6 +729,19 @@ struct OpenHandlesParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct PrintJobsParams {
+    #[schemars(description = "Session ID that connect returns.")]
+    session_id: String,
+    #[schemars(description = "Exact name of the printer, not the share name.")]
+    printer: String,
+    #[schemars(
+        description = "Return the document name and the owner of each job. The default is false, and the tool hides the personal data."
+    )]
+    #[serde(default)]
+    include_personal_data: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct DnsCacheParams {
     #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
@@ -1475,6 +1488,45 @@ impl WinrigServer {
     }
 
     #[tool(
+        name = "get_printers",
+        description = "List the printers on the host with the share name, the driver, the port, the port host and number, the state as decoded flags and the job count. The result is cut to fit the response size; truncated shows a cut. Read-only."
+    )]
+    async fn get_printers(
+        &self,
+        Parameters(params): Parameters<SessionIdParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let identity = self.identity(&ctx)?;
+        Ok(self
+            .run(
+                &identity,
+                &params.session_id,
+                &ps::get_printers(),
+                "get_printers",
+            )
+            .await)
+    }
+
+    #[tool(
+        name = "get_print_jobs",
+        description = "List the print jobs of one printer with the job id, the state, the size and the submit time. The document name and the owner are personal data and stay hidden unless include_personal_data is true. The result is cut to fit the response size; truncated shows a cut. Read-only."
+    )]
+    async fn get_print_jobs(
+        &self,
+        Parameters(params): Parameters<PrintJobsParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let identity = self.identity(&ctx)?;
+        let command = match ps::get_print_jobs(&params.printer, params.include_personal_data) {
+            Ok(command) => command,
+            Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
+        };
+        Ok(self
+            .run(&identity, &params.session_id, &command, "get_print_jobs")
+            .await)
+    }
+
+    #[tool(
         name = "get_dns_cache",
         description = "Read the local DNS client cache as tabular text: record name, type, TTL and resolved data."
     )]
@@ -2174,7 +2226,7 @@ mod tests {
             !names.iter().any(|name| name == "write_file"),
             "write_file must not be advertised while disabled"
         );
-        assert_eq!(names.len(), 39, "expected 39 tools without write_file");
+        assert_eq!(names.len(), 41, "expected 41 tools without write_file");
 
         let on = server_with(&[("WINRIG_ALLOW_FILE_WRITE", "true")]);
         let names: Vec<String> = on
@@ -2184,7 +2236,7 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect();
         assert!(names.iter().any(|name| name == "write_file"));
-        assert_eq!(names.len(), 40, "expected 40 tools with write_file");
+        assert_eq!(names.len(), 42, "expected 42 tools with write_file");
     }
 
     /// TR-FS-01: a removed route is not only hidden from the list but also uncallable.
@@ -2235,16 +2287,18 @@ mod tests {
         assert!(tools.iter().any(|tool| tool.name == "connect"));
         assert!(tools.iter().any(|tool| tool.name == "get_system_info"));
         assert!(tools.iter().any(|tool| tool.name == "get_open_handles"));
+        assert!(tools.iter().any(|tool| tool.name == "get_printers"));
+        assert!(tools.iter().any(|tool| tool.name == "get_print_jobs"));
         assert!(tools.iter().any(|tool| tool.name == "delete_directory"));
         // An exact count: "at least 30" would catch neither a lost tool nor a
         // duplicate. These are all declared tools; the configuration decides
         // how many the agent sees (TR-FS-01), and
         // `write_file_is_absent_until_the_operator_enables_it` checks that.
-        assert_eq!(tools.len(), 40, "expected 40 declared tools");
+        assert_eq!(tools.len(), 42, "expected 42 declared tools");
         let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 40, "tool names must be unique");
+        assert_eq!(names.len(), 42, "tool names must be unique");
     }
 
     #[test]

@@ -74,6 +74,7 @@ A release goes out under the tag `vX.Y.Z` on `main`. The version in `Cargo.toml`
 - `AGENTS.md` — the canon of the repository (this file). `CONTRIBUTING.md` — the same for an external participant, in short.
 - `SECURITY.md` — the channel for the private disclosure of vulnerabilities; a report about them does not go to a public issue.
 - `CHANGELOG.md` — the history of changes by Keep a Changelog; the entry under a tag is the source of the release text.
+- `scripts/check-comments.sh` — the comment check that CI runs (section 10).
 
 ## 9. Document formatting
 
@@ -82,3 +83,15 @@ A release goes out under the tag `vX.Y.Z` on `main`. The version in `Cargo.toml`
 - Lines that carry meaning per line stay as they are: headings, tables, code blocks in a fence, horizontal rules, empty separators.
 - Lines inside a code block do not wrap and do not unwrap.
 - Multi-line paragraphs and "shifted" continuations of a list item are not permitted; unwrap the existing ones.
+
+## 10. Code rules
+
+- A comment explains only what the code cannot say. It gives a non-obvious reason, a security invariant, or a constraint with its DR, TR, AC or ADR ID. It also gives a unit, a format or a range.
+- Do not restate a name or the code in a comment. Do not narrate steps. Do not refer to a review finding, to a slice of the change history, or to the change history.
+- Code comments are plain short English, not STE. One idea per sentence; pronouns are permitted.
+- A doc comment is for an item whose contract is not clear from its name and signature. One sentence is enough, unless the contract is subtle. The crate has no public library API for third parties; `pub` items exist for the binary and the integration tests.
+- The first line of a doc comment never restates the item name. Do not add a doc comment to a field or a function whose name says everything.
+- User-facing text (an MCP tool description, a tool parameter description, CLI help) lives only in an explicit attribute: `#[tool(description)]`, `#[schemars(description)]`, `#[command(about)]` or `#[arg(help)]`. It never lives in `///`. It obeys `docs/style/ste-en.md`.
+- A parameter description is only where it adds information: a unit, a format, an allowed value, a default or an invariant.
+- `scripts/check-comments.sh` runs in CI.
+- `comment-check: allow` is rare, and each use has a reason on the same line.

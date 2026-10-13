@@ -22,16 +22,19 @@ use crate::executor::{
 pub const DEFAULT_HTTP_PORT: u16 = 5985;
 pub const DEFAULT_HTTPS_PORT: u16 = 5986;
 
-/// Forces UTF-8 in redirected PowerShell output.
+/// Prefix of every command sent to the host.
 ///
 /// `winrm-rs` sets `WINRS_CODEPAGE=65001` at the cmd shell level, but `powershell.exe`
 /// uses its own `[Console]::OutputEncoding` for redirected output. On a localized Windows
 /// it does not hold the system language, and PowerShell replaces unrepresentable
 /// characters with `?` before it sends the bytes, so no decoding on this side can bring
 /// them back. The try/catch wrapper is for a host without a console (port of
-/// `UTF8_PREAMBLE` from the Python version).
-pub const UTF8_PREAMBLE: &str = "try { [Console]::OutputEncoding = [Text.Encoding]::UTF8; \
-     $OutputEncoding = [Text.Encoding]::UTF8 } catch { }; ";
+/// `UTF8_PREAMBLE` from the Python version). `$ProgressPreference` stops the progress
+/// stream, which otherwise writes a localized CLIXML record to stderr on the first use
+/// of a module (TR-REL-10).
+pub const PREAMBLE: &str = "try { [Console]::OutputEncoding = [Text.Encoding]::UTF8; \
+     $OutputEncoding = [Text.Encoding]::UTF8 } catch { }; \
+     $ProgressPreference = 'SilentlyContinue'; ";
 
 /// Caller identity for one request (DR-2).
 #[derive(Debug, Clone)]
@@ -485,7 +488,7 @@ impl SessionRegistry {
              $($os.LastBootUpTime.ToString('yyyy-MM-dd HH:mm:ss'))\"";
         match self
             .transport
-            .run_powershell(&target, &format!("{UTF8_PREAMBLE}{probe}"))
+            .run_powershell(&target, &format!("{PREAMBLE}{probe}"))
             .await
         {
             Ok(output) if output.exit_code == 0 => {
@@ -554,7 +557,7 @@ impl SessionRegistry {
                 Value::Object(info)
             }
             Ok(output) => {
-                let stderr = strip_clixml(&String::from_utf8_lossy(&output.stderr));
+                let stderr = strip_clixml(&String::from_utf8_lossy(&output.stderr), true);
                 // DR-4: the host error text can contain the password. The audit is redacted
                 // unconditionally, the reply to the agent by the threshold.
                 let secret = [password.expose_secret().to_owned()];
@@ -724,16 +727,50 @@ impl SessionRegistry {
             format!(" [{tool_name}]")
         };
 
+        // The preamble (TR-REL-10) counts against the WinRS command line, so a
+        // command that no longer fits is refused here, before the transport.
+        let command_chars = crate::ps::command_line_chars(command);
+        if command_chars > crate::ps::WINRS_COMMAND_LINE_LIMIT {
+            self.audit(
+                "COMMAND REFUSED",
+                &[
+                    ("user", username.to_owned()),
+                    ("session", session_id.to_owned()),
+                    (
+                        "tool",
+                        if tool_name.is_empty() {
+                            "(direct)".to_owned()
+                        } else {
+                            tool_name.to_owned()
+                        },
+                    ),
+                    ("chars", command_chars.to_string()),
+                    ("limit", crate::ps::WINRS_COMMAND_LINE_LIMIT.to_string()),
+                ],
+                "",
+            );
+            return json!({
+                "error": format!(
+                    "command is {command_chars} characters; the WinRS command line holds \
+                     {} characters",
+                    crate::ps::WINRS_COMMAND_LINE_LIMIT
+                )
+            });
+        }
+
         // The preamble is added to the execution only; the audit keeps the command the tool
         // requested.
         match self
             .transport
-            .run_powershell(&target, &format!("{UTF8_PREAMBLE}{command}"))
+            .run_powershell(&target, &format!("{PREAMBLE}{command}"))
             .await
         {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-                let stderr = strip_clixml(&String::from_utf8_lossy(&output.stderr));
+                let stderr = strip_clixml(
+                    &String::from_utf8_lossy(&output.stderr),
+                    !redactions.is_empty(),
+                );
                 let truncated_stdout = truncate(&stdout, crate::executor::MAX_OUTPUT_CHARS);
                 let body = command_audit_body(
                     command,
@@ -1017,17 +1054,171 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn strip_clixml(stderr: &str) -> String {
-    // PowerShell packs progress into CLIXML; cut out the `<Objs>...</Objs>` block.
-    let trimmed = stderr.trim();
-    if let Some(start) = trimmed.find("#< CLIXML")
-        && let Some(end) = trimmed[start..].find("</Objs>")
-    {
-        let mut cleaned = String::from(&trimmed[..start]);
-        cleaned.push_str(&trimmed[start + end + "</Objs>".len()..]);
-        return cleaned.trim().to_owned();
+/// Removes the CLIXML envelope that PowerShell writes to stderr (TR-REL-10).
+///
+/// The stream records inside the envelope carry the reason a command failed or
+/// misbehaved, so their text stays. The progress records, the envelope and the
+/// position lines are noise. PowerShell escapes a stream record as
+/// `<S S="Error">text</S>`, not as an object. `unwrap` joins the lines of a
+/// record, so a secret that a host buffer split across lines stays whole for the
+/// redaction (DR-4).
+fn strip_clixml(stderr: &str, unwrap: bool) -> String {
+    strip_clixml_envelopes(&remove_progress_objects(stderr), unwrap)
+}
+
+/// Drops every `<Obj S="progress" …>…</Obj>` object.
+fn remove_progress_objects(stderr: &str) -> String {
+    const PROGRESS_OBJ: &str = "<Obj S=\"progress\"";
+    let mut cleaned = String::with_capacity(stderr.len());
+    let mut rest = stderr;
+    while let Some(start) = rest.find(PROGRESS_OBJ) {
+        cleaned.push_str(&rest[..start]);
+        // A progress object nests elements but no other `<Obj>`, so the next
+        // `</Obj>` closes it.
+        match rest[start..].find("</Obj>") {
+            Some(end) => rest = &rest[start + end + "</Obj>".len()..],
+            None => {
+                // Unclosed: the end is unknown, so keep the tail as it is.
+                cleaned.push_str(&rest[start..]);
+                rest = "";
+                break;
+            }
+        }
     }
-    trimmed.to_owned()
+    cleaned.push_str(rest);
+    cleaned
+}
+
+/// Replaces every `#< CLIXML … </Objs>` envelope with its stream text.
+fn strip_clixml_envelopes(input: &str, unwrap: bool) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    loop {
+        let Some(marker) = rest.find("#< CLIXML") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..marker]);
+        let Some(close) = rest[marker..].find("</Objs>") else {
+            // No closing tag: the text stays as it is.
+            out.push_str(&rest[marker..]);
+            break;
+        };
+        let body_end = marker + close + "</Objs>".len();
+        let text = clixml_stream_text(&rest[marker..body_end], unwrap);
+        if !out.is_empty() && !out.ends_with('\n') && !text.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&text);
+        rest = &rest[body_end..];
+    }
+    out.trim().to_owned()
+}
+
+/// The plain text of the `<S S="...">` stream records inside a CLIXML envelope.
+///
+/// The newline that ends each record stays, so records concatenate without a
+/// blank line. A position line goes, because a window of our one-line script can
+/// hold a fragment of a secret (DR-4). With `unwrap` a record's lines join, so a
+/// secret split by a wrapped line is still one string.
+fn clixml_stream_text(body: &str, unwrap: bool) -> String {
+    let mut out = String::new();
+    let mut rest = body;
+    while let Some(start) = rest.find("<S S=\"") {
+        let Some(open) = rest[start..].find('>') else {
+            break;
+        };
+        if rest[start..start + open + 1].ends_with("/>") {
+            // A self-closing record carries no text; do not eat the next one.
+            rest = &rest[start + open + 1..];
+            continue;
+        }
+        let text_start = start + open + 1;
+        let Some(close) = rest[text_start..].find("</S>") else {
+            break;
+        };
+        let raw = decode_clixml_text(&rest[text_start..text_start + close]);
+        let text = drop_position_lines(&raw.replace("\r\n", "\n"), unwrap);
+        if unwrap && !out.is_empty() && !text.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&text);
+        rest = &rest[text_start + close + "</S>".len()..];
+    }
+    out.trim_end_matches('\n').to_owned()
+}
+
+/// Removes the `At …` header, the `+ …` script window and the `+ ~~~` underline.
+///
+/// Those lines carry a window of our one-line script, which can hold a fragment
+/// of a secret (DR-4). The `+ CategoryInfo` and `+ FullyQualifiedErrorId` lines
+/// carry no script text and stay. With `unwrap` the kept lines join without a
+/// separator, so a secret that a host buffer split across lines is matched.
+fn drop_position_lines(text: &str, unwrap: bool) -> String {
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| !is_position_line(line))
+        .collect();
+    if unwrap {
+        return kept.join("");
+    }
+    let mut out = kept.join("\n");
+    // `str::lines` drops the trailing newline; restore it so the next record
+    // abuts the way PowerShell wrote it.
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// True for a line that carries a window of the script rather than the message.
+fn is_position_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("At line:") || trimmed.starts_with("At char:") {
+        return true;
+    }
+    if trimmed.starts_with("At ") && trimmed.contains(" char:") {
+        return true;
+    }
+    match trimmed.strip_prefix("+ ") {
+        Some(rest) => {
+            let rest = rest.trim_start();
+            !(rest.starts_with("CategoryInfo") || rest.starts_with("FullyQualifiedErrorId"))
+        }
+        None => false,
+    }
+}
+
+/// Decodes the text of a CLIXML stream record.
+///
+/// PowerShell writes a control character as `_xHHHH_` and an XML metacharacter as
+/// an entity, so the plain text needs both undone to be readable.
+fn decode_clixml_text(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '_'
+            && i + 6 < chars.len()
+            && chars[i + 1] == 'x'
+            && chars[i + 6] == '_'
+            && chars[i + 2..i + 6].iter().all(char::is_ascii_hexdigit)
+        {
+            let hex: String = chars[i + 2..i + 6].iter().collect();
+            if let Some(c) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                out.push(c);
+                i += 7;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 fn indent(text: &str) -> String {
@@ -1586,6 +1777,176 @@ mod tests {
         assert!(reply["stdout"].as_str().unwrap().contains("***"));
     }
 
+    /// AC-REL10-1: PowerShell writes a CLIXML progress record to stderr on the first
+    /// use of a module, in the host language. Every command must carry the preamble
+    /// that silences the stream, so the result holds no `S="progress"` record
+    /// (TR-REL-10).
+    #[tokio::test]
+    async fn every_command_carries_the_progress_silencing_preamble() {
+        let transport = Arc::new(FakeTransport::returning(output(
+            "HOST1|Windows|10.0|2026-01-01 00:00:00",
+            "",
+            0,
+        )));
+        let registry = registry(transport.clone());
+        let identity = UserIdentity::with_password("alice", "s3cret");
+        let _ = registry.connect(&identity, "host1", None, None, true).await;
+        for command in [
+            crate::ps::get_system_info(),
+            crate::ps::list_processes("", "cpu", 5),
+            crate::ps::get_services("", "", false),
+        ] {
+            let _ = registry
+                .run_ps("alice", "host1", &command, "read", &[])
+                .await;
+        }
+        let calls = transport.calls();
+        assert!(calls.len() >= 4, "expected the probe and three commands");
+        for (_, script) in calls {
+            assert!(
+                script.starts_with(PREAMBLE),
+                "command lacks the progress-silencing preamble: {script}"
+            );
+        }
+    }
+
+    /// TR-REL-10: PowerShell serializes stderr as CLIXML. The test uses the real
+    /// shape: a `<Obj S="progress">` record and a `<S S="Error">` stream record in
+    /// one `<Objs>` envelope. The progress record goes; the error text stays, with
+    /// the `_xHHHH_` escapes decoded.
+    #[test]
+    fn strip_clixml_keeps_stream_records_and_drops_progress() {
+        let stderr = "#< CLIXML\r\n<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\">\
+<Obj S=\"progress\" RefId=\"0\"><TN RefId=\"0\"><T>System.Management.Automation.PSCustomObject</T><T>System.Object</T></TN><MS><I64 N=\"SourceId\">1</I64><PR N=\"Record\"><AV>Preparing modules for first use.</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj>\
+<S S=\"Error\">Get-Item : Cannot find path 'C:\\nope' because it does not exist._x000D__x000A_</S></Objs>";
+        let cleaned = strip_clixml(stderr, false);
+        assert!(
+            cleaned.contains("Cannot find path 'C:\\nope' because it does not exist."),
+            "{cleaned}"
+        );
+        assert!(!cleaned.contains("S=\"progress\""), "{cleaned}");
+        assert!(!cleaned.contains("<Objs"), "{cleaned}");
+        assert!(
+            !cleaned.contains("_x000D_"),
+            "escapes must be decoded: {cleaned}"
+        );
+    }
+
+    /// TR-REL-10: the `_xHHHH_` escapes and the XML entities of a stream record are
+    /// decoded, so the text is what a person reads.
+    #[test]
+    fn strip_clixml_decodes_escapes_and_entities() {
+        let stderr = "#< CLIXML\n<Objs Version=\"1.1.0.1\">\
+<S S=\"Error\">a&lt;b&gt; &amp; c_x000D__x000A_</S></Objs>";
+        assert_eq!(strip_clixml(stderr, false), "a<b> & c");
+    }
+
+    /// TR-REL-10: every progress record goes, not only the first. A run of a
+    /// module can emit several before the command output.
+    #[test]
+    fn strip_clixml_removes_every_progress_record() {
+        let stderr = "#< CLIXML\n<Objs Version=\"1.1.0.1\">\
+                      <Obj S=\"progress\">one</Obj>\
+                      <Obj S=\"progress\">two</Obj></Objs>";
+        let cleaned = strip_clixml(stderr, false);
+        assert!(!cleaned.contains("progress"), "{cleaned}");
+        assert!(cleaned.is_empty(), "{cleaned}");
+    }
+
+    /// Plain stderr without CLIXML passes through unchanged.
+    #[test]
+    fn strip_clixml_keeps_stderr_without_clixml() {
+        assert_eq!(strip_clixml("access denied\n", false), "access denied");
+    }
+
+    /// An unclosed `<Obj S="progress"` has no known end, so the tail stays as it
+    /// is rather than losing unknown content.
+    #[test]
+    fn strip_clixml_keeps_an_unclosed_progress_record() {
+        let stderr = "#< CLIXML\n<Objs Version=\"1.1.0.1\"><Obj S=\"progress\" RefId=\"0\"><TN>";
+        let cleaned = strip_clixml(stderr, false);
+        assert!(cleaned.contains("<Obj S=\"progress\""), "{cleaned}");
+        assert!(cleaned.contains("<TN>"), "{cleaned}");
+    }
+
+    /// The envelope goes only when it closes; without `</Objs>` the text stays as
+    /// it is and nothing panics.
+    #[test]
+    fn strip_clixml_keeps_an_unclosed_envelope() {
+        let stderr = "#< CLIXML\n<Objs Version=\"1.1.0.1\"><S S=\"Error\">boom";
+        let cleaned = strip_clixml(stderr, false);
+        assert!(cleaned.contains("boom"), "{cleaned}");
+    }
+
+    /// DR-4: the position lines carry a window of our one-line script, which can
+    /// hold a fragment of a secret. The exception message and the two
+    /// `+ CategoryInfo` / `+ FullyQualifiedErrorId` lines stay.
+    #[test]
+    fn strip_clixml_drops_position_lines() {
+        let stderr = "#< CLIXML\r\n<Objs Version=\"1.1.0.1\"><S S=\"Error\">\
+Get-Item : Cannot find path 'C:\\nope' because it does not exist._x000D__x000A_\
+At line:1 char:2940_x000D__x000A_\
++ ... supersecretvalu ..._x000D__x000A_\
++ ~~~~~~~~~~~~~~~~~~~~~~~~_x000D__x000A_\
++ CategoryInfo : ObjectNotFound: (C:\\nope:String) [Get-Item], ItemNotFoundException_x000D__x000A_\
++ FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.GetItemCommand_x000D__x000A_\
+</S></Objs>";
+        let cleaned = strip_clixml(stderr, false);
+        assert!(
+            cleaned.contains("Cannot find path 'C:\\nope' because it does not exist."),
+            "{cleaned}"
+        );
+        assert!(cleaned.contains("+ CategoryInfo"), "{cleaned}");
+        assert!(cleaned.contains("+ FullyQualifiedErrorId"), "{cleaned}");
+        assert!(!cleaned.contains("supersecretvalu"), "{cleaned}");
+        assert!(!cleaned.contains("At line:"), "{cleaned}");
+        assert!(!cleaned.contains("~~~"), "{cleaned}");
+    }
+
+    /// Two records abut: each ends with a newline, so they join into exactly two
+    /// lines, without a blank line between them.
+    #[test]
+    fn strip_clixml_joins_records_without_a_blank_line() {
+        let stderr = "#< CLIXML\n<Objs Version=\"1.1.0.1\">\
+<S S=\"Error\">line one_x000D__x000A_</S>\
+<S S=\"Error\">line two_x000D__x000A_</S></Objs>";
+        assert_eq!(strip_clixml(stderr, false), "line one\nline two");
+    }
+
+    /// A second `#< CLIXML … </Objs>` envelope is cleaned too.
+    #[test]
+    fn strip_clixml_cleans_a_second_envelope() {
+        let stderr = "#< CLIXML\n<Objs Version=\"1.1.0.1\"><S S=\"Error\">one_x000D__x000A_</S></Objs>\
+#< CLIXML\n<Objs Version=\"1.1.0.1\"><S S=\"Error\">two_x000D__x000A_</S></Objs>";
+        let cleaned = strip_clixml(stderr, false);
+        assert!(cleaned.contains("one"), "{cleaned}");
+        assert!(cleaned.contains("two"), "{cleaned}");
+        assert!(!cleaned.contains("<Objs"), "{cleaned}");
+        assert!(!cleaned.contains("#< CLIXML"), "{cleaned}");
+    }
+
+    /// A self-closing `<S …/>` carries no text; skipping it must not swallow the
+    /// record that follows.
+    #[test]
+    fn strip_clixml_skips_a_self_closing_record() {
+        let stderr = "#< CLIXML\n<Objs Version=\"1.1.0.1\">\
+<S S=\"Error\" />\
+<S S=\"Error\">boom_x000D__x000A_</S></Objs>";
+        let cleaned = strip_clixml(stderr, false);
+        assert!(cleaned.contains("boom"), "{cleaned}");
+        assert!(!cleaned.contains("<S "), "{cleaned}");
+    }
+
+    /// A host buffer can split a record across lines; with `unwrap` the halves
+    /// join so the redaction matches the whole secret (DR-4).
+    #[test]
+    fn strip_clixml_unwraps_a_split_record() {
+        let stderr = "#< CLIXML\n<Objs Version=\"1.1.0.1\">\
+<S S=\"Error\">super_x000D__x000A_secretvalue123_x000D__x000A_</S></Objs>";
+        assert_eq!(strip_clixml(stderr, false), "super\nsecretvalue123");
+        assert_eq!(strip_clixml(stderr, true), "supersecretvalue123");
+    }
+
     #[test]
     fn command_audit_body_redacts_below_reply_threshold() {
         // DR-4: the audit is redacted unconditionally (min_length=1), even if the secret is
@@ -1609,6 +1970,121 @@ mod tests {
         let registry = registry(transport);
         let reply = registry.run_ps("alice", "nope", "Get-Date", "", &[]).await;
         assert!(reply["error"].as_str().is_some());
+    }
+
+    /// DR-4: a position window in the host stderr holds a fragment of our one-line
+    /// script; it must not reach the reply or the audit. The exception message
+    /// stays.
+    #[tokio::test]
+    async fn run_ps_drops_the_position_window_from_stderr() {
+        let transport = Arc::new(FakeTransport::returning(output(
+            "HOST1|Windows|10.0|2026-01-01 00:00:00",
+            "",
+            0,
+        )));
+        let registry = registry(transport.clone());
+        let identity = UserIdentity::with_password("alice", "s3cret");
+        let _ = registry.connect(&identity, "host1", None, None, true).await;
+        let stderr = "#< CLIXML\r\n<Objs Version=\"1.1.0.1\"><S S=\"Error\">\
+Get-Item : Cannot find path 'C:\\nope' because it does not exist._x000D__x000A_\
+At line:1 char:2940_x000D__x000A_\
++ ... supersecretvalu ..._x000D__x000A_\
++ ~~~~~~~~~~~~~~~~~~~~~~~~_x000D__x000A_\
++ CategoryInfo : ObjectNotFound_x000D__x000A_\
++ FullyQualifiedErrorId : PathNotFound_x000D__x000A_\
+</S></Objs>";
+        transport.set_result(Ok(output("", stderr, 1)));
+        let captured = capture();
+        let reply = registry
+            .run_ps(
+                "alice",
+                "host1",
+                "Get-Item 'C:\\nope'",
+                "read_file",
+                &["supersecretvalue123".to_owned()],
+            )
+            .await;
+        let reply_stderr = reply["stderr"].as_str().unwrap_or_default();
+        assert!(
+            reply_stderr.contains("Cannot find path 'C:\\nope' because it does not exist."),
+            "{reply_stderr}"
+        );
+        assert!(!reply_stderr.contains("supersecretvalu"), "{reply_stderr}");
+        let audit = captured.text();
+        assert!(!audit.contains("supersecretvalu"), "{audit}");
+        assert!(audit.contains("Cannot find path"), "{audit}");
+    }
+
+    /// DR-4: a host buffer split wraps a long line and cuts a secret in half, so
+    /// the redaction of the whole secret would miss. The record lines join before
+    /// the redaction, so no half reaches the reply or the audit.
+    #[tokio::test]
+    async fn run_ps_redacts_a_secret_split_across_lines() {
+        let transport = Arc::new(FakeTransport::returning(output(
+            "HOST1|Windows|10.0|2026-01-01 00:00:00",
+            "",
+            0,
+        )));
+        let registry = registry(transport.clone());
+        let identity = UserIdentity::with_password("alice", "s3cret");
+        let _ = registry.connect(&identity, "host1", None, None, true).await;
+        let stderr = "#< CLIXML\r\n<Objs Version=\"1.1.0.1\"><S S=\"Error\">\
+Get-Item : the path under super_x000D__x000A_secretvalue123 was not found._x000D__x000A_</S></Objs>";
+        transport.set_result(Ok(output("", stderr, 1)));
+        let captured = capture();
+        let reply = registry
+            .run_ps(
+                "alice",
+                "host1",
+                "Get-Item 'C:\\nope'",
+                "read_file",
+                &["supersecretvalue123".to_owned()],
+            )
+            .await;
+        let reply_stderr = reply["stderr"].as_str().unwrap_or_default();
+        assert!(!reply_stderr.contains("secretvalue123"), "{reply_stderr}");
+        assert!(!reply_stderr.contains("super"), "{reply_stderr}");
+        let audit = captured.text();
+        assert!(!audit.contains("secretvalue123"), "{audit}");
+        assert!(!audit.contains("supersecretvalue123"), "{audit}");
+    }
+
+    /// The preamble counts against the WinRS command line, so an oversized command
+    /// is refused before the transport records anything. The refusal is audited
+    /// with the length and the limit, without the command body.
+    #[tokio::test]
+    async fn run_ps_refuses_an_oversized_command_without_transport() {
+        let transport = Arc::new(FakeTransport::returning(output(
+            "HOST1|Windows|10.0|2026-01-01 00:00:00",
+            "",
+            0,
+        )));
+        let registry = registry(transport.clone());
+        let identity = UserIdentity::with_password("alice", "s3cret");
+        let _ = registry.connect(&identity, "host1", None, None, true).await;
+        let command = "x".repeat(9000);
+        let before = transport.calls().len();
+        let captured = capture();
+        let reply = registry
+            .run_ps("alice", "host1", &command, "read_file", &[])
+            .await;
+        let error = reply["error"].as_str().unwrap_or_default();
+        let expected = crate::ps::command_line_chars(&command).to_string();
+        assert!(error.contains(&expected), "{error}");
+        assert!(error.contains("8191"), "{error}");
+        assert_eq!(
+            transport.calls().len(),
+            before,
+            "the transport must not be called"
+        );
+        let audit = captured.text();
+        assert!(audit.contains("COMMAND REFUSED"), "{audit}");
+        assert!(audit.contains(&expected), "{audit}");
+        assert!(audit.contains("8191"), "{audit}");
+        assert!(
+            !audit.contains(&"x".repeat(100)),
+            "the command body leaked: {audit}"
+        );
     }
 
     #[tokio::test]

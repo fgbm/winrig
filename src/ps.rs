@@ -46,15 +46,59 @@ pub const VALID_ENCODINGS: [&str; 8] = [
     "utf32",
 ];
 
-/// Raw content bytes carried by one call (TR-FS-05, ADR-0013 §8).
+/// WinRS caps the command line at about 8191 characters (the `cmd.exe` limit).
+pub const WINRS_COMMAND_LINE_LIMIT: usize = 8191;
+/// The `powershell.exe -EncodedCommand ` prefix that `winrm-rs` puts before the
+/// payload; the prefix counts against the same command line.
+const LAUNCHER_PREFIX_CHARS: usize = "powershell.exe -EncodedCommand ".len();
+/// Safety margin for the encoding estimate and for a quote in the path.
+const COMMAND_LINE_MARGIN: usize = 256;
+/// The smallest chunk a write still splits into. Below this the write becomes a
+/// long series of calls for little gain (TR-FS-04).
+const MIN_WRITE_CHUNK_BYTES: usize = 256;
+
+/// The upper bound of one content chunk (TR-FS-05, ADR-0013 §8).
 ///
 /// The script travels to the host as the argument of
 /// `powershell.exe -EncodedCommand <base64>`, and WinRS caps the command line
 /// at about 8191 characters. Triple encoding (content base64, then script
-/// UTF-16LE, then argument base64) grows the payload about 3.5 times, so more
-/// than 2 KB does not fit one call. `winrm-rs::transfer` picked the same value
-/// for the same reason.
-pub const WRITE_CHUNK_BYTES: usize = 2000;
+/// UTF-16LE, then argument base64) grows the payload about 3.5 times. The
+/// preamble (TR-REL-10), the temporary path and the launcher prefix all count
+/// against the same limit, so the actual chunk is smaller for a long path
+/// (`max_chunk_bytes`). This value is the maximum, chosen so a full chunk fits
+/// with more than 256 characters of margin in the worst case.
+pub const WRITE_CHUNK_BYTES: usize = 1536;
+
+/// Counts the preamble and the launcher prefix next to the script.
+pub fn command_line_chars(script: &str) -> usize {
+    let units = crate::session::PREAMBLE.encode_utf16().count() + script.encode_utf16().count();
+    // `-EncodedCommand` takes UTF-16LE bytes as base64: 4 characters for each
+    // 3 bytes, rounded up.
+    LAUNCHER_PREFIX_CHARS + 4 * (units * 2).div_ceil(3)
+}
+
+/// True when one command line holds the script with the margin left.
+fn fits_command_line(script: &str) -> bool {
+    command_line_chars(script) <= WINRS_COMMAND_LINE_LIMIT - COMMAND_LINE_MARGIN
+}
+
+/// The largest content chunk that still fits one command line for this path.
+///
+/// The escaped temporary path is fixed, so only the chunk decides the length.
+fn max_chunk_bytes(temp_path: &str) -> usize {
+    let mut lo = 0usize;
+    let mut hi = WRITE_CHUNK_BYTES;
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        let bytes = vec![0u8; mid];
+        if fits_command_line(&write_chunk(temp_path, &encode_base64(&bytes), false)) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
 
 #[must_use]
 pub fn encode_base64(bytes: &[u8]) -> String {
@@ -155,8 +199,8 @@ pub fn write_commit(temp_path: &str, path: &str, encoding: &str) -> Result<Strin
 ///
 /// # Errors
 ///
-/// An error text when the content exceeds `max_bytes` or the encoding is
-/// unknown.
+/// An error text when the content exceeds `max_bytes`, the encoding is unknown,
+/// or the target path is too long for one WinRS command line.
 pub fn write_plan(
     path: &str,
     temp_path: &str,
@@ -175,10 +219,25 @@ pub fn write_plan(
     // The encoding is checked before the chunks: otherwise the refusal comes
     // after part of the file already reached the host.
     let commit = write_commit(temp_path, path, encoding)?;
+    // Every command of the write rides one WinRS command line: the host scan, the
+    // chunks, the final replacement and the cleanup (TR-FS-05). The chunk is
+    // derived from the escaped temporary path, which is fixed for this call.
+    let chunk = max_chunk_bytes(temp_path);
+    let fits = chunk >= MIN_WRITE_CHUNK_BYTES
+        && fits_command_line(&write_scan(path))
+        && fits_command_line(&commit)
+        && fits_command_line(&write_abort(temp_path));
+    if !fits {
+        return Err(format!(
+            "path is {} characters; the write must fit one WinRS command line of \
+             {WINRS_COMMAND_LINE_LIMIT} characters; shorten the path",
+            path.chars().count()
+        ));
+    }
     let mut plan: Vec<String> = bytes
-        .chunks(WRITE_CHUNK_BYTES)
+        .chunks(chunk)
         .enumerate()
-        .map(|(index, chunk)| write_chunk(temp_path, &encode_base64(chunk), index == 0))
+        .map(|(index, part)| write_chunk(temp_path, &encode_base64(part), index == 0))
         .collect();
     if plan.is_empty() {
         // Empty content is still a file, not a skipped write.
@@ -1078,18 +1137,107 @@ mod tests {
         );
     }
 
-    /// TR-FS-05: one chunk fits the WinRS command line. 2000 raw bytes give
-    /// about 2700 base64 characters, and the script grows about 3.5 times after
-    /// UTF-16LE and a second base64, so it must stay under 8191.
+    /// The temporary path the server builds for a target.
+    fn temp_for(path: &str) -> String {
+        format!("{path}.winrig-0000000000000000.part")
+    }
+
+    /// A target path with exactly `chars` characters, without quotes.
+    fn path_of(chars: usize) -> String {
+        format!("C:\\{}", "a".repeat(chars.saturating_sub(3)))
+    }
+
+    /// TR-FS-05: every command the server sends for a plan fits one command line
+    /// (TR-REL-10). The chunk commands carry no preamble of their own; the helper
+    /// adds it.
+    fn assert_plan_fits(path: &str, temp: &str, plan: &[String]) {
+        assert!(fits_command_line(&write_scan(path)), "scan does not fit");
+        assert!(fits_command_line(&write_abort(temp)), "abort does not fit");
+        for command in plan {
+            assert!(
+                fits_command_line(command),
+                "plan command does not fit: {command}"
+            );
+        }
+    }
+
+    /// TR-FS-05: for a short path the full chunk fits one command line, measured
+    /// on the real encoding (script UTF-16LE, then base64), not on an estimate.
     #[test]
     fn a_full_chunk_fits_the_winrs_command_line() {
-        let content = vec![b'A'; WRITE_CHUNK_BYTES];
-        let b64 = encode_base64(&content);
-        let script = write_chunk("C:\\Temp\\winrig.part", &b64, true);
-        let encoded_len = script.encode_utf16().count() * 2 * 4 / 3;
+        let temp = temp_for("C:\\out.txt");
+        assert_eq!(max_chunk_bytes(&temp), WRITE_CHUNK_BYTES);
+        let content = vec![0u8; WRITE_CHUNK_BYTES];
+        assert!(fits_command_line(&write_chunk(
+            &temp,
+            &encode_base64(&content),
+            false
+        )));
+    }
+
+    /// TR-FS-05: a long temporary path lowers the chunk, so the command still
+    /// fits; the chunk never drops below the minimum.
+    #[test]
+    fn a_long_path_lowers_the_chunk() {
+        let path = format!("\\\\?\\C:\\{}", "a".repeat(700));
+        let temp = temp_for(&path);
+        let chunk = max_chunk_bytes(&temp);
+        assert!(chunk < WRITE_CHUNK_BYTES, "the chunk must shrink: {chunk}");
+        assert!(chunk >= MIN_WRITE_CHUNK_BYTES, "{chunk}");
+        let content = vec![0u8; chunk];
+        assert!(fits_command_line(&write_chunk(
+            &temp,
+            &encode_base64(&content),
+            false
+        )));
+    }
+
+    /// TR-FS-05: a `\\?\` path may exceed MAX_PATH, and a small write is accepted
+    /// as long as the whole plan fits one command line (TR-FS-04, ADR-0015).
+    #[test]
+    fn a_long_path_with_small_content_is_accepted() {
+        let path = format!("\\\\?\\C:\\{}", "a".repeat(700));
+        let temp = temp_for(&path);
+        let plan = write_plan(&path, &temp, "hello", "utf8", 64 * 1024).expect("fits");
+        assert_plan_fits(&path, &temp, &plan);
+    }
+
+    /// TR-FS-05: the write fits up to a computed path limit; the next character
+    /// is refused before any host call, and the error names the path and the
+    /// limit (TR-FS-04).
+    #[test]
+    fn the_write_fits_up_to_the_computed_path_limit() {
+        let mut limit = 0;
+        while limit < 5000
+            && write_plan(
+                &path_of(limit + 1),
+                &temp_for(&path_of(limit + 1)),
+                "x",
+                "utf8",
+                64 * 1024,
+            )
+            .is_ok()
+        {
+            limit += 1;
+        }
+        assert!(limit < 5000, "no path limit found");
         assert!(
-            encoded_len < 8191,
-            "chunk script would exceed the WinRS command line: {encoded_len}"
+            limit > 260,
+            "the budget must allow more than MAX_PATH: {limit}"
+        );
+
+        let path = path_of(limit);
+        let temp = temp_for(&path);
+        let plan = write_plan(&path, &temp, "x", "utf8", 64 * 1024).expect("the boundary fits");
+        assert_plan_fits(&path, &temp, &plan);
+
+        let over = path_of(limit + 1);
+        let error = write_plan(&over, &temp_for(&over), "x", "utf8", 64 * 1024)
+            .expect_err("beyond the limit");
+        assert!(error.contains(&over.chars().count().to_string()), "{error}");
+        assert!(
+            error.contains(&WINRS_COMMAND_LINE_LIMIT.to_string()),
+            "{error}"
         );
     }
 
@@ -1158,10 +1306,10 @@ mod tests {
     /// TR-FS-05: the plan is the chunks plus exactly one final replacement.
     #[test]
     fn plan_splits_content_and_ends_with_one_commit() {
-        let content = "x".repeat(5000);
+        let content = "x".repeat(4096);
         let plan =
             write_plan("C:\\out.txt", "C:\\out.part", &content, "utf8", 64 * 1024).expect("valid");
-        // 5000 bytes at a 2000-byte chunk give three chunks, then the replacement.
+        // 4096 bytes at a 1536-byte chunk give three chunks, then the replacement.
         assert_eq!(plan.len(), 4, "{plan:#?}");
         assert!(plan[0].contains("WriteAllBytes"));
         assert!(plan[1].contains("Append"));

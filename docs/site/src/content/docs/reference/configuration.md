@@ -67,7 +67,7 @@ A value with the wrong format stops the start with a message that names the vari
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `WINRIG_ALLOW_FILE_WRITE` | `false` | Whether the tool `write_file` exists. While the value is `false`, the server removes the tool from the router: it does not declare the tool and no call reaches it |
-| `WINRIG_MAX_WRITE_BYTES` | `65536` | The largest content that `write_file` accepts, in bytes. The server rejects it before any network activity. The value cannot be smaller than one 2000-byte chunk |
+| `WINRIG_MAX_WRITE_BYTES` | `65536` | The largest content that `write_file` accepts, in bytes. The server rejects it before any network activity. The value cannot be smaller than one 1536-byte chunk. The tool also refuses a path so long that its commands would not fit the WinRS command line of about 8191 characters: about 760 characters for UTF-8 and about 460 characters for the other encodings, for a path with no quote character |
 
 ## Reserved
 

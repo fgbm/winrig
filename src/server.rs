@@ -1653,7 +1653,7 @@ impl WinrigServer {
 
     #[tool(
         name = "write_file",
-        description = "Write a file on the host and replace it as a whole. The tool refuses protected paths. It refuses an existing file unless overwrite is set. The content travels in chunks of about 2 KB, because the WinRS command line is limited. Use this tool for configuration files and scripts, not for large payloads. To run a script that is too long for one command, write it here and then execute it by path."
+        description = "Write a file on the host and replace it as a whole. The tool refuses protected paths. It refuses an existing file unless overwrite is set. The content travels in chunks of about 1.5 KB, because the WinRS command line is limited. The tool refuses a path so long that its commands would not fit that line: about 760 characters for UTF-8 and about 460 characters for the other encodings, for a path with no quote character. Use this tool for configuration files and scripts, not for large payloads. To run a script that is too long for one command, write it here and then execute it by path."
     )]
     async fn write_file(
         &self,

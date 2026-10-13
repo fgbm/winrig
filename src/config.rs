@@ -214,7 +214,7 @@ fn read_int(
             _ => "an integer".to_owned(),
         };
         ConfigError::new(format!(
-            "{name}={raw:?} is not a valid integer; expected {expected}"
+            "{name}={raw:?} is not an integer; expected {expected}"
         ))
     })?;
     if let Some(lo) = minimum
@@ -246,7 +246,7 @@ fn read_bool(env: &Env, name: &str, default: bool) -> Result<bool, ConfigError> 
         return Ok(false);
     }
     Err(ConfigError::new(format!(
-        "{name}={raw:?} is not a valid boolean; expected one of true/false, 1/0, yes/no, on/off"
+        "{name}={raw:?} is not a boolean; expected one of true/false, 1/0, yes/no, on/off"
     )))
 }
 
@@ -256,7 +256,7 @@ fn read_log_level(env: &Env, name: &str, default: LogLevel) -> Result<LogLevel, 
     };
     LogLevel::parse(&raw).ok_or_else(|| {
         ConfigError::new(format!(
-            "{name}={raw:?} is not a valid log level; expected one of DEBUG, ERROR, INFO, WARNING, CRITICAL"
+            "{name}={raw:?} is not a log level; expected one of DEBUG, ERROR, INFO, WARNING, CRITICAL"
         ))
     })
 }
@@ -271,7 +271,7 @@ fn read_allowed_hosts(env: &Env) -> Result<Vec<String>, ConfigError> {
     };
     crate::policy::parse_allowed_hosts(&raw).map_err(|entry| {
         ConfigError::new(format!(
-            "WINRIG_ALLOWED_HOSTS entry {entry:?} is invalid; expected {}",
+            "WINRIG_ALLOWED_HOSTS entry {entry:?} is not valid; expected {}",
             crate::policy::ALLOWED_HOSTS_FORM
         ))
     })
@@ -357,7 +357,7 @@ fn reject_renamed_variables(env: &Env) -> Result<(), ConfigError> {
         return Ok(());
     }
     Err(ConfigError::new(format!(
-        "environment variable names changed to the WINRIG_* notation; rename: {}",
+        "the environment variable names use the WINRIG_* notation; rename: {}",
         found.join(", ")
     )))
 }

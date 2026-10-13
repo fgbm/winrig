@@ -1,20 +1,20 @@
-//! Генерация PowerShell-команд для инструментов (чистые функции).
+//! PowerShell command generators for the tools (pure functions).
 //!
-//! Команды не зависят от локали хоста и от транспорта, поэтому строятся и
-//! тестируются здесь, без Windows-хоста. Значения экранируются для вставки в
-//! строку PowerShell в одинарных кавычках ([`escape`]).
+//! The commands do not depend on the host locale or on the transport, so they
+//! are built and tested here without a Windows host. Values are escaped before
+//! they enter a PowerShell single-quoted string ([`escape`]).
 
 use serde_json::Value;
 
-/// Символы, которые PowerShell считает одинарной кавычкой (TR-SEC-12).
+/// Characters that PowerShell treats as a string delimiter (TR-SEC-12).
 ///
-/// Токенизатор PowerShell закрывает строку в одинарных кавычках не только
-/// ASCII-апострофом, но и типографскими кавычками: `‘` U+2018, `’` U+2019,
-/// `‚` U+201A и `‛` U+201B. Удвоение любого из них внутри такой строки даёт
-/// литеральный символ.
+/// The PowerShell tokenizer ends a single-quoted string not only at the ASCII
+/// apostrophe but also at the typographic quotes: `‘` U+2018, `’` U+2019,
+/// `‚` U+201A and `‛` U+201B. Doubling any of them inside the string yields the
+/// literal character.
 pub const SINGLE_QUOTES: [char; 5] = ['\'', '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'];
 
-/// Экранирует значение для вставки в PowerShell-строку в одинарных кавычках.
+/// Doubles each delimiter in a value so it stays literal inside a single-quoted string.
 #[must_use]
 pub fn escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
@@ -27,7 +27,7 @@ pub fn escape(value: &str) -> String {
     out
 }
 
-/// Уровни журнала событий: имя инструмента → числовой уровень.
+/// Numeric values that Get-WinEvent expects for each level name.
 const EVENT_LEVELS: [(&str, &str); 4] = [
     ("critical", "1"),
     ("error", "2"),
@@ -35,7 +35,6 @@ const EVENT_LEVELS: [(&str, &str); 4] = [
     ("info", "4"),
 ];
 
-/// Известные кодировки для чтения файлов.
 pub const VALID_ENCODINGS: [&str; 8] = [
     "ascii",
     "bigendianunicode",
@@ -47,26 +46,26 @@ pub const VALID_ENCODINGS: [&str; 8] = [
     "utf32",
 ];
 
-/// Сколько сырых байт содержимого уходит в один вызов (TR-FS-05, ADR-0013 §8).
+/// Raw content bytes carried by one call (TR-FS-05, ADR-0013 §8).
 ///
-/// Скрипт едет на хост аргументом `powershell.exe -EncodedCommand <base64>`, а
-/// WinRS ограничивает командную строку примерно 8191 символом. Тройное
-/// кодирование (base64 содержимого → UTF-16LE скрипта → base64 аргумента) даёт
-/// около 3.5-кратного роста, поэтому больше 2 КБ в вызов не помещается.
-/// `winrm-rs::transfer` выбрал ту же величину по той же причине.
+/// The script travels to the host as the argument of
+/// `powershell.exe -EncodedCommand <base64>`, and WinRS caps the command line
+/// at about 8191 characters. Triple encoding (content base64, then script
+/// UTF-16LE, then argument base64) grows the payload about 3.5 times, so more
+/// than 2 KB does not fit one call. `winrm-rs::transfer` picked the same value
+/// for the same reason.
 pub const WRITE_CHUNK_BYTES: usize = 2000;
 
-/// Кодирует байты в base64 для вставки в PowerShell-строку.
 #[must_use]
 pub fn encode_base64(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// Выражение .NET-кодировки для завершающей конвертации.
+/// Maps an encoding key to the .NET type used for the final conversion.
 ///
-/// Имена — те же, что принимает `read_file`; `utf8` сюда не попадает, потому
-/// что для него конвертации нет вовсе (файл переносится байт в байт).
+/// The keys are the same that `read_file` accepts; `utf8` is absent because it
+/// needs no conversion at all (the file moves byte for byte).
 fn dotnet_encoding(key: &str) -> Option<&'static str> {
     Some(match key {
         "ascii" => "[Text.Encoding]::ASCII",
@@ -82,16 +81,17 @@ fn dotnet_encoding(key: &str) -> Option<&'static str> {
     })
 }
 
-/// Один кусок содержимого во временный файл (TR-FS-05).
+/// One content chunk into the temporary file (TR-FS-05).
 ///
-/// Первый кусок создаёт файл, остальные дописывают. Куски — сырые байты, а не
-/// текст: граница на 2000 байт может разрезать многобайтовый символ, и склеить
-/// его обратно можно только побайтово.
+/// The first chunk creates the file and the rest append. Chunks are raw bytes,
+/// not text: the 2000-byte boundary can split a multi-byte character, and only
+/// a byte-wise join can reassemble it.
 #[must_use]
 pub fn write_chunk(temp_path: &str, chunk_base64: &str, first: bool) -> String {
     let safe = escape(temp_path);
-    // В алфавите base64 кавычки нет, но функция публичная, а модуль обещает
-    // экранировать каждое значение, попадающее в строку в одинарных кавычках.
+    // The base64 alphabet has no quote character, but the function is public
+    // and the module promises to escape every value that enters a single-quoted
+    // string.
     let safe_chunk = escape(chunk_base64);
     if first {
         format!(
@@ -107,16 +107,16 @@ pub fn write_chunk(temp_path: &str, chunk_base64: &str, first: bool) -> String {
     }
 }
 
-/// Заменяет цель временным файлом (TR-FS-05).
+/// Replaces the target with the temporary file (TR-FS-05).
 ///
-/// Для `utf8` это переименование: содержимое уже лежит байт в байт, каким его
-/// прислал агент, без BOM. Для прочих кодировок временный файл читается как
-/// UTF-8 и записывается в цель нужной кодировкой — конвертация делается один
-/// раз в конце, потому что по кускам она разъехалась бы на границе символа.
+/// For `utf8` this is a rename: the content is already byte-for-byte what the
+/// agent sent, without a BOM. For other encodings the temporary file is read as
+/// UTF-8 and written to the target in the requested encoding. The conversion
+/// happens once at the end; per chunk it would break at a character boundary.
 ///
 /// # Errors
 ///
-/// Текст ошибки, если кодировка не из [`VALID_ENCODINGS`].
+/// An error text when the encoding is not in [`VALID_ENCODINGS`].
 pub fn write_commit(temp_path: &str, path: &str, encoding: &str) -> Result<String, String> {
     let key = encoding.trim().to_lowercase();
     if !VALID_ENCODINGS.contains(&key.as_str()) {
@@ -133,10 +133,10 @@ pub fn write_commit(temp_path: &str, path: &str, encoding: &str) -> Result<Strin
              Write-Output 'File written successfully'"
         ));
     };
-    // Конвертация идёт во второй временный файл, и только потом цель
-    // заменяется переименованием. Запись сразу в цель усекла бы её в начале, и
-    // отказ на этом шаге оставил бы обрезанный файл на месте настоящего
-    // (TR-FS-05).
+    // The conversion goes into a second temporary file, and only then the
+    // target is replaced by a rename. Writing straight to the target would
+    // truncate it first, and a failure at this step would leave a truncated
+    // file in place of the real one (TR-FS-05).
     let safe_staged = escape(&format!("{temp_path}.enc"));
     Ok(format!(
         "$text = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes('{safe_temp}')); \
@@ -147,15 +147,16 @@ pub fn write_commit(temp_path: &str, path: &str, encoding: &str) -> Result<Strin
     ))
 }
 
-/// Полный план записи: куски во временный файл и завершающая замена.
+/// The full plan: content chunks into the temporary file and the final replacement.
 ///
-/// План строится целиком до первого обращения к хосту, поэтому предел размера
-/// и неизвестная кодировка отвергаются до сети (TR-FS-04). Временный путь
-/// передаётся снаружи, чтобы план был воспроизводим в тестах.
+/// The plan is built entirely before the first host call, so the size limit and
+/// an unknown encoding are rejected before the network (TR-FS-04). The caller
+/// passes the temporary path so the plan is reproducible in tests.
 ///
 /// # Errors
 ///
-/// Текст ошибки, если содержимое больше `max_bytes` или кодировка неизвестна.
+/// An error text when the content exceeds `max_bytes` or the encoding is
+/// unknown.
 pub fn write_plan(
     path: &str,
     temp_path: &str,
@@ -171,8 +172,8 @@ pub fn write_plan(
             bytes.len()
         ));
     }
-    // Кодировку проверяем до кусков: иначе отказ придёт после того, как часть
-    // файла уже уехала на хост.
+    // The encoding is checked before the chunks: otherwise the refusal comes
+    // after part of the file already reached the host.
     let commit = write_commit(temp_path, path, encoding)?;
     let mut plan: Vec<String> = bytes
         .chunks(WRITE_CHUNK_BYTES)
@@ -180,17 +181,17 @@ pub fn write_plan(
         .map(|(index, chunk)| write_chunk(temp_path, &encode_base64(chunk), index == 0))
         .collect();
     if plan.is_empty() {
-        // Пустое содержимое — всё равно файл, а не пропуск записи.
+        // Empty content is still a file, not a skipped write.
         plan.push(write_chunk(temp_path, "", true));
     }
     plan.push(commit);
     Ok(plan)
 }
 
-/// Убирает временные файлы после отказа (TR-FS-05).
+/// Removes the temporary files after a failure (TR-FS-05).
 ///
-/// Их два: файл кусков и промежуточный файл конвертации, который появляется
-/// для кодировок, отличных от `utf8`.
+/// There are two: the chunk file and the staged conversion file that appears
+/// for encodings other than `utf8`.
 #[must_use]
 pub fn write_abort(temp_path: &str) -> String {
     let safe = escape(temp_path);
@@ -201,24 +202,24 @@ pub fn write_abort(temp_path: &str) -> String {
     )
 }
 
-/// Свойство `Roots` скана: защищённые корни из системных переменных хоста
-/// (TR-FS-06, ADR-0015 §10–12).
+/// The `Roots` property of the scans: protected roots from the host system
+/// variables (TR-FS-06, ADR-0015 §10–12).
 ///
-/// Переменные окружения не зависят от языка системы, поэтому проверка не
-/// зависит от локали (AGENTS.md §6). Корня профилей в переменных нет, поэтому
-/// берётся родитель `PUBLIC`. Отсутствующая переменная даёт `null`, и разбор
-/// её пропускает; пустой `SystemRoot` разбор отвергает.
+/// Environment variables do not depend on the system language, so the check is
+/// locale-independent (AGENTS.md §6). The profile root is not in the variables,
+/// so the parent of `PUBLIC` is used. A missing variable yields `null` and the
+/// parser skips it; an empty `SystemRoot` is rejected.
 pub const HOST_ROOTS: &str = "Roots=[PSCustomObject]@{ SystemRoot=$env:SystemRoot; \
      ProgramFiles=$env:ProgramFiles; ProgramFilesX86=${env:ProgramFiles(x86)}; \
      ProgramData=$env:ProgramData; \
      Users=$(if ($env:PUBLIC) { Split-Path -Parent $env:PUBLIC } else { $null }) }";
 
-/// Скан цели записи: оба разрешения пути, существование и корни хоста
+/// The write target scan: both path resolutions, existence and the host roots
 /// (TR-FS-03, TR-FS-06).
 ///
-/// Куски пишет .NET, цель заменяет `Move-Item`, а относительный путь они
-/// разрешают от разных каталогов, поэтому хост возвращает оба разрешения.
-/// Любая ошибка останавливает скрипт, и инструмент отказывает (fail-closed).
+/// .NET writes the chunks and `Move-Item` replaces the target, and they resolve
+/// a relative path from different directories, so the host returns both
+/// resolutions. Any error stops the script and the tool refuses (fail-closed).
 #[must_use]
 pub fn write_scan(path: &str) -> String {
     let safe = escape(path);
@@ -232,8 +233,8 @@ pub fn write_scan(path: &str) -> String {
     )
 }
 
-/// Скан удаляемого файла: путь, как его разрешил хост, признак каталога и
-/// корни хоста (DR-6, TR-SEC-04).
+/// The scan of a file to delete: the host-resolved path, the directory flag and
+/// the host roots (DR-6, TR-SEC-04).
 #[must_use]
 pub fn delete_file_scan(path: &str) -> String {
     let safe = escape(path);
@@ -246,8 +247,9 @@ pub fn delete_file_scan(path: &str) -> String {
     )
 }
 
-/// Скан удаляемого каталога: путь хоста, reparse-точки в корне и поддереве,
-/// число элементов до `limit` и корни хоста (DR-6, ADR-0005 §5, TR-SEC-04).
+/// The scan of a directory to delete: the host path, reparse points at the root
+/// and in the subtree, the item count up to `limit` and the host roots (DR-6,
+/// ADR-0005 §5, TR-SEC-04).
 #[must_use]
 pub fn delete_directory_scan(path: &str, limit: i64) -> String {
     let safe = escape(path);
@@ -264,12 +266,11 @@ pub fn delete_directory_scan(path: &str, limit: i64) -> String {
     )
 }
 
-/// Хосты/учётки: усекает число до `cap` включительно.
+/// Clamps a number into the inclusive range `low`..=`high`.
 fn cap(value: i64, low: i64, high: i64) -> i64 {
     value.clamp(low, high)
 }
 
-/// `list_directory` — содержимое каталога.
 #[must_use]
 pub fn list_directory(path: &str) -> String {
     let safe = escape(path);
@@ -281,7 +282,6 @@ pub fn list_directory(path: &str) -> String {
     )
 }
 
-/// `find_files` — рекурсивный поиск по маске.
 #[must_use]
 pub fn find_files(path: &str, pattern: &str, max_depth: i64, include_size: bool) -> String {
     let safe_path = escape(path);
@@ -300,11 +300,9 @@ pub fn find_files(path: &str, pattern: &str, max_depth: i64, include_size: bool)
     )
 }
 
-/// `read_file` — чтение файла диапазоном или с конца.
-///
 /// # Errors
 ///
-/// Возвращает текст ошибки при неизвестной кодировке или неверном диапазоне.
+/// Returns an error text for an unknown encoding or an invalid range.
 pub fn read_file(
     path: &str,
     start_line: i64,
@@ -350,7 +348,6 @@ fn read_file_range(safe: &str, start: i64, end: i64, enc: &str) -> String {
     )
 }
 
-/// `search_file_content` — grep-подобный поиск.
 #[must_use]
 pub fn search_file_content(
     path: &str,
@@ -399,7 +396,6 @@ pub fn search_file_content(
     )
 }
 
-/// `file_info` — метаданные файла или каталога.
 #[must_use]
 pub fn file_info(path: &str) -> String {
     let safe = escape(path);
@@ -415,11 +411,11 @@ pub fn file_info(path: &str) -> String {
     )
 }
 
-/// `compare_files` — построчное сравнение двух файлов.
+/// Compares two files line by line.
 ///
-/// Пути печатаются только через уже вычисленные переменные хоста, а не
-/// подставляются в строку в двойных кавычках: `$(...)` внутри двойных кавычек
-/// PowerShell раскрывает, поэтому литеральный путь мог бы выполнить код.
+/// The paths are printed only through host variables that were already
+/// computed, never interpolated into a double-quoted string: PowerShell expands
+/// `$(...)` inside double quotes, so a literal path could execute code.
 #[must_use]
 pub fn compare_files(path_a: &str, path_b: &str, max_diffs: i64) -> String {
     let safe_a = escape(path_a);
@@ -440,11 +436,9 @@ pub fn compare_files(path_a: &str, path_b: &str, max_diffs: i64) -> String {
     )
 }
 
-/// `get_event_log` — чтение журнала событий.
-///
 /// # Errors
 ///
-/// Возвращает текст ошибки при неизвестном уровне (TR-REL-03).
+/// Returns an error text for an unknown level (TR-REL-03).
 pub fn get_event_log(
     log_name: &str,
     level: &str,
@@ -491,7 +485,6 @@ pub fn get_event_log(
     ))
 }
 
-/// `get_services` — список служб (сводка или детально).
 #[must_use]
 pub fn get_services(name_filter: &str, status_filter: &str, detail: bool) -> String {
     let mut where_clauses: Vec<String> = Vec::new();
@@ -537,7 +530,6 @@ fn capitalize(value: &str) -> String {
     }
 }
 
-/// `list_processes` — процессы с сортировкой.
 #[must_use]
 pub fn list_processes(name_filter: &str, sort_by: &str, top: i64) -> String {
     let result_cap = cap(top, 1, 100);
@@ -565,7 +557,6 @@ pub fn list_processes(name_filter: &str, sort_by: &str, top: i64) -> String {
     )
 }
 
-/// `get_system_info` — сводка о системе.
 #[must_use]
 pub fn get_system_info() -> String {
     "$os = Get-CimInstance Win32_OperatingSystem; \
@@ -580,7 +571,6 @@ pub fn get_system_info() -> String {
         .to_owned()
 }
 
-/// `get_disk_space` — место на фиксированных дисках.
 #[must_use]
 pub fn get_disk_space() -> String {
     "Get-CimInstance Win32_LogicalDisk -Filter \"DriveType=3\" \
@@ -591,7 +581,6 @@ pub fn get_disk_space() -> String {
         .to_owned()
 }
 
-/// `get_registry` — чтение раздела или значения реестра.
 #[must_use]
 pub fn get_registry(key: &str, value_name: &str) -> String {
     let mut k = key.trim().to_owned();
@@ -613,7 +602,6 @@ pub fn get_registry(key: &str, value_name: &str) -> String {
     }
 }
 
-/// `get_network_config` — конфигурация сетевых адаптеров.
 #[must_use]
 pub fn get_network_config() -> String {
     "Get-NetIPConfiguration -ErrorAction SilentlyContinue \
@@ -625,11 +613,9 @@ pub fn get_network_config() -> String {
         .to_owned()
 }
 
-/// `get_environment_variables` — переменные окружения.
-///
 /// # Errors
 ///
-/// Возвращает текст ошибки при неизвестной области видимости.
+/// Gives an error text for an unknown scope.
 pub fn get_environment_variables(name_filter: &str, scope: &str) -> Result<String, String> {
     let sc = match scope.trim().to_lowercase().as_str() {
         "machine" => "Machine",
@@ -652,11 +638,9 @@ pub fn get_environment_variables(name_filter: &str, scope: &str) -> Result<Strin
     ))
 }
 
-/// `get_certificates` — сертификаты личного хранилища.
-///
 /// # Errors
 ///
-/// Возвращает текст ошибки при неизвестном хранилище.
+/// Gives an error text for an unknown store.
 pub fn get_certificates(store: &str, days_until_expiry: i64) -> Result<String, String> {
     let st = match store.trim().to_lowercase().as_str() {
         "localmachine" => "LocalMachine",
@@ -677,7 +661,6 @@ pub fn get_certificates(store: &str, days_until_expiry: i64) -> Result<String, S
     ))
 }
 
-/// `test_network` — ICMP-ping или TCP-проверка порта.
 #[must_use]
 pub fn test_network(target: &str, port: i64) -> String {
     let safe_target = escape(target);
@@ -697,7 +680,6 @@ pub fn test_network(target: &str, port: i64) -> String {
     )
 }
 
-/// `get_tcp_connections` — активные TCP-соединения.
 #[must_use]
 pub fn get_tcp_connections(state_filter: &str, port_filter: i64) -> String {
     let mut where_parts: Vec<String> = Vec::new();
@@ -735,11 +717,9 @@ pub fn get_tcp_connections(state_filter: &str, port_filter: i64) -> String {
     )
 }
 
-/// `resolve_dns_name` — разрешение имени.
-///
 /// # Errors
 ///
-/// Возвращает текст ошибки при неизвестном типе записи.
+/// Returns an error text for an unknown record type.
 pub fn resolve_dns_name(name: &str, record_type: &str, dns_server: &str) -> Result<String, String> {
     const VALID: [&str; 9] = ["A", "AAAA", "CNAME", "MX", "NS", "PTR", "SOA", "SRV", "TXT"];
     let rt = record_type.trim().to_uppercase();
@@ -766,7 +746,6 @@ pub fn resolve_dns_name(name: &str, record_type: &str, dns_server: &str) -> Resu
     ))
 }
 
-/// Проверяет, что входной JSON — объект, и извлекает строковое поле.
 #[must_use]
 pub fn json_str(value: &Value, key: &str) -> String {
     value
@@ -776,19 +755,17 @@ pub fn json_str(value: &Value, key: &str) -> String {
         .to_owned()
 }
 
-/// Проверяет, что входной JSON — объект, и извлекает целочисленное поле.
 #[must_use]
 pub fn json_i64(value: &Value, key: &str, default: i64) -> i64 {
     value.get(key).and_then(Value::as_i64).unwrap_or(default)
 }
 
-/// Проверяет, что входной JSON — объект, и извлекает булево поле.
 #[must_use]
 pub fn json_bool(value: &Value, key: &str, default: bool) -> bool {
     value.get(key).and_then(Value::as_bool).unwrap_or(default)
 }
 
-/// `get_perf_snapshot` — локаленезависимый снимок производительности (TR-REL-02).
+/// A locale-independent performance snapshot (TR-REL-02).
 #[must_use]
 pub fn get_perf_snapshot(interval_sec: i64, process_filter: &str) -> String {
     let cap_interval = cap(interval_sec, 1, 10);
@@ -832,7 +809,6 @@ pub fn get_perf_snapshot(interval_sec: i64, process_filter: &str) -> String {
     )
 }
 
-/// `get_scheduled_tasks` — запланированные задачи.
 #[must_use]
 pub fn get_scheduled_tasks(name_filter: &str, include_disabled: bool) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -859,7 +835,6 @@ pub fn get_scheduled_tasks(name_filter: &str, include_disabled: bool) -> String 
     )
 }
 
-/// `get_local_users` — локальные учётные записи.
 #[must_use]
 pub fn get_local_users() -> String {
     "Get-LocalUser -ErrorAction Stop | Select-Object Name, Enabled, \
@@ -869,12 +844,12 @@ pub fn get_local_users() -> String {
         .to_owned()
 }
 
-/// `get_security_context` — контекст безопасности сессии (whoami /all).
+/// Session security context from whoami /all.
 ///
-/// `whoami /priv /fo csv /nh` печатает строки без заголовка, поэтому разбор не
-/// зависит от языка системы: колонки берутся по позиции, а `Enabled` считается
-/// только для английского `Enabled`. Сырое значение состояния сохраняется, и
-/// агент видит локализованную строку как есть.
+/// `whoami /priv /fo csv /nh` prints rows without a header, so the parse is
+/// locale-independent: the columns are taken by position, and `Enabled` is true
+/// only for the English `Enabled`. The raw state value is kept, so the agent
+/// sees the localized string as it is.
 #[must_use]
 pub fn get_security_context() -> String {
     "$wi = [Security.Principal.WindowsIdentity]::GetCurrent(); \
@@ -891,7 +866,6 @@ pub fn get_security_context() -> String {
         .to_owned()
 }
 
-/// `get_permissions` — ACL файла или каталога.
 #[must_use]
 pub fn get_permissions(path: &str) -> String {
     let safe = escape(path);
@@ -904,7 +878,6 @@ pub fn get_permissions(path: &str) -> String {
     )
 }
 
-/// `get_dns_cache` — кэш DNS-клиента.
 #[must_use]
 pub fn get_dns_cache(name_filter: &str) -> String {
     let name_where = if name_filter.trim().is_empty() {
@@ -922,7 +895,7 @@ pub fn get_dns_cache(name_filter: &str) -> String {
     )
 }
 
-/// `get_installed_software` — установленное ПО (64- и 32-бит).
+/// Installed software from both the 64-bit and the 32-bit uninstall keys.
 #[must_use]
 pub fn get_installed_software(name_filter: &str) -> String {
     let name_where = if name_filter.trim().is_empty() {
@@ -943,7 +916,6 @@ pub fn get_installed_software(name_filter: &str) -> String {
     )
 }
 
-/// `get_user_groups` — членство в локальных группах.
 #[must_use]
 pub fn get_user_groups(username: &str) -> String {
     if username.trim().is_empty() {
@@ -1018,7 +990,7 @@ mod tests {
     #[test]
     fn get_event_log_builds_level_prefix() {
         let cmd = get_event_log("System", "warning", 24, "", 25).expect("valid");
-        // warning включает critical, error, warning -> 1,2,3
+        // warning includes critical, error and warning -> 1,2,3
         assert!(cmd.contains("Level=1,2,3"));
     }
 
@@ -1057,8 +1029,8 @@ mod tests {
 
     #[test]
     fn registry_generators_use_literal_path() {
-        // AC-REL06-1: литеральные пути со служебными символами не трактуются
-        // как шаблон, поэтому `-Path` недопустим, только `-LiteralPath`.
+        // AC-REL06-1: a literal path with wildcard characters is not treated as
+        // a pattern, so `-Path` is not allowed here, only `-LiteralPath`.
         let read = get_registry("HKLM:\\SOFTWARE\\App[1]", "");
         assert!(read.contains("-LiteralPath '"), "{read}");
         assert!(!read.contains("-Path '"), "{read}");
@@ -1078,7 +1050,7 @@ mod tests {
 
     #[test]
     fn compare_files_does_not_interpolate_paths_in_double_quotes() {
-        // Инъекция: путь в двойных кавычках раскрывает $(...) в PowerShell.
+        // Injection: a path in double quotes expands $(...) in PowerShell.
         for (a, b) in [
             ("C:\\a$(calc).txt", "C:\\b.txt"),
             ("C:\\a.txt", "C:\\b$(calc).txt"),
@@ -1097,8 +1069,8 @@ mod tests {
 
     #[test]
     fn get_security_context_avoids_localized_csv_headers() {
-        // whoami /priv /fo csv на локализованной Windows даёт не-английские
-        // заголовки; парсим без заголовка с явными позициями.
+        // whoami /priv /fo csv on a localized Windows yields non-English
+        // headers; the parse uses no header and explicit positions.
         let cmd = get_security_context();
         assert!(cmd.contains("/nh"), "header-less output expected: {cmd}");
         assert!(
@@ -1107,9 +1079,9 @@ mod tests {
         );
     }
 
-    /// TR-FS-05: кусок помещается в командную строку WinRS. 2000 сырых байт
-    /// дают около 2700 символов base64, скрипт после UTF-16LE и повторного
-    /// base64 растёт примерно в 3.5 раза — и обязан остаться под 8191.
+    /// TR-FS-05: one chunk fits the WinRS command line. 2000 raw bytes give
+    /// about 2700 base64 characters, and the script grows about 3.5 times after
+    /// UTF-16LE and a second base64, so it must stay under 8191.
     #[test]
     fn a_full_chunk_fits_the_winrs_command_line() {
         let content = vec![b'A'; WRITE_CHUNK_BYTES];
@@ -1122,8 +1094,8 @@ mod tests {
         );
     }
 
-    /// TR-FS-05: первый кусок создаёт временный файл, последующие дописывают.
-    /// Дописывающий кусок не имеет права начинать файл заново.
+    /// TR-FS-05: the first chunk creates the temporary file, later ones append.
+    /// An appending chunk must not start the file over.
     #[test]
     fn first_chunk_creates_and_the_rest_append() {
         let first = write_chunk("C:\\Temp\\p", "QUJD", true);
@@ -1134,8 +1106,8 @@ mod tests {
         assert!(!next.contains("WriteAllBytes"), "{next}");
     }
 
-    /// TR-FS-05: цель заменяется переименованием, а не пишется по кускам.
-    /// Для utf8 конвертации нет вовсе — файл переносится байт в байт.
+    /// TR-FS-05: the target is replaced by a rename, not written in chunks.
+    /// For utf8 there is no conversion at all; the file moves byte for byte.
     #[test]
     fn commit_renames_for_utf8_and_converts_otherwise() {
         let utf8 = write_commit("C:\\Temp\\p", "C:\\out.txt", "utf8").expect("valid");
@@ -1147,8 +1119,8 @@ mod tests {
         assert!(unicode.contains("WriteAllText"), "{unicode}");
     }
 
-    /// TR-FS-05: конвертация не пишет в цель напрямую. Иначе цель усекается в
-    /// начале записи, и отказ на этом шаге оставляет обрезанный файл.
+    /// TR-FS-05: the conversion never writes to the target directly. Otherwise
+    /// the target is truncated first and a failure leaves a partial file.
     #[test]
     fn commit_never_writes_the_target_in_place() {
         for encoding in VALID_ENCODINGS {
@@ -1164,8 +1136,8 @@ mod tests {
         }
     }
 
-    /// TR-FS-05: уборка достаёт и промежуточный файл конвертации, иначе после
-    /// отказа рядом с целью остаётся мусор.
+    /// TR-FS-05: the cleanup also reaches the staged conversion file; otherwise
+    /// a failure leaves garbage next to the target.
     #[test]
     fn abort_removes_the_staged_file_too() {
         let command = write_abort("C:\\Temp\\p");
@@ -1173,7 +1145,7 @@ mod tests {
         assert!(command.contains("C:\\Temp\\p.enc"), "{command}");
     }
 
-    /// Кодировка берётся из того же перечня, что у чтения (ADR-0013 §7).
+    /// The encoding comes from the same list as the read path (ADR-0013 §7).
     #[test]
     fn commit_rejects_unknown_encoding() {
         let error = write_commit("C:\\Temp\\p", "C:\\out.txt", "koi8-r").expect_err("unknown");
@@ -1184,13 +1156,13 @@ mod tests {
         }
     }
 
-    /// TR-FS-05: план — это куски плюс ровно одна завершающая замена.
+    /// TR-FS-05: the plan is the chunks plus exactly one final replacement.
     #[test]
     fn plan_splits_content_and_ends_with_one_commit() {
         let content = "x".repeat(5000);
         let plan =
             write_plan("C:\\out.txt", "C:\\out.part", &content, "utf8", 64 * 1024).expect("valid");
-        // 5000 байт при куске 2000 — три куска, затем замена.
+        // 5000 bytes at a 2000-byte chunk give three chunks, then the replacement.
         assert_eq!(plan.len(), 4, "{plan:#?}");
         assert!(plan[0].contains("WriteAllBytes"));
         assert!(plan[1].contains("Append"));
@@ -1198,8 +1170,8 @@ mod tests {
         assert!(plan[3].contains("Move-Item"));
     }
 
-    /// TR-FS-04: предел проверяется до сети и назван в отказе вместе с
-    /// фактическим размером — иначе агент не поймёт, насколько сокращать.
+    /// TR-FS-04: the limit is checked before the network and the refusal names
+    /// the actual size; otherwise the agent cannot tell how much to cut.
     #[test]
     fn plan_refuses_content_above_the_limit() {
         let content = "x".repeat(5000);
@@ -1209,7 +1181,7 @@ mod tests {
         assert!(error.contains("4096"), "{error}");
     }
 
-    /// Пустое содержимое создаёт пустой файл, а не пропускает запись.
+    /// Empty content creates an empty file, not a skipped write.
     #[test]
     fn plan_creates_an_empty_file() {
         let plan = write_plan("C:\\out.txt", "C:\\out.part", "", "utf8", 64 * 1024).expect("valid");
@@ -1218,8 +1190,8 @@ mod tests {
         assert!(plan[1].contains("Move-Item"));
     }
 
-    /// Размер считается в байтах, а не в символах: кириллица в UTF-8 вдвое
-    /// длиннее, и предел обязан считать именно байты.
+    /// The size counts bytes, not characters: Cyrillic is twice as long in
+    /// UTF-8, and the limit must count bytes.
     #[test]
     fn plan_counts_bytes_not_characters() {
         let content = "я".repeat(1500); // 3000 байт в UTF-8
@@ -1228,7 +1200,7 @@ mod tests {
         assert!(error.contains("3000"), "{error}");
     }
 
-    /// TR-FS-05: уборка удаляет временный файл и молчит, если его уже нет.
+    /// TR-FS-05: the cleanup removes the temporary file and stays silent when it is gone.
     #[test]
     fn abort_removes_the_temporary_file_quietly() {
         let command = write_abort("C:\\Temp\\p");
@@ -1236,8 +1208,8 @@ mod tests {
         assert!(command.contains("SilentlyContinue"), "{command}");
     }
 
-    /// TR-SEC-12: PowerShell закрывает строку в одинарных кавычках любым из
-    /// пяти символов, а не только ASCII-апострофом.
+    /// TR-SEC-12: PowerShell ends a single-quoted string at any of the five
+    /// characters, not only at the ASCII apostrophe.
     #[test]
     fn escape_doubles_every_single_quote_form() {
         for quote in SINGLE_QUOTES {
@@ -1257,9 +1229,8 @@ mod tests {
         }
     }
 
-    /// Инъекция: свободный текст, попавший в строку PowerShell в одинарных
-    /// кавычках, обязан удваивать кавычку во всех генераторах (AC-OBS02-1,
-    /// AC-SEC12-1).
+    /// Injection: free text that enters a PowerShell single-quoted string must
+    /// double the quote in every generator (AC-OBS02-1, AC-SEC12-1).
     fn assert_generators_escape(quote: char) {
         let evil = format!("x{quote} ; Remove-Item -Recurse C:\\ ; {quote}");
         let evil = evil.as_str();
@@ -1300,8 +1271,8 @@ mod tests {
                 !command.contains(evil),
                 "unescaped free text in command: {command}"
             );
-            // Если текст вообще попал в команду, его кавычка обязана быть
-            // удвоена; генераторы с enum-фильтром просто не принимают текст.
+            // If the text enters the command at all, its quote must be doubled;
+            // generators with an enum filter simply do not take the text.
             assert!(
                 !command.contains(&opened) || command.contains(&doubled),
                 "single quote {quote:?} was not doubled: {command}"
@@ -1309,8 +1280,8 @@ mod tests {
         }
     }
 
-    /// AC-FS-07: корни берутся из переменных окружения хоста, а не из
-    /// локализованных имён каталогов, и попадают во все три скана.
+    /// AC-FS-07: the roots come from the host environment variables, not from
+    /// localized directory names, and reach all three scans.
     #[test]
     fn scans_read_protected_roots_from_the_environment() {
         for variable in [
@@ -1332,8 +1303,8 @@ mod tests {
         }
     }
 
-    /// AC-FS-07: скан записи возвращает оба разрешения пути и останавливается
-    /// на первой ошибке, чтобы отказ не выглядел пустым успехом.
+    /// AC-FS-07: the write scan returns both path resolutions and stops at the
+    /// first error, so a refusal does not look like an empty success.
     #[test]
     fn write_scan_resolves_the_path_both_ways() {
         let command = write_scan("x.ps1");

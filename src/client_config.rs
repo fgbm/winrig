@@ -1,18 +1,19 @@
-//! Запись определения MCP-сервера в конфиги клиентов (ADR-0009, ADR-0012).
+//! Writes the MCP server definition into client configuration files (ADR-0009,
+//! ADR-0012).
 //!
-//! `winrig setup --write-config <client>` добавляет запись `winrig`, не трогая
-//! остальные записи файла. Уровень записи задаёт `--scope` (ADR-0012):
-//! `global` — пользовательский конфиг клиента, `project` — конфиг в корне
-//! текущего проекта. Для клиентов, умеющих подставлять содержимое файла
-//! (`{file:...}` в opencode), токен выносится в отдельный файл `0600`; для
-//! остальных запись содержит токен как значение, а сам конфиг остаётся с
-//! правами клиента.
+//! `winrig setup --write-config <client>` adds a `winrig` entry and leaves the
+//! other entries of the file alone. `--scope` sets the write level (ADR-0012):
+//! `global` is the user config of the client, `project` is a config in the root
+//! of the current project. For clients that can load a file by reference
+//! (`{file:...}` in opencode), the token goes into a separate `0600` file; for
+//! the others the entry holds the token as a value and the config keeps the
+//! client's own permissions.
 //!
-//! Форматы подтверждены по документации клиентов: opencode — ключ `mcp` с
-//! записями `{type, url|command, headers|environment}`; Claude Code —
-//! `mcpServers` в `~/.claude.json` (global) или `.mcp.json` (project); Codex —
-//! `[mcp_servers.<name>]` в `~/.codex/config.toml` или `.codex/config.toml`;
-//! Cursor — `mcpServers` в `~/.cursor/mcp.json` или `.cursor/mcp.json`.
+//! The formats follow the client documentation: opencode uses the `mcp` key with
+//! `{type, url|command, headers|environment}` entries; Claude Code uses
+//! `mcpServers` in `~/.claude.json` (global) or `.mcp.json` (project); Codex uses
+//! `[mcp_servers.<name>]` in `~/.codex/config.toml` or `.codex/config.toml`;
+//! Cursor uses `mcpServers` in `~/.cursor/mcp.json` or `.cursor/mcp.json`.
 
 use std::path::{Path, PathBuf};
 
@@ -21,7 +22,7 @@ use serde_json::{Map, Value, json};
 use crate::paths::PathError;
 use crate::profile::ProfileError;
 
-/// Поддерживаемый клиент записи конфигурации.
+/// Configuration format this tool can write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Client {
     /// opencode (`~/.config/opencode/opencode.json`).
@@ -34,17 +35,16 @@ pub enum Client {
     Cursor,
 }
 
-/// Уровень записи конфига клиента (ADR-0012).
+/// Where the client config is written (ADR-0012).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
-    /// Пользовательский конфиг клиента, действующий во всех проектах.
+    /// The user config of the client, in effect in every project.
     Global,
-    /// Конфиг в корне текущего проекта.
+    /// Config in the root of the current project.
     Project,
 }
 
 impl Scope {
-    /// Каноническое имя уровня.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -53,7 +53,7 @@ impl Scope {
         }
     }
 
-    /// Истина, если уровень проектный.
+    /// True for the project scope.
     #[must_use]
     pub fn is_project(self) -> bool {
         matches!(self, Self::Project)
@@ -61,7 +61,7 @@ impl Scope {
 }
 
 impl Client {
-    /// Разбирает имя клиента из флага `--write-config`.
+    /// Parses a client name from the `--write-config` flag.
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -73,7 +73,6 @@ impl Client {
         }
     }
 
-    /// Каноническое имя клиента.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -84,7 +83,7 @@ impl Client {
         }
     }
 
-    /// Путь к глобальному конфигу клиента в домашнем каталоге.
+    /// Location of the client's global config under the home directory.
     #[must_use]
     pub fn global_config_path(self) -> Option<PathBuf> {
         let home = std::env::var_os("HOME").map(PathBuf::from)?;
@@ -99,7 +98,7 @@ impl Client {
         })
     }
 
-    /// Путь к проектному конфигу клиента в корне проекта (ADR-0012).
+    /// The client's project config location in the project root (ADR-0012).
     #[must_use]
     pub fn project_config_path(self, root: &Path) -> PathBuf {
         match self {
@@ -110,37 +109,35 @@ impl Client {
         }
     }
 
-    /// Истина, если клиент умеет подставлять содержимое файла ссылкой.
+    /// True when the client can load a file by reference.
     #[must_use]
     pub fn supports_file_reference(self) -> bool {
         matches!(self, Self::Opencode)
     }
 }
 
-/// Ошибка записи конфига клиента.
+/// Failure to write a client configuration file.
 #[derive(Debug)]
 pub enum ClientConfigError {
-    /// Клиент неизвестен.
+    /// Unknown client name.
     UnknownClient {
-        /// Переданное имя.
+        /// Client string the caller passed.
         name: String,
     },
-    /// Домашний каталог недоступен.
+    /// Home directory unavailable.
     NoHome,
-    /// Для токена opencode на project-уровне не задан каталог состояния.
+    /// No state directory for the opencode token at the project scope.
     NoStateDir,
-    /// Файл существует, но не разобран.
+    /// Existing file that cannot be parsed.
     Unreadable {
-        /// Путь к файлу.
+        /// File that failed the parse.
         path: PathBuf,
-        /// Причина.
+        /// Cause of the failure.
         reason: String,
     },
-    /// Ошибка ввода-вывода.
+    /// Input or output error.
     Io {
-        /// Путь.
         path: PathBuf,
-        /// Причина.
         source: std::io::Error,
     },
 }
@@ -167,48 +164,49 @@ impl std::fmt::Display for ClientConfigError {
 
 impl std::error::Error for ClientConfigError {}
 
-/// Определение MCP-сервера для печати и записи.
+/// What this tool prints and writes into a client config.
 #[derive(Debug, Clone)]
 pub struct ServerDefinition {
-    /// Команда запуска (абсолютный путь к бинарю, затем `stdio`).
+    /// Launch line: absolute path to the binary, then `stdio`.
     pub command: String,
-    /// Имя профиля.
     pub profile: String,
-    /// Токен доступа.
     pub token: String,
-    /// Абсолютный каталог профилей; передаётся клиенту, чтобы он нашёл профиль
-    /// даже когда каталог отличается от стандартного (ADR-0009).
+    /// Absolute profile directory; passed to the client so it finds the profile
+    /// even when the directory differs from the default (ADR-0009).
     pub profile_dir: Option<String>,
-    /// Абсолютный **корень** каталога состояния; передаётся клиенту по той же
-    /// причине. Имя профиля к нему добавляет сервер, и ровно один раз: в
-    /// определение уходит корень, иначе `WINRIG_STATE_DIR` и реальный каталог
-    /// состояния разъезжаются на один уровень (TR-PRF-15).
+    /// Absolute **root** of the state directory; passed to the client for the
+    /// same reason. The server adds the profile name to it, exactly once: the
+    /// definition carries the root, otherwise `WINRIG_STATE_DIR` and the real
+    /// state directory drift apart by one level (TR-PRF-15).
     pub state_root: Option<String>,
-    /// Явное имя записи MCP-сервера (`--server-name`). Без него ключ берётся у
-    /// существующей записи на тот же профиль, иначе [`DEFAULT_SERVER_NAME`].
+    /// Explicit key for the entry (`--server-name`). Without it the key comes
+    /// from an existing entry for the same profile, otherwise
+    /// [`DEFAULT_SERVER_NAME`].
     pub server_name: Option<String>,
-    /// Значение `WINRIG_ALLOWED_HOSTS` (`--allowed-hosts`). `None` — переменной
-    /// в записи нет, и сервер разрешает только loopback (TR-PRF-17).
+    /// Value of `WINRIG_ALLOWED_HOSTS` (`--allowed-hosts`). `None` means the
+    /// variable is absent from the entry and the server allows loopback only
+    /// (TR-PRF-17).
     pub allowed_hosts: Option<String>,
 }
 
-/// Имя записи MCP-сервера по умолчанию.
+/// Entry key used when no other key is given.
 pub const DEFAULT_SERVER_NAME: &str = "winrig";
 
 impl ServerDefinition {
-    /// Имя записи без оглядки на существующий конфиг (печать определения).
+    /// Entry name that ignores the existing config (printing the definition).
     fn plain_key(&self) -> String {
         self.server_name
             .clone()
             .unwrap_or_else(|| DEFAULT_SERVER_NAME.to_owned())
     }
 
-    /// Ключ записи в существующем конфиге клиента (TR-PRF-14).
+    /// Which key the new entry takes in an existing client config (TR-PRF-14).
     ///
-    /// Приоритет: явное `--server-name`; ключ уже объявленной записи на тот же
-    /// профиль; [`DEFAULT_SERVER_NAME`]. Средний шаг обязателен: вторая запись
-    /// на один профиль поднимает второй процесс, тот ловит lock профиля и
-    /// выходит с кодом 2, а клиент показывает `Connection closed`.
+    /// Priority: an explicit `--server-name`; the key of an entry already
+    /// declared for the same profile; [`DEFAULT_SERVER_NAME`]. The middle step
+    /// is required: a second entry for one profile starts a second process, that
+    /// process hits the profile lock and exits with code 2, and the client shows
+    /// `Connection closed`.
     fn key_in(
         &self,
         servers: &Map<String, Value>,
@@ -223,7 +221,7 @@ impl ServerDefinition {
             .map_or_else(|| DEFAULT_SERVER_NAME.to_owned(), |(key, _)| key.clone())
     }
 
-    /// Пары «переменная окружения → значение» для запуска сервера.
+    /// The variable and value pairs that launch the server.
     fn environment(&self) -> Vec<(&'static str, String)> {
         let mut env = vec![("WINRIG_TOKEN", self.token.clone())];
         if let Some(dir) = &self.profile_dir {
@@ -246,11 +244,11 @@ impl ServerDefinition {
         map
     }
 
-    /// Печатает JSON-определение сервера.
+    /// Prints the JSON server definition.
     ///
     /// # Errors
     ///
-    /// Ошибка сериализации (недостижима для корректных значений).
+    /// A serialization error (unreachable for valid values).
     pub fn to_json(&self) -> Result<String, ClientConfigError> {
         let value = json!({
             "mcpServers": {
@@ -268,12 +266,13 @@ impl ServerDefinition {
         })
     }
 
-    /// Записывает токен в отдельный файл `0600` рядом с конфигом клиента.
+    /// Writes the token into a separate `0600` file next to the client config.
     ///
-    /// Каталог не трогается, если существует: это может быть чужой каталог
-    /// конфигов. # Errors
+    /// An existing directory is left untouched: it may belong to another tool.
     ///
-    /// [`ClientConfigError::Io`] при ошибке записи.
+    /// # Errors
+    ///
+    /// [`ClientConfigError::Io`] when the write fails.
     pub fn write_token_file(&self, dir: &Path) -> Result<PathBuf, ClientConfigError> {
         crate::private_fs::ensure_private_dir(dir).map_err(|source| ClientConfigError::Io {
             path: dir.to_path_buf(),
@@ -291,11 +290,11 @@ impl ServerDefinition {
     }
 }
 
-/// Возвращает корень проекта: ближайший предок `start` с `.git`, иначе `start`.
+/// The project root: the nearest ancestor of `start` with `.git`, otherwise `start`.
 ///
-/// `.git` может быть каталогом репозитория или файлом воркtree; оба случая
-/// означают корень. Так запуск из подкаталога монорепозитория попадает в
-/// корень, а не в текущий каталог (ADR-0012).
+/// `.git` can be a repository directory or a worktree file; both cases mean the
+/// root. This way a start from a subdirectory of a monorepo lands in the root,
+/// not in the current directory (ADR-0012).
 #[must_use]
 pub fn find_project_root(start: &Path) -> PathBuf {
     start
@@ -304,11 +303,11 @@ pub fn find_project_root(start: &Path) -> PathBuf {
         .map_or_else(|| start.to_path_buf(), Path::to_path_buf)
 }
 
-/// Пишет запись сервера в конфиг клиента, не трогая другие записи.
+/// Writes the server entry into the client config and leaves other entries alone.
 ///
 /// # Errors
 ///
-/// [`ClientConfigError`] при разборе существующего файла или записи.
+/// [`ClientConfigError`] when an existing file or entry cannot be parsed.
 pub fn write_client_config(
     client: Client,
     scope: Scope,
@@ -386,12 +385,12 @@ fn entry_object(map: &Map<String, Value>, key: &str) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
-/// Профиль записи opencode: команда — массив, профиль идёт следом за флагом.
+/// The profile of an opencode entry: the command is an array and the profile follows the flag.
 fn opencode_profile(entry: &Value) -> Option<&str> {
     profile_after_flag(entry.get("command")?.as_array()?)
 }
 
-/// Профиль записи со схемой `mcpServers`: профиль лежит в `args`.
+/// The profile of an entry with the `mcpServers` schema: the profile sits in `args`.
 fn mcp_servers_profile(entry: &Value) -> Option<&str> {
     profile_after_flag(entry.get("args")?.as_array()?)
 }
@@ -410,15 +409,15 @@ fn write_opencode(
 ) -> Result<(), ClientConfigError> {
     let mut root = read_object(path)?;
     let mut mcp = entry_object(&root, "mcp");
-    // На project-уровне токен уходит в приватный state-каталог профиля, чтобы
-    // секрет не оказался в дереве репозитория (ADR-0012).
+    // At the project scope the token goes into the private state directory of
+    // the profile, so the secret does not land in the repository tree (ADR-0012).
     let token_dir = match scope {
         Scope::Global => path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf(),
-        // Тот же путь, что соберёт сервер из `WINRIG_STATE_DIR`: корень плюс
-        // имя профиля, один раз (TR-PRF-15).
+        // The same path the server builds from `WINRIG_STATE_DIR`: the root plus
+        // the profile name, once (TR-PRF-15).
         Scope::Project => PathBuf::from(
             definition
                 .state_root
@@ -452,12 +451,12 @@ fn write_opencode(
             "type": "local",
             "command": [definition.command, "stdio", "--profile", definition.profile],
             "environment": Value::Object(environment),
-            // Схема opencode использует `disabled`; отсутствие поля = включён.
+            // The opencode schema uses `disabled`; a missing field means enabled.
             "disabled": false
         }),
     );
     root.insert("mcp".to_owned(), Value::Object(mcp));
-    // Токен вынесен в отдельный файл, поэтому сам конфиг остаётся как был.
+    // The token is in a separate file, so the config itself stays as it was.
     write_json(path, &Value::Object(root), false)
 }
 
@@ -478,18 +477,18 @@ fn write_mcp_servers_json(
         }),
     );
     root.insert("mcpServers".to_owned(), Value::Object(servers));
-    // Токен записан значением в самом конфиге — делаем файл приватным (DR-4).
+    // The token is a value in the config itself, so make the file private (DR-4).
     write_json(path, &Value::Object(root), true)
 }
 
-/// Пишет TOML-конфиг Codex, добавляя секции `[mcp_servers.winrig]` и
+/// Writes the Codex TOML config, adding the sections `[mcp_servers.winrig]` and
 /// `[mcp_servers.winrig.env]`.
 ///
-/// Реализовано без TOML-редактора: любая существующая секция под префиксом
-/// `[mcp_servers.winrig` удаляется вместе со своими строками до следующего
-/// заголовка верхнего вида, остальные строки файла сохраняются как есть.
-/// Поэтому повторная запись не оставляет ни старого токена, ни дубликата
-/// заголовка (AC-PRF-15).
+/// There is no TOML editor: any existing section under the prefix
+/// `[mcp_servers.winrig` is dropped together with its lines up to the next
+/// top-level header, and the other lines of the file are kept as they are. A
+/// rewrite therefore leaves neither the old token nor a duplicate header
+/// (AC-PRF-15).
 fn write_codex(path: &Path, definition: &ServerDefinition) -> Result<(), ClientConfigError> {
     let existing = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -513,8 +512,8 @@ fn write_codex(path: &Path, definition: &ServerDefinition) -> Result<(), ClientC
     for line in existing.lines() {
         let is_header = line.trim_start().starts_with('[');
         if is_header {
-            // Пропускаем только секции winrig; любой другой заголовок начинает
-            // сохраняемый блок.
+            // Only winrig sections are skipped; any other header starts a kept
+            // block.
             skipping = is_winrig_header(line);
         }
         if !skipping {
@@ -542,16 +541,16 @@ fn write_codex(path: &Path, definition: &ServerDefinition) -> Result<(), ClientC
         path: path.to_path_buf(),
         source,
     })?;
-    // Токен записан значением в самом конфиге — делаем файл приватным (DR-4).
+    // The token is a value in the config itself, so make the file private (DR-4).
     crate::private_fs::apply_private_file_mode(path);
     Ok(())
 }
 
-/// Ключ секции Codex для того же профиля (TR-PRF-14).
+/// The section name Codex uses for the same profile (TR-PRF-14).
 ///
-/// TOML-редактора здесь нет, поэтому секции разбираются построчно: заголовок
-/// `[mcp_servers.NAME]` или `[mcp_servers.NAME.env]` открывает блок, а строка
-/// `args` с нужным профилем внутри блока и выдаёт имя.
+/// There is no TOML editor here, so the sections are parsed line by line: a
+/// `[mcp_servers.NAME]` or `[mcp_servers.NAME.env]` header opens a block, and an
+/// `args` line with the wanted profile inside the block gives the name.
 fn codex_key(existing: &str, definition: &ServerDefinition) -> String {
     if let Some(name) = &definition.server_name {
         return name.clone();
@@ -590,28 +589,28 @@ fn write_json(path: &Path, value: &Value, protect: bool) -> Result<(), ClientCon
         path: path.to_path_buf(),
         source,
     })?;
-    // DR-4: там, где токен записан значением, файл делаем приватным на Unix.
+    // DR-4: where the token is a value, make the file private on Unix.
     if protect {
         crate::private_fs::apply_private_file_mode(path);
     }
     Ok(())
 }
 
-/// Преобразует ошибку профиля в текст CLI (для единого вывода).
+/// Turns a profile error into CLI text (for one output shape).
 pub fn profile_error_text(error: &ProfileError) -> String {
     error.to_string()
 }
 
-/// Преобразует ошибку каталогов в текст CLI.
+/// Turns a directory error into CLI text.
 pub fn path_error_text(error: &PathError) -> String {
     error.to_string()
 }
 
-/// Записывает конфиг клиента в явный путь (тестовый шов без домашнего каталога).
+/// Writes the client config to an explicit path (a test seam without the home directory).
 ///
 /// # Errors
 ///
-/// [`ClientConfigError`] при разборе существующего файла или записи.
+/// [`ClientConfigError`] when an existing file or entry cannot be parsed.
 pub fn write_client_config_at(
     client: Client,
     path: &Path,
@@ -648,8 +647,8 @@ mod tests {
         }
     }
 
-    /// AC-PRF-68: `--allowed-hosts` доходит до записи каждого клиента, а
-    /// повторная запись без флага убирает переменную (TR-PRF-17, ADR-0015 §9).
+    /// AC-PRF-68: `--allowed-hosts` reaches the entry of every client, and a
+    /// rewrite without the flag removes the variable (TR-PRF-17, ADR-0015 §9).
     #[test]
     fn allowed_hosts_are_written_and_removed_for_every_client() {
         let dir = temp_dir("allowed-hosts");
@@ -679,7 +678,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Печатное определение тоже несёт список хостов.
+    /// The printed definition carries the host list too.
     #[test]
     fn printed_definition_carries_allowed_hosts() {
         let mut with_hosts = definition();
@@ -697,8 +696,8 @@ mod tests {
         );
     }
 
-    /// Определение несёт каталоги профиля и состояния, иначе клиент с
-    /// нестандартным расположением не найдёт профиль.
+    /// The definition carries the profile and state directories; otherwise a
+    /// client with a non-standard location does not find the profile.
     #[test]
     fn definition_carries_directories() {
         let rendered = definition().to_json().expect("json");
@@ -708,9 +707,9 @@ mod tests {
         assert!(rendered.contains("/tmp/state"));
     }
 
-    /// AC-PRF-66: `WINRIG_STATE_DIR` — корень состояния, а токен лежит там,
-    /// куда сервер соберёт путь сам. Иначе имя профиля добавляется дважды и
-    /// lock уезжает мимо каталога, объявленного в конфиге.
+    /// AC-PRF-66: `WINRIG_STATE_DIR` is the state root, and the token lives
+    /// where the server builds the path itself. Otherwise the profile name is
+    /// added twice and the lock misses the directory declared in the config.
     #[test]
     fn state_dir_in_the_entry_is_the_root() {
         let dir = temp_dir("stateroot");
@@ -739,9 +738,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-64: тот же профиль уже объявлен под своим ключом — запись
-    /// обновляется на месте. Вторая запись подняла бы второй процесс на один
-    /// профиль, тот поймал бы lock и клиент увидел бы `Connection closed`.
+    /// AC-PRF-64: the same profile is already declared under its own key, so
+    /// the entry is updated in place. A second entry would start a second
+    /// process for one profile, it would hit the lock, and the client would see
+    /// `Connection closed`.
     #[test]
     fn opencode_updates_the_existing_entry_for_the_same_profile() {
         let dir = temp_dir("samekey");
@@ -762,8 +762,8 @@ mod tests {
         );
     }
 
-    /// AC-PRF-64: чужой профиль под своим ключом не трогаем — это другой
-    /// сервер, и lock он не делит.
+    /// AC-PRF-64: an entry for another profile is left alone; it is a different
+    /// server and does not share the lock.
     #[test]
     fn opencode_leaves_entries_for_other_profiles_alone() {
         let dir = temp_dir("otherprofile");
@@ -782,7 +782,7 @@ mod tests {
         assert_eq!(mcp["winrig"]["command"][3], "corp");
     }
 
-    /// AC-PRF-65: `--server-name` задаёт ключ явно.
+    /// AC-PRF-65: `--server-name` sets the key explicitly.
     #[test]
     fn explicit_server_name_is_used_as_the_key() {
         let dir = temp_dir("servername");
@@ -796,7 +796,7 @@ mod tests {
         assert!(value["mcp"].get("winrig").is_none());
     }
 
-    /// AC-PRF-64: то же для клиентов со схемой `mcpServers`.
+    /// AC-PRF-64: the same for clients with the `mcpServers` schema.
     #[test]
     fn mcp_servers_updates_the_existing_entry_for_the_same_profile() {
         let dir = temp_dir("samekeyclaude");
@@ -817,7 +817,7 @@ mod tests {
         );
     }
 
-    /// AC-PRF-15: другие записи файла не тронуты, токен есть, пароля нет.
+    /// AC-PRF-15: the other entries of the file are untouched, the token is present, the password is not.
     #[test]
     fn opencode_preserves_other_entries() {
         let dir = temp_dir("opencode");
@@ -837,7 +837,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-15: Claude Code и Cursor получают mcpServers с env-токеном.
+    /// AC-PRF-15: Claude Code and Cursor get an mcpServers entry with an env token.
     #[test]
     fn mcp_servers_clients_write_stdio_entry() {
         for (client, name) in [(Client::ClaudeCode, "claude"), (Client::Cursor, "cursor")] {
@@ -857,8 +857,8 @@ mod tests {
         }
     }
 
-    /// AC-PRF-15: Codex получает секцию `[mcp_servers.winrig]`; существующая
-    /// одноимённая секция заменяется, прочие строки сохраняются.
+    /// AC-PRF-15: Codex gets a `[mcp_servers.winrig]` section; an existing
+    /// section of the same name is replaced and the other lines are kept.
     #[test]
     fn codex_replaces_only_its_own_section() {
         let dir = temp_dir("codex");
@@ -878,8 +878,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-15: повторная запись Codex заменяет и `.env`-секцию: старого
-    /// токена и дубликата заголовка не остаётся.
+    /// AC-PRF-15: a Codex rewrite also replaces the `.env` section; neither the
+    /// old token nor a duplicate header remains.
     #[test]
     fn codex_rewrite_replaces_env_section() {
         let dir = temp_dir("codex-rewrite");
@@ -916,7 +916,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-15: повторная запись Claude/Cursor заменяет запись, не плодит её.
+    /// AC-PRF-15: a Claude/Cursor rewrite replaces the entry instead of duplicating it.
     #[test]
     fn mcp_servers_rewrite_replaces_entry() {
         let dir = temp_dir("mcp-rewrite");
@@ -936,13 +936,13 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-15: битый конфиг Codex не затирается молча.
+    /// AC-PRF-15: a broken Codex config is not overwritten silently.
     #[test]
     fn codex_broken_file_is_reported_not_overwritten() {
         let dir = temp_dir("codex-broken");
         let path = dir.join("config.toml");
-        // Файл читается, но содержит уже занятый чужой заголовок, который
-        // не должен быть потерян.
+        // The file is readable, but it contains a foreign header that is already
+        // taken and must not be lost.
         std::fs::write(&path, "[mcp_servers.winrig]\nbroken\n").unwrap();
         write_client_config_at(Client::Codex, &path, Scope::Global, &definition()).expect("write");
         let rendered = std::fs::read_to_string(&path).unwrap();
@@ -951,7 +951,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-15: неизвестный клиент отвергается без изменений файлов.
+    /// AC-PRF-15: an unknown client is refused with no file changes.
     #[test]
     fn unknown_client_is_rejected() {
         assert!(Client::parse("vscode").is_none());
@@ -959,8 +959,8 @@ mod tests {
         assert_eq!(Client::parse("claude-code"), Some(Client::ClaudeCode));
     }
 
-    /// Там, где токен записан значением, файл конфига приватный на Unix;
-    /// opencode не трогает права своего конфига (токен в отдельном файле).
+    /// Where the token is a value, the config file is private on Unix; opencode
+    /// does not touch the mode of its config (the token is in a separate file).
     #[cfg(unix)]
     #[test]
     fn inline_token_config_is_private() {
@@ -994,12 +994,12 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Нечитаемый (не-UTF-8) конфиг не затирается молча.
+    /// An unreadable (non-UTF-8) config is not overwritten silently.
     #[test]
     fn unreadable_config_is_reported_not_overwritten() {
         let dir = temp_dir("unreadable");
         let path = dir.join("config.toml");
-        // Невалидный UTF-8: read_to_string вернёт ошибку.
+        // Invalid UTF-8: read_to_string returns an error.
         std::fs::write(&path, [0xff, 0xfe, 0x00, 0x01]).unwrap();
         let error = write_client_config_at(Client::Codex, &path, Scope::Global, &definition())
             .expect_err("must refuse to overwrite");
@@ -1008,8 +1008,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// ADR-0012: корень проекта — ближайший предок с `.git`, иначе сам каталог;
-    /// `.git`-файл воркtree считается корнем наравне с каталогом.
+    /// ADR-0012: the project root is the nearest ancestor with `.git`, otherwise
+    /// the directory itself; a `.git` worktree file counts as a root like a
+    /// directory.
     #[test]
     fn find_project_root_walks_up_to_git() {
         let dir = temp_dir("project-root");
@@ -1028,7 +1029,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// ADR-0012: проектный путь различается по клиенту.
+    /// ADR-0012: the project path differs per client.
     #[test]
     fn project_config_paths_per_client() {
         let root = Path::new("/tmp/proj");
@@ -1050,8 +1051,8 @@ mod tests {
         );
     }
 
-    /// AC-PRF-61: на project-уровне токен opencode уходит в приватный
-    /// state-каталог, а не в дерево проекта.
+    /// AC-PRF-61: at the project scope the opencode token goes into the private
+    /// state directory, not into the project tree.
     #[test]
     fn opencode_project_token_goes_to_state_dir() {
         let dir = temp_dir("opencode-project");
@@ -1070,8 +1071,8 @@ mod tests {
             "token must stay a file reference"
         );
         assert!(rendered.contains("{file:"));
-        // TR-PRF-15: каталог профиля собирается ровно один раз — сервер
-        // получает корень и сам добавит имя профиля.
+        // TR-PRF-15: the profile directory is built exactly once; the server
+        // gets the root and adds the profile name itself.
         let token_file = state.join("corp").join("winrig-token");
         assert!(
             token_file.is_file(),
@@ -1089,8 +1090,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// ADR-0012: project-уровень opencode без state-каталога отвергается, а не
-    /// кладёт токен в проект.
+    /// ADR-0012: the opencode project scope without a state directory is
+    /// refused instead of putting the token into the project.
     #[test]
     fn opencode_project_without_state_dir_is_refused() {
         let dir = temp_dir("opencode-project-nostate");

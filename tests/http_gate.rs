@@ -1,10 +1,10 @@
-//! Интеграционные проверки HTTP-гейта `/mcp`: auth-middleware в реальной
-//! связке axum + rmcp, без сети и без Windows-хоста (AGENTS.md §4).
+//! Integration checks of the HTTP gate `/mcp`: the auth middleware in a real
+//! axum + rmcp wiring, without network and without a Windows host (AGENTS.md §4).
 //!
-//! Здесь закрывается разрыв, который unit-тесты не видят: middleware
-//! действительно стоит перед MCP-сервисом, и без секрета запрос не доходит до
-//! инструментов (DR-1). Второй блок проверяет путь по токену профиля: запрос
-//! без `X-AD-User` доходит до службы, а заголовки `X-AD-*` игнорируются
+//! This closes a gap the unit tests cannot see: the middleware really stands in
+//! front of the MCP service, and without a secret a request never reaches the tools
+//! (DR-1). A second block checks the profile-token path: a request without
+//! `X-AD-User` reaches the service, and the `X-AD-*` headers are ignored
 //! (ADR-0009 §4, AC-PRF-06/49/51/52/53).
 
 use std::sync::Arc;
@@ -57,7 +57,7 @@ fn header_only_state() -> AuthState {
     }
 }
 
-/// Профиль во временном каталоге; возвращает состояние и токен.
+/// A profile in a temporary directory; returns the state and the token.
 fn temp_profile_state(name: &str) -> (AuthState, std::path::PathBuf, String) {
     let dir = std::env::temp_dir().join(format!(
         "winrig-gate-{name}-{}-{:?}",
@@ -103,8 +103,8 @@ async fn status_with(router: axum::Router, headers: &[(&'static str, &str)]) -> 
     reply_with(router, headers).await.0
 }
 
-/// Статус и тело ответа: позитивные проверки утверждают не «не 401», а
-/// конкретный успех, иначе 400 или 500 прошли бы за победу.
+/// Status and response body: positive checks assert a concrete success, not "not
+/// 401", otherwise 400 or 500 would pass for a win.
 async fn reply_with(
     router: axum::Router,
     headers: &[(&'static str, &str)],
@@ -123,7 +123,7 @@ async fn reply_with(
     (status, String::from_utf8_lossy(&body).into_owned())
 }
 
-/// Утверждает, что запрос дошёл до MCP-службы и получил ответ на `initialize`.
+/// Asserts that the request reached the MCP service and got an answer to `initialize`.
 fn assert_initialized(status: StatusCode, body: &str, what: &str) {
     assert_eq!(status, StatusCode::OK, "{what}: body was {body}");
     assert!(
@@ -190,7 +190,7 @@ async fn x_mcp_token_header_is_accepted() {
     assert_initialized(status, &body, "X-MCP-Token with X-AD-User");
 }
 
-/// AC-PRF-06: запрос по токену профиля без X-AD-User проходит гейт.
+/// AC-PRF-06: a request by profile token without X-AD-User passes the gate.
 #[tokio::test]
 async fn profile_token_without_user_reaches_the_service() {
     let (state, dir, token) = temp_profile_state("ok");
@@ -203,7 +203,7 @@ async fn profile_token_without_user_reaches_the_service() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// AC-PRF-49: заголовки без общего секрета не дают идентичность.
+/// AC-PRF-49: headers without the shared secret give no identity.
 #[tokio::test]
 async fn headers_without_token_are_rejected_even_with_profile() {
     let (state, dir, _token) = temp_profile_state("headers");
@@ -216,7 +216,7 @@ async fn headers_without_token_are_rejected_even_with_profile() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// AC-PRF-40: неверный токен профиля — 401.
+/// AC-PRF-40: a wrong profile token is 401.
 #[tokio::test]
 async fn wrong_profile_token_is_rejected() {
     let (state, dir, _token) = temp_profile_state("wrong");
@@ -229,8 +229,8 @@ async fn wrong_profile_token_is_rejected() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// AC-PRF-53: повторные неверные запросы не дороже константного сравнения;
-/// проверяем, что корректный токен продолжает работать после серии отказов.
+/// AC-PRF-53: repeated wrong requests cost no more than a constant-time
+/// comparison; check that a correct token keeps working after a run of refusals.
 #[tokio::test]
 async fn profile_token_stays_valid_after_failures() {
     let (state, dir, token) = temp_profile_state("cheap");
@@ -251,7 +251,7 @@ async fn profile_token_stays_valid_after_failures() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// AC-PRF-07: путь по заголовкам сохранён рядом с профилем.
+/// AC-PRF-07: the header path stays available next to a profile.
 #[tokio::test]
 async fn header_path_still_works_with_profile_bound() {
     let (state, dir, _token) = temp_profile_state("both");

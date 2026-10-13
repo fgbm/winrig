@@ -1,20 +1,20 @@
-# ADR-0001 — Общий секрет до доверия и идентичность на каждый запрос
+# ADR-0001 — Shared secret before trust and identity on each request
 
-- Статус: принято
-- Дата: 2026-09-19
-- Связано: AGENTS.md §3 DR-1, DR-2
+- Status: accepted
+- Date: 2026-09-19
+- Related: AGENTS.md §3 DR-1, DR-2
 
-## Контекст
+## Context
 
-`X-AD-User` называет вызывающего и одновременно является ключом кэша паролей и пула соединений. Если доверять ему без проверки, любой, кто дотянется до порта, может назваться чужим именем и получить чужой пароль и сессии.
+The header `X-AD-User` names the caller. It is also the key of the password cache and of the connection pool. If the server trusts the header without a check, any caller that reaches the port can use the name of another user. That caller then gets the password and the sessions of that user.
 
-## Решение
+## Decision
 
-1. Каждый запрос обязан предъявить общий секрет `WINRIG_AUTH_TOKEN` (заголовок `Authorization: Bearer` или `X-MCP-Token`); без него сервер не стартует.
-2. `X-AD-User` принимается только после успешной проверки секрета; сравнение — константное по времени (`subtle::ConstantTimeEq`).
-3. Идентичность пользователя определяется по заголовкам текущего запроса и не наследуется из задачи, создавшей MCP-сессию.
+1. Each request must present the shared secret `WINRIG_AUTH_TOKEN`. The secret is in the `Authorization: Bearer` header or the `X-MCP-Token` header. The server does not start without the secret.
+2. The server accepts `X-AD-User` only after a successful check of the secret. The comparison is constant-time (`subtle::ConstantTimeEq`).
+3. The identity of the user comes from the headers of the current request. The identity does not come from the task that made the MCP session.
 
-## Последствия
+## Consequences
 
-- Порт без секрета бесполезен для атакующего.
-- Каждый инструмент получает идентичность из текущего запроса (`src/identity.rs`), а заголовки берутся из `http::request::Parts` в расширениях запроса `rmcp`.
+- A port without the secret is useless to an attacker.
+- Each tool gets the identity from the current request (`src/identity.rs`). The server reads the headers from `http::request::Parts` in the request extensions of `rmcp`.

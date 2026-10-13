@@ -1444,7 +1444,7 @@ impl WinrigServer {
             &self,
             &ctx,
             "FLUSH DNS CACHE",
-            "This will clear all cached DNS entries on the remote server."
+            "This will clear all cached DNS entries on the host."
         );
         let command = "$before = (Get-DnsClientCache -ErrorAction SilentlyContinue | Measure-Object).Count; \
              Clear-DnsClientCache; \
@@ -1478,7 +1478,7 @@ impl WinrigServer {
             &ctx,
             "RESTART SERVICE",
             &format!(
-                "Service: {}\nState before: {before}\nAfter restart: state is re-read and returned.",
+                "Service: {}\nState before: {before}\nAfter restart: the tool reads the state again and returns it.",
                 params.name
             )
         );
@@ -1570,7 +1570,7 @@ impl WinrigServer {
             self.process_details(&identity, &params.session_id, pid)
                 .await
         );
-        require_confirmation!(&self, &ctx, "KILL PROCESS", &details);
+        require_confirmation!(&self, &ctx, "TERMINATE PROCESS", &details);
         Ok(self
             .run(&identity, &params.session_id, &command, "kill_process")
             .await)
@@ -1744,7 +1744,7 @@ impl WinrigServer {
             },
             &format!(
                 "Path: {}\nResolved: {}\nBytes: {bytes}\nEncoding: {}\nExisting file: {}\n\n\
-                 The file is replaced as a whole.",
+                 The tool replaces the whole file.",
                 params.path,
                 scan.full_name,
                 params.encoding,
@@ -1856,7 +1856,7 @@ impl WinrigServer {
             &ctx,
             "DELETE FILE",
             &format!(
-                "Path: {}\nResolved: {}\nMetadata: {}\n\nThis cannot be undone.",
+                "Path: {}\nResolved: {}\nMetadata: {}\n\nThis deletion is permanent.",
                 params.path, scan.full_name, stdout
             )
         );
@@ -1935,7 +1935,7 @@ impl WinrigServer {
             &ctx,
             "DELETE DIRECTORY (recursive)",
             &format!(
-                "Path: {}\nResolved: {}\nItems: {} files + {} dirs\n\nThis deletes ALL its contents and cannot be undone.",
+                "Path: {}\nResolved: {}\nItems: {} files + {} directories\n\nThe tool deletes ALL the contents of this directory. This deletion is permanent.",
                 params.path, scan.full_name, scan.file_count, scan.dir_count
             )
         );
@@ -1973,7 +1973,7 @@ impl ServerHandler for WinrigServer {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "Remote Windows administration over WinRM/NTLM. Call connect first. In HTTP mode the \
              request carries X-AD-User (and optionally X-AD-Password) with the shared secret, or a \
-             profile token; in stdio mode the identity comes from the profile. Mutating tools \
+             profile token. In stdio mode the identity comes from the profile. Modifying tools \
              require explicit confirmation and refuse to run when the client has no elicitation.",
         )
     }

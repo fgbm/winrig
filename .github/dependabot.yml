@@ -1,7 +1,7 @@
 version: 2
 updates:
-  # Rust-зависимости. Обновления приходят отдельными PR и проходят полный
-  # прогон (fmt, clippy, test, deny), прежде чем попасть в main.
+  # Rust dependencies. Updates come as separate PRs and pass the full check
+  # run (fmt, clippy, test, deny) before they reach main.
   - package-ecosystem: cargo
     directory: /
     schedule:
@@ -11,14 +11,14 @@ updates:
     commit-message:
       prefix: "build"
     groups:
-      # Один PR на все патч-версии: они почти всегда безопасны и не создают
-      # очередь из двадцати веток.
+      # One PR for all patch versions: they are almost always safe and do not
+      # create a queue of twenty branches.
       patch-updates:
         applies-to: version-updates
         update-types: ["patch"]
 
-  # Версии actions в workflow: закреплены мажором, обновляются вручную или
-  # этим PR.
+  # The action versions in the workflows: pinned by major version, updated by
+  # hand or by this PR.
   - package-ecosystem: github-actions
     directory: /
     schedule:

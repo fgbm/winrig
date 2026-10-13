@@ -5,8 +5,8 @@ on:
     branches: [main]
   pull_request:
 
-# Прогон обязан быть зелёным до коммита (AGENTS.md §6). Версия Rust берётся из
-# rust-toolchain.toml, поэтому CI и локальная разработка совпадают.
+# The check run must be green before a commit (AGENTS.md §6). The Rust
+# version comes from rust-toolchain.toml, so CI and local development agree.
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -53,9 +53,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # rustsec/audit-check@v2 закреплён на Node 20, снятом с поддержки, а
-      # релиза на Node 24 нет. Бинарь cargo-audit ставится тем же
-      # install-action, что и остальные инструменты, и запускается напрямую.
+      # rustsec/audit-check@v2 is pinned to Node 20, which is out of support,
+      # and there is no release on Node 24. The cargo-audit binary is installed
+      # by the same install-action as the other tools and runs directly.
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit

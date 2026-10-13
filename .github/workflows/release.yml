@@ -1,8 +1,9 @@
 name: Release
 
-# Тег `vX.Y.Z` — единственный вход в релиз (AGENTS.md §7). Работа делится на две
-# части: create-release берёт текст из CHANGELOG.md и создаёт GitHub Release,
-# upload-assets собирает под каждый таргет и прикладывает архив с чексуммой.
+# The tag `vX.Y.Z` is the only entry to a release (AGENTS.md §7). The work
+# splits into two jobs: create-release takes the text from CHANGELOG.md and
+# creates the GitHub Release, and upload-assets builds each target and attaches
+# an archive with a checksum.
 on:
   push:
     tags:
@@ -23,9 +24,9 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
-      # Отказ до создания релиза: версия в Cargo.toml и тег поднимаются одним
-      # коммитом (AGENTS.md §7), и расхождение — ошибка подготовки, а не повод
-      # выпустить релиз с чужим номером.
+      # Refuse before the release is created: the version in Cargo.toml and the
+      # tag go up in one commit (AGENTS.md §7), so a mismatch is a preparation
+      # error, not a reason to publish a release with a wrong number.
       - name: Tag must match Cargo.toml
         shell: bash
         run: |
@@ -44,9 +45,9 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
-      # Текст берётся из записи CHANGELOG с версией тега; `branch: main`
-      # отвергает тег на коммите вне main. Каждый коммит main уже прошёл CI,
-      # поэтому к моменту тега качество проверено.
+      # The text comes from the CHANGELOG entry with the version of the tag;
+      # `branch: main` rejects a tag on a commit outside main. Each commit on
+      # main already passed CI, so the quality is checked by the time of the tag.
       - uses: taiki-e/create-gh-release-action@v1
         with:
           changelog: CHANGELOG.md
@@ -63,15 +64,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux: musl даёт статический бинарь без glibc-зависимости. AWS-LC
-          # (`aws-lc-sys`) и ring несут C-код, поэтому сборка идёт через cross —
-          # в образе есть musl-компилятор и cmake, которых нет на голом раннере.
+          # Linux: musl gives a static binary with no glibc dependency. AWS-LC
+          # (`aws-lc-sys`) and ring carry C code, so the build goes through
+          # cross — the image has a musl compiler and cmake, which a bare
+          # runner does not.
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
-          # macOS и Windows собираются нативно; Intel-лейбл закреплён явно,
-          # потому что macos-latest с macos-14 — это arm64.
+          # macOS and Windows build natively; the Intel label is pinned
+          # explicitly, because macos-latest with macos-14 is arm64.
           - target: x86_64-apple-darwin
             os: macos-15-intel
           - target: aarch64-apple-darwin
@@ -87,7 +89,7 @@ jobs:
           archive: winrig-$tag-$target
           locked: true
           checksum: sha256
-          # В архив кладутся лицензия и краткое описание, чтобы распакованный
-          # набор был самодостаточен.
+          # The archive holds the license and a short description, so the
+          # unpacked set is self-contained.
           include: LICENSE,README.md
           token: ${{ secrets.GITHUB_TOKEN }}

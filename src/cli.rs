@@ -138,6 +138,11 @@ pub enum Command {
         #[arg(help = "Profile name")]
         name: String,
     },
+    #[command(
+        about = "Read the client configurations and compare the settings of every winrig server.",
+        after_help = "Exit code 0 when the servers agree, 1 when they disagree or a configuration file was skipped or an entry was not parsed, 2 on a usage error."
+    )]
+    Doctor,
 }
 
 /// The profile and state directories are passed to the client so the server

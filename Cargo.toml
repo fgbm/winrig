@@ -40,6 +40,8 @@ winrm-rs = "1.2.2"
 # Serialization for config, audit and tool replies.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Reads the Codex `config.toml` for the environment check (`winrig doctor`).
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
 # Structured logging and the audit trail.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

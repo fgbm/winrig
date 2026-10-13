@@ -470,6 +470,100 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
     load_config_from(&|name| std::env::var(name).ok())
 }
 
+/// Canonical `(variable, value)` pairs of the known non-secret settings, for the
+/// environment check (TR-PRF-18). A `None` value means the setting has no fixed
+/// default. The order is the order the check prints them.
+#[must_use]
+pub fn setting_pairs(config: &AppConfig) -> Vec<(&'static str, Option<String>)> {
+    vec![
+        ("WINRIG_BIND_HOST", Some(config.mcp_bind_host.clone())),
+        ("WINRIG_PORT", Some(config.mcpo_port.to_string())),
+        (
+            "WINRIG_PASSWORD_TTL_SECONDS",
+            Some(config.ad_password_idle_ttl_seconds.to_string()),
+        ),
+        ("WINRIG_LOG_DIR", config.log_dir.clone()),
+        (
+            "WINRIG_LOG_LEVEL",
+            Some(config.log_level.as_str().to_owned()),
+        ),
+        (
+            "WINRIG_LOG_MAX_BYTES",
+            Some(config.log_max_bytes.to_string()),
+        ),
+        (
+            "WINRIG_LOG_BACKUP_COUNT",
+            Some(config.log_backup_count.to_string()),
+        ),
+        (
+            "WINRIG_LOCKOUT_ATTEMPTS",
+            Some(config.ad_lockout_max_attempts.to_string()),
+        ),
+        (
+            "WINRIG_LOCKOUT_WINDOW_SECONDS",
+            Some(config.ad_lockout_window_seconds.to_string()),
+        ),
+        (
+            "WINRIG_SECRET_REDACT_MIN_LENGTH",
+            Some(config.secret_redact_min_length.to_string()),
+        ),
+        (
+            "WINRIG_ALLOWED_HOSTS",
+            Some(canonical_host_list(&config.allowed_hosts)),
+        ),
+        (
+            "WINRIG_ALLOW_INSECURE_TLS",
+            Some(config.allow_insecure_tls.to_string()),
+        ),
+        (
+            "WINRIG_AUDIT_MAX_OUTPUT_CHARS",
+            Some(config.audit_max_output_chars.to_string()),
+        ),
+        (
+            "WINRIG_AUDIT_LOG_BODY",
+            Some(config.audit_log_body.to_string()),
+        ),
+        (
+            "WINRIG_CONFIRM_TIMEOUT_SECONDS",
+            Some(config.confirm_timeout_seconds.to_string()),
+        ),
+        (
+            "WINRIG_SFTP_CRED_TTL_SECONDS",
+            Some(config.sftp_cred_idle_ttl_seconds.to_string()),
+        ),
+        (
+            "WINRIG_ALLOW_FILE_WRITE",
+            Some(config.allow_file_write.to_string()),
+        ),
+        (
+            "WINRIG_MAX_WRITE_BYTES",
+            Some(config.max_write_bytes.to_string()),
+        ),
+    ]
+}
+
+/// Order does not matter for a membership list, so the canonical form is sorted.
+fn canonical_host_list(hosts: &[String]) -> String {
+    let mut sorted = hosts.to_vec();
+    sorted.sort();
+    sorted.join(",")
+}
+
+/// Text of one known variable in canonical form, or `None` when the parser
+/// refuses it (TR-PRF-18). One variable is normalized alone, so a bad value does
+/// not hide the others.
+#[must_use]
+pub fn canonical_setting(name: &str, raw: &str) -> Option<String> {
+    let target = name.to_owned();
+    let value = raw.to_owned();
+    let env = move |key: &str| (key == target.as_str()).then(|| value.clone());
+    let config = load_config_from(&env).ok()?;
+    setting_pairs(&config)
+        .into_iter()
+        .find(|(key, _)| *key == name)
+        .and_then(|(_, value)| value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -853,5 +947,48 @@ mod tests {
     fn negative_value_for_unsigned_field_is_rejected() {
         let env = source(&with(&[("WINRIG_LOG_BACKUP_COUNT", "-1")]));
         assert!(load_config_from(&env).is_err());
+    }
+
+    /// TR-PRF-18: the environment check reads the same values as the parser, so
+    /// `1` and `true` agree and a host list is normalized and sorted.
+    #[test]
+    fn setting_pairs_use_the_parser_forms() {
+        let env = source(&with(&[
+            ("WINRIG_ALLOW_INSECURE_TLS", "1"),
+            ("WINRIG_ALLOWED_HOSTS", "Host1,.Corp.Example"),
+            ("WINRIG_PASSWORD_TTL_SECONDS", "0300"),
+        ]));
+        let pairs: BTreeMap<&str, Option<String>> =
+            setting_pairs(&load_config_from(&env).expect("valid"))
+                .into_iter()
+                .collect();
+        assert_eq!(pairs["WINRIG_ALLOW_INSECURE_TLS"].as_deref(), Some("true"));
+        assert_eq!(
+            pairs["WINRIG_ALLOWED_HOSTS"].as_deref(),
+            Some(".corp.example,host1")
+        );
+        assert_eq!(pairs["WINRIG_PASSWORD_TTL_SECONDS"].as_deref(), Some("300"));
+        assert_eq!(pairs["WINRIG_LOG_DIR"], None);
+    }
+
+    /// TR-PRF-18: the empty environment gives a valid default configuration, and
+    /// one variable normalizes alone.
+    #[test]
+    fn canonical_setting_normalizes_one_variable() {
+        assert!(load_config_from(&|_| None).is_ok());
+        assert_eq!(
+            canonical_setting("WINRIG_ALLOW_INSECURE_TLS", "ON").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            canonical_setting("WINRIG_ALLOWED_HOSTS", "B,.A").as_deref(),
+            Some(".a,b")
+        );
+        assert_eq!(
+            canonical_setting("WINRIG_PORT", "9000").as_deref(),
+            Some("9000")
+        );
+        assert_eq!(canonical_setting("WINRIG_PORT", "abc"), None);
+        assert_eq!(canonical_setting("WINRIG_PORT", "70000"), None);
     }
 }

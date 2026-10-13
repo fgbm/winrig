@@ -69,6 +69,18 @@ WINRIG_TOKEN = "<token from setup>"
 For the other three clients, the profile token goes into the client configuration as a value. At the project scope, the project usually commits such a file, so `setup` prints a warning and sets the file mode to `0600` on Unix.
 :::
 
+## Check the configuration
+
+`winrig doctor` reads the client configurations of every client and of both scopes. It lists each winrig server with the effective values of the known settings: `WINRIG_ALLOWED_HOSTS`, `WINRIG_ALLOW_INSECURE_TLS`, `WINRIG_ALLOW_FILE_WRITE` and the other `WINRIG_*` settings. A setting that is absent shows its default with the marker `(default)`. The command compares the servers and marks every setting on which they disagree. It prints a value only for the known settings; every other variable appears as `set` or `empty`, so no token value is shown. The per-server plumbing (`WINRIG_TOKEN`, `WINRIG_PROFILE_DIR` and the other identity variables) is listed but not compared, because it differs between servers by design.
+
+```bash
+./target/release/winrig doctor
+```
+
+The command is read-only. It writes no configuration file and no profile. A configuration file that cannot be read is skipped with its path and a reason, and the rest of the report stays. A winrig entry that is not a stdio server, for example an HTTP entry, appears as `not compared` and does not change the exit code.
+
+Exit codes: `0` when the servers agree, `1` when they disagree or a configuration file was skipped or an entry was not parsed, `2` on a usage error.
+
 ## stdio or HTTP
 
 The stdio mode serves one local client. The HTTP mode serves several projects at the endpoint `/mcp` (default `127.0.0.1:8005`). Any MCP client works the same way. Use the stdio definition that `setup` printed, or point the client at the streamable-HTTP endpoint. Pass `Authorization: Bearer <token>`.

@@ -29,6 +29,9 @@ pub enum StartupError {
     PasswordRejected(String),
     /// Other failures at run time: exit code 1.
     Runtime(String),
+    /// The environment check found a difference or an incomplete scan: exit code 1
+    /// (TR-PRF-18).
+    EnvironmentDrift(String),
 }
 
 impl StartupError {
@@ -38,7 +41,7 @@ impl StartupError {
         match self {
             Self::Usage(_) => 2,
             Self::PasswordRejected(_) => 3,
-            Self::Runtime(_) => 1,
+            Self::Runtime(_) | Self::EnvironmentDrift(_) => 1,
         }
     }
 }
@@ -46,9 +49,10 @@ impl StartupError {
 impl std::fmt::Display for StartupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Usage(message) | Self::PasswordRejected(message) | Self::Runtime(message) => {
-                f.write_str(message)
-            }
+            Self::Usage(message)
+            | Self::PasswordRejected(message)
+            | Self::Runtime(message)
+            | Self::EnvironmentDrift(message) => f.write_str(message),
         }
     }
 }
@@ -92,6 +96,7 @@ pub fn run(cli: Cli) -> Result<(), StartupError> {
         Some(Command::List { json }) => list_command(json),
         Some(Command::Rotate { name }) => rotate_command(&name),
         Some(Command::Forget { name }) => forget_command(&name),
+        Some(Command::Doctor) => doctor_command(),
         Some(Command::Stdio { profile }) => run_stdio(profile.as_deref()),
         Some(Command::Serve {
             profile,
@@ -522,6 +527,319 @@ fn forget_command(name: &str) -> Result<(), StartupError> {
         println!("Profile {name:?} did not exist; nothing to remove.");
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Environment check
+// ---------------------------------------------------------------------------
+
+/// Variables that name a server or carry its secret; they differ between servers
+/// by design, so the drift check leaves them out (TR-PRF-18).
+const SERVER_IDENTITY_VARIABLES: [&str; 5] = [
+    "WINRIG_TOKEN",
+    "WINRIG_AUTH_TOKEN",
+    "WINRIG_PROFILE",
+    "WINRIG_PROFILE_DIR",
+    "WINRIG_STATE_DIR",
+];
+
+/// AC-PRF-69: reads the client configurations, reports the effective settings of
+/// each winrig server and marks the differences. Read-only (Q-23).
+fn doctor_command() -> Result<(), StartupError> {
+    let cwd = std::env::current_dir().map_err(|error| {
+        StartupError::Runtime(format!("cannot read the current directory: {error}"))
+    })?;
+    let mut servers = Vec::new();
+    let mut skipped = Vec::new();
+    let mut unparsed = Vec::new();
+    let mut not_compared = Vec::new();
+    for file in client_config::config_files(&cwd) {
+        match client_config::read_servers(&file) {
+            Ok(scan) => {
+                servers.extend(scan.servers);
+                for key in scan.unparsed {
+                    unparsed.push((file.path.clone(), key));
+                }
+                for key in scan.not_compared {
+                    not_compared.push((file.path.clone(), key));
+                }
+            }
+            Err(error) => skipped.push((file.path.clone(), error.reason)),
+        }
+    }
+    let servers = effective_servers(servers);
+    let differences = doctor_differences(&servers);
+    print!(
+        "{}",
+        format_doctor_report(&servers, &differences, &skipped, &unparsed, &not_compared)
+    );
+    if differences.is_empty() && skipped.is_empty() && unparsed.is_empty() {
+        return Ok(());
+    }
+    Err(StartupError::EnvironmentDrift(
+        "the winrig servers disagree or the check is incomplete".to_owned(),
+    ))
+}
+
+/// The narrowest scope wins for one server key: a local or project entry
+/// overrides the global one (TR-PRF-18).
+fn effective_servers(
+    mut servers: Vec<client_config::ServerEntry>,
+) -> Vec<client_config::ServerEntry> {
+    servers.sort_by(|a, b| {
+        (a.client, &a.key, a.scope.rank()).cmp(&(b.client, &b.key, b.scope.rank()))
+    });
+    servers.dedup_by(|a, b| a.client == b.client && a.key == b.key);
+    servers
+}
+
+/// Pairs of the known variables with the parser's values (TR-PRF-18).
+fn default_settings() -> Vec<(&'static str, Option<String>)> {
+    let config = crate::config::load_config_from(&|_| None)
+        .expect("the empty environment must give a valid default configuration");
+    crate::config::setting_pairs(&config)
+}
+
+/// Canonical or refused value of one known setting for one server (TR-PRF-18).
+#[derive(Clone, PartialEq, Eq)]
+enum Effective {
+    /// A value the parser accepted, in canonical form.
+    Value(String),
+    /// A value the parser refused; the raw text is never kept.
+    Invalid,
+    /// The setting has no default and the entry does not set it.
+    Unset,
+}
+
+/// Effective values of the known settings for one server. Each variable is
+/// normalized alone, so a bad value does not hide the others (TR-PRF-18).
+fn setting_values(
+    entry: &client_config::ServerEntry,
+    defaults: &[(&'static str, Option<String>)],
+) -> std::collections::BTreeMap<&'static str, Effective> {
+    defaults
+        .iter()
+        .map(|(name, default)| {
+            let raw = entry
+                .variables
+                .get(*name)
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty());
+            let effective = match raw {
+                None => default.clone().map_or(Effective::Unset, Effective::Value),
+                Some(text) => crate::config::canonical_setting(name, text)
+                    .map_or(Effective::Invalid, Effective::Value),
+            };
+            (*name, effective)
+        })
+        .collect()
+}
+
+fn is_default(entry: &client_config::ServerEntry, name: &str) -> bool {
+    entry
+        .variables
+        .get(name)
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
+}
+
+fn configured_settings(
+    servers: &[client_config::ServerEntry],
+    defaults: &[(&'static str, Option<String>)],
+) -> Vec<&'static str> {
+    defaults
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| servers.iter().any(|server| !is_default(server, name)))
+        .collect()
+}
+
+fn other_variables(
+    servers: &[client_config::ServerEntry],
+    defaults: &[(&'static str, Option<String>)],
+) -> std::collections::BTreeSet<String> {
+    let known: std::collections::BTreeSet<&str> = defaults.iter().map(|(name, _)| *name).collect();
+    let mut others = std::collections::BTreeSet::new();
+    for server in servers {
+        for name in server.variables.keys() {
+            if !known.contains(name.as_str()) {
+                others.insert(name.clone());
+            }
+        }
+    }
+    others
+}
+
+/// AC-PRF-69: the report lists each server with its effective settings and marks
+/// the differing ones. A value outside the known settings is never printed
+/// (DR-4).
+fn format_doctor_report(
+    servers: &[client_config::ServerEntry],
+    differences: &[String],
+    skipped: &[(std::path::PathBuf, String)],
+    unparsed: &[(std::path::PathBuf, String)],
+    not_compared: &[(std::path::PathBuf, String)],
+) -> String {
+    use std::fmt::Write;
+
+    let defaults = default_settings();
+    let settings = configured_settings(servers, &defaults);
+    let others = other_variables(servers, &defaults);
+    let mut out = String::new();
+    if servers.is_empty() {
+        out.push_str("No winrig servers found in the client configurations.\n");
+    } else {
+        let _ = writeln!(out, "winrig servers ({}):", servers.len());
+        for server in servers {
+            let account = server.profile.as_deref().unwrap_or("(unknown)");
+            let _ = writeln!(
+                out,
+                "  {} [{} {}, profile={}]",
+                escape_text(&server.key),
+                server.client.as_str(),
+                server.scope.as_str(),
+                escape_text(account)
+            );
+            let _ = writeln!(
+                out,
+                "    path: {}",
+                escape_text(&server.path.display().to_string())
+            );
+            let values = setting_values(server, &defaults);
+            for &name in &settings {
+                let effective = values.get(name).cloned().unwrap_or(Effective::Unset);
+                let _ = writeln!(
+                    out,
+                    "    {name} = {}",
+                    escape_text(&display_effective(&effective, is_default(server, name)))
+                );
+            }
+            for name in &others {
+                let Some(raw) = server.variables.get(name.as_str()) else {
+                    continue;
+                };
+                let shown = if raw.is_empty() { "(empty)" } else { "set" };
+                let _ = writeln!(out, "    {} = {shown}", escape_text(name));
+            }
+        }
+    }
+    for (path, reason) in skipped {
+        let _ = writeln!(
+            out,
+            "skipped: {}: {}",
+            escape_text(&path.display().to_string()),
+            escape_text(reason)
+        );
+    }
+    for (path, key) in unparsed {
+        let _ = writeln!(
+            out,
+            "not parsed: {}: {}",
+            escape_text(&path.display().to_string()),
+            escape_text(key)
+        );
+    }
+    for (path, key) in not_compared {
+        let _ = writeln!(
+            out,
+            "not compared: {}: {} (HTTP entry)",
+            escape_text(&path.display().to_string()),
+            escape_text(key)
+        );
+    }
+    if differences.is_empty() {
+        out.push_str("differences: none\n");
+    } else {
+        let _ = writeln!(out, "differences ({}):", differences.len());
+        for line in differences {
+            let _ = writeln!(out, "  {line}");
+        }
+    }
+    out
+}
+
+fn display_effective(effective: &Effective, is_default: bool) -> String {
+    match effective {
+        Effective::Value(text) if text.is_empty() && is_default => "(default)".to_owned(),
+        Effective::Value(text) if text.is_empty() => "(empty)".to_owned(),
+        Effective::Value(text) if is_default => format!("{text} (default)"),
+        Effective::Value(text) => text.clone(),
+        Effective::Invalid => "invalid".to_owned(),
+        Effective::Unset => "(unset)".to_owned(),
+    }
+}
+
+fn doctor_differences(servers: &[client_config::ServerEntry]) -> Vec<String> {
+    let defaults = default_settings();
+    let settings = configured_settings(servers, &defaults);
+    let others = other_variables(servers, &defaults);
+    let values: Vec<std::collections::BTreeMap<&'static str, Effective>> = servers
+        .iter()
+        .map(|server| setting_values(server, &defaults))
+        .collect();
+    let mut lines = Vec::new();
+    for &name in &settings {
+        let per_server: Vec<Effective> = values
+            .iter()
+            .map(|map| map.get(name).cloned().unwrap_or(Effective::Unset))
+            .collect();
+        if all_equal(&per_server) {
+            continue;
+        }
+        let rendered: Vec<String> = servers
+            .iter()
+            .zip(&per_server)
+            .map(|(server, effective)| {
+                format!(
+                    "{}/{}={}",
+                    server.client.as_str(),
+                    escape_text(&server.key),
+                    escape_text(&display_effective(effective, is_default(server, name)))
+                )
+            })
+            .collect();
+        lines.push(format!("{}: {}", escape_text(name), rendered.join(", ")));
+    }
+    for name in &others {
+        if is_server_identity_variable(name) {
+            continue;
+        }
+        let per_server: Vec<Option<&str>> = servers
+            .iter()
+            .map(|server| server.variables.get(name.as_str()).map(String::as_str))
+            .collect();
+        if !all_equal(&per_server) {
+            lines.push(format!("{}: differs", escape_text(name)));
+        }
+    }
+    lines
+}
+
+fn is_server_identity_variable(name: &str) -> bool {
+    SERVER_IDENTITY_VARIABLES.contains(&name)
+}
+
+fn all_equal<T: PartialEq>(values: &[T]) -> bool {
+    values.windows(2).all(|pair| pair[0] == pair[1])
+}
+
+/// Replaces a control character so a value cannot forge a report line (TR-PRF-18).
+fn escape_text(text: &str) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            character if character.is_control() => {
+                let _ = write!(out, "\\x{:02x}", character as u32);
+            }
+            character => out.push(character),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,5 +1338,269 @@ mod tests {
         }
         let error = resolve_scope_with(None, true, || Ok("nope".to_owned())).expect_err("junk");
         assert!(matches!(error, StartupError::Usage(_)), "{error}");
+    }
+
+    fn doctor_entry(
+        key: &str,
+        scope: client_config::SourceScope,
+        profile: &str,
+        variables: &[(&str, &str)],
+    ) -> client_config::ServerEntry {
+        client_config::ServerEntry {
+            client: client_config::Client::Opencode,
+            scope,
+            path: PathBuf::from("/tmp/project/opencode.json"),
+            key: key.to_owned(),
+            profile: Some(profile.to_owned()),
+            variables: variables
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect(),
+        }
+    }
+
+    fn render(servers: &[client_config::ServerEntry]) -> String {
+        format_doctor_report(servers, &doctor_differences(servers), &[], &[], &[])
+    }
+
+    /// AC-PRF-69: the report lists each server, marks the differing setting and
+    /// never prints a value outside the known settings (DR-4).
+    #[test]
+    fn doctor_report_marks_differences_without_secrets() {
+        let servers = vec![
+            doctor_entry(
+                "winrig",
+                client_config::SourceScope::Global,
+                "corp",
+                &[
+                    ("WINRIG_ALLOW_INSECURE_TLS", "true"),
+                    ("WINRIG_TOKEN", "secret-token-value"),
+                ],
+            ),
+            doctor_entry(
+                "winrig-lab",
+                client_config::SourceScope::Project,
+                "lab",
+                &[("WINRIG_ALLOWED_HOSTS", "web01")],
+            ),
+        ];
+        let report = render(&servers);
+        assert!(report.contains("WINRIG_ALLOW_INSECURE_TLS"), "{report}");
+        assert!(report.contains("winrig=true"), "{report}");
+        assert!(report.contains("winrig-lab=false (default)"), "{report}");
+        assert!(report.contains("WINRIG_TOKEN = set"), "{report}");
+        assert!(!report.contains("secret-token-value"), "{report}");
+    }
+
+    /// AC-PRF-69: the known settings are compared through the parser, so `1`
+    /// and `true` agree and an unset setting equals the default.
+    #[test]
+    fn doctor_normalizes_equivalent_values() {
+        let forms = vec![
+            doctor_entry(
+                "a",
+                client_config::SourceScope::Global,
+                "corp",
+                &[("WINRIG_ALLOW_INSECURE_TLS", "1")],
+            ),
+            doctor_entry(
+                "b",
+                client_config::SourceScope::Project,
+                "corp",
+                &[("WINRIG_ALLOW_INSECURE_TLS", "true")],
+            ),
+        ];
+        assert!(
+            doctor_differences(&forms).is_empty(),
+            "{:?}",
+            doctor_differences(&forms)
+        );
+
+        let unset = vec![
+            doctor_entry("a", client_config::SourceScope::Global, "corp", &[]),
+            doctor_entry(
+                "b",
+                client_config::SourceScope::Project,
+                "corp",
+                &[("WINRIG_ALLOW_INSECURE_TLS", "false")],
+            ),
+        ];
+        assert!(
+            doctor_differences(&unset).is_empty(),
+            "{:?}",
+            doctor_differences(&unset)
+        );
+    }
+
+    /// AC-PRF-69: a project entry with the same key overrides the global one.
+    #[test]
+    fn doctor_lets_a_project_entry_override_the_global_one() {
+        let servers = effective_servers(vec![
+            doctor_entry(
+                "winrig",
+                client_config::SourceScope::Global,
+                "corp",
+                &[("WINRIG_ALLOW_INSECURE_TLS", "true")],
+            ),
+            doctor_entry(
+                "winrig",
+                client_config::SourceScope::Project,
+                "corp",
+                &[("WINRIG_ALLOW_INSECURE_TLS", "false")],
+            ),
+        ]);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].scope, client_config::SourceScope::Project);
+    }
+
+    /// AC-PRF-69: agreement between servers is reported, not marked as drift.
+    #[test]
+    fn doctor_report_without_difference_says_none() {
+        let servers = vec![
+            doctor_entry(
+                "a",
+                client_config::SourceScope::Global,
+                "corp",
+                &[("WINRIG_ALLOW_INSECURE_TLS", "true")],
+            ),
+            doctor_entry(
+                "b",
+                client_config::SourceScope::Project,
+                "corp",
+                &[("WINRIG_ALLOW_INSECURE_TLS", "true")],
+            ),
+        ];
+        let report = render(&servers);
+        assert!(report.contains("differences: none"), "{report}");
+    }
+
+    #[test]
+    fn doctor_report_without_servers_says_so() {
+        let report = format_doctor_report(&[], &[], &[], &[], &[]);
+        assert!(report.contains("No winrig servers"), "{report}");
+    }
+
+    /// DR-4: only the known settings show a value; any other variable is masked.
+    #[test]
+    fn doctor_masks_unknown_variables() {
+        let servers = vec![doctor_entry(
+            "winrig",
+            client_config::SourceScope::Global,
+            "corp",
+            &[
+                ("HTTPS_PROXY", "http://u:p@h"),
+                ("X_AUTH", "Bearer a.b.c"),
+                ("WINRIG_PASSWORD_TTL_SECONDS", "300"),
+            ],
+        )];
+        let report = render(&servers);
+        assert!(
+            report.contains("WINRIG_PASSWORD_TTL_SECONDS = 300"),
+            "{report}"
+        );
+        assert!(!report.contains("http://u:p@h"), "{report}");
+        assert!(!report.contains("Bearer a.b.c"), "{report}");
+        assert!(report.contains("HTTPS_PROXY = set"), "{report}");
+        assert!(report.contains("X_AUTH = set"), "{report}");
+    }
+
+    /// TR-PRF-18: a skipped file, an unparsed entry and a non-compared entry
+    /// appear with their path; only the first two affect the exit code.
+    #[test]
+    fn doctor_reports_skipped_unparsed_and_not_compared_lines() {
+        let report = format_doctor_report(
+            &[],
+            &[],
+            &[(PathBuf::from("/a/b.json"), "not a regular file".to_owned())],
+            &[(PathBuf::from("/c/d.json"), "winrig-broken".to_owned())],
+            &[(PathBuf::from("/e/f.json"), "winrig-http".to_owned())],
+        );
+        assert!(
+            report.contains("skipped: /a/b.json: not a regular file"),
+            "{report}"
+        );
+        assert!(
+            report.contains("not parsed: /c/d.json: winrig-broken"),
+            "{report}"
+        );
+        assert!(
+            report.contains("not compared: /e/f.json: winrig-http (HTTP entry)"),
+            "{report}"
+        );
+    }
+
+    /// TR-PRF-18: the per-server plumbing differs by design, so it is listed but
+    /// never marked as drift.
+    #[test]
+    fn doctor_excludes_server_identity_variables_from_drift() {
+        let servers = vec![
+            doctor_entry(
+                "winrig",
+                client_config::SourceScope::Global,
+                "corp",
+                &[
+                    ("WINRIG_TOKEN", "one"),
+                    ("WINRIG_PROFILE_DIR", "/a"),
+                    ("WINRIG_STATE_DIR", "/s1"),
+                ],
+            ),
+            doctor_entry(
+                "winrig-lab",
+                client_config::SourceScope::Project,
+                "lab",
+                &[
+                    ("WINRIG_TOKEN", "two"),
+                    ("WINRIG_PROFILE_DIR", "/b"),
+                    ("WINRIG_STATE_DIR", "/s2"),
+                ],
+            ),
+        ];
+        assert!(
+            doctor_differences(&servers).is_empty(),
+            "{:?}",
+            doctor_differences(&servers)
+        );
+        let report = render(&servers);
+        assert!(report.contains("WINRIG_TOKEN = set"), "{report}");
+        assert!(report.contains("WINRIG_PROFILE_DIR = set"), "{report}");
+    }
+
+    /// TR-PRF-18: a control character in a key or a profile name cannot forge a
+    /// report line.
+    #[test]
+    fn doctor_escapes_control_characters() {
+        let servers = vec![doctor_entry(
+            "bad\nkey",
+            client_config::SourceScope::Global,
+            "p\u{7}q",
+            &[("WINRIG_X\u{1b}", "1")],
+        )];
+        let report = render(&servers);
+        assert!(report.contains("bad\\nkey"), "{report}");
+        assert!(report.contains("profile=p\\x07q"), "{report}");
+        assert!(report.contains("WINRIG_X\\x1b"), "{report}");
+        assert!(!report.contains("bad\nkey"), "{report}");
+    }
+
+    /// TR-PRF-18: a value the parser refuses is shown as `invalid`, never raw,
+    /// and the other settings stay normalized.
+    #[test]
+    fn doctor_marks_an_invalid_value_without_printing_it() {
+        let servers = vec![doctor_entry(
+            "winrig",
+            client_config::SourceScope::Global,
+            "corp",
+            &[
+                ("WINRIG_PORT", "not-a-port"),
+                ("WINRIG_ALLOW_INSECURE_TLS", "1"),
+            ],
+        )];
+        let report = render(&servers);
+        assert!(report.contains("WINRIG_PORT = invalid"), "{report}");
+        assert!(
+            report.contains("WINRIG_ALLOW_INSECURE_TLS = true"),
+            "{report}"
+        );
+        assert!(!report.contains("not-a-port"), "{report}");
     }
 }

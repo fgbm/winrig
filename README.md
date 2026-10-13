@@ -211,7 +211,10 @@ winrig list                              # a table: NAME, USER, PATH; no secrets
 winrig list --json                       # the same data in JSON
 winrig rotate corp                       # re-encrypt with a fresh profile token
 winrig forget corp                       # delete the profile (idempotent)
+winrig doctor                            # compare the settings of the winrig servers; read-only
 ```
+
+`doctor` reads the client configurations of every client and of both scopes. It lists each winrig server with the effective values of the known settings: `WINRIG_ALLOWED_HOSTS`, `WINRIG_ALLOW_INSECURE_TLS`, `WINRIG_ALLOW_FILE_WRITE` and the other `WINRIG_*` settings. A setting that is absent shows its default with the marker `(default)`. The command compares the servers and marks every setting on which they disagree. It prints a value only for the known settings; every other variable appears as `set` or `empty`, so no token value is shown. The per-server plumbing (`WINRIG_TOKEN`, `WINRIG_PROFILE_DIR` and the other identity variables) is listed but not compared, because it differs between servers by design. A winrig entry that is not a stdio server, for example an HTTP entry, appears as `not compared` and does not change the exit code. The command writes nothing. It exits with code 0 when the servers agree, 1 when they disagree or a configuration file was skipped or an entry was not parsed, and 2 on a usage error.
 
 The profile file is `corp.json` in the profile directory. It holds the format version, the canonical account name, the HKDF-SHA256 salt, the XChaCha20-Poly1305 nonce and the ciphertext. The account name is bound as associated data. On Unix, the file mode is `0600` inside a directory `0700`. Wider permissions give a warning, not a refusal. The log tells a wrong profile token from a damaged file, but the client gets 401 in both cases. If `WINRIG_AUTH_TOKEN` matches the profile token, the start fails.
 

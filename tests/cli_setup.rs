@@ -4,7 +4,9 @@
 //! Covers scenarios the library unit tests cannot see: `setup` prints the token
 //! once and never puts the password into the output (AC-PRF-01/21), a corrupt
 //! profile blocks stdio (AC-PRF-41), `serve` without secrets refuses (AC-PRF-47),
-//! and writing the client config loses no foreign entries (AC-PRF-15).
+//! writing the client config loses no foreign entries (AC-PRF-15), and `doctor`
+//! compares the settings of the winrig servers without writing anything
+//! (AC-PRF-69).
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -810,5 +812,212 @@ fn write_config_carries_allowed_hosts() {
         "stderr: {}",
         String::from_utf8_lossy(&malformed.stderr)
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Invokes `winrig doctor` with an isolated home and profile/state directories.
+fn run_doctor(dir: &std::path::Path, home: &std::path::Path) -> std::process::Output {
+    let mut command = Command::new(winrig());
+    command
+        .arg("doctor")
+        .current_dir(dir)
+        .env("WINRIG_PROFILE_DIR", dir.join("profiles"))
+        .env("WINRIG_STATE_DIR", dir.join("state"));
+    isolated_home(&mut command, home);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run doctor")
+}
+
+/// AC-PRF-69: `doctor` lists each winrig server, marks the differing setting,
+/// prints no token value and changes no file (TR-PRF-18, Q-23). Drift is exit 1.
+#[test]
+fn doctor_reports_drift_and_writes_nothing() {
+    let dir = temp_dir("doctor");
+    let home = dir.join("home");
+    let opencode = home.join(".config").join("opencode");
+    std::fs::create_dir_all(&opencode).expect("opencode dir");
+    let config = opencode.join("opencode.json");
+    std::fs::write(
+        &config,
+        r#"{"mcp":{
+            "winrig":{"type":"local","command":["/opt/winrig","stdio","--profile","corp"],"environment":{"WINRIG_ALLOW_INSECURE_TLS":"true","WINRIG_TOKEN":"{file:/secret/winrig-token}"}},
+            "winrig-lab":{"type":"local","command":["/opt/winrig","stdio","--profile","lab"],"environment":{"WINRIG_ALLOWED_HOSTS":"web01"}}
+        }}"#,
+    )
+    .expect("write config");
+    let before = std::fs::read(&config).expect("read before");
+
+    let output = run_doctor(&dir, &home);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "drift is exit 1; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("WINRIG_ALLOW_INSECURE_TLS"), "{stdout}");
+    assert!(stdout.contains("WINRIG_ALLOWED_HOSTS"), "{stdout}");
+    assert!(stdout.contains("winrig=true"), "{stdout}");
+    assert!(stdout.contains("differences"), "{stdout}");
+    assert!(
+        !stdout.contains("{file:/secret/winrig-token}"),
+        "token reference on stdout: {stdout}"
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("{file:/secret/winrig-token}"));
+
+    // Read-only (Q-23): the configuration is byte-identical and nothing is created.
+    assert_eq!(
+        std::fs::read(&config).expect("read after"),
+        before,
+        "doctor must not change the configuration"
+    );
+    assert!(
+        !dir.join("profiles").exists(),
+        "doctor must not create the profile directory"
+    );
+    assert!(
+        !dir.join("state").exists(),
+        "doctor must not create the state directory"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// AC-PRF-69: `1` and `true` agree, so there is no drift and the exit code is 0.
+#[test]
+fn doctor_reports_no_drift_with_exit_zero() {
+    let dir = temp_dir("doctor-clean");
+    let home = dir.join("home");
+    let opencode = home.join(".config").join("opencode");
+    std::fs::create_dir_all(&opencode).expect("opencode dir");
+    std::fs::write(
+        opencode.join("opencode.json"),
+        r#"{"mcp":{
+            "winrig":{"type":"local","command":["/opt/winrig","stdio","--profile","corp"],"environment":{"WINRIG_ALLOW_INSECURE_TLS":"1"}},
+            "winrig-lab":{"type":"local","command":["/opt/winrig","stdio","--profile","lab"],"environment":{"WINRIG_ALLOW_INSECURE_TLS":"true"}}
+        }}"#,
+    )
+    .expect("write config");
+
+    let output = run_doctor(&dir, &home);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("differences: none"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// AC-PRF-69: a winrig HTTP entry is reported as `not compared` and does not
+/// change the exit code; only real drift or a skipped file does.
+#[test]
+fn doctor_does_not_fail_on_an_http_entry() {
+    let dir = temp_dir("doctor-http-entry");
+    let home = dir.join("home");
+    let opencode = home.join(".config").join("opencode");
+    std::fs::create_dir_all(&opencode).expect("opencode dir");
+    std::fs::write(
+        opencode.join("opencode.json"),
+        r#"{"mcp":{
+            "winrig":{"type":"local","command":["/opt/winrig","stdio","--profile","corp"],"environment":{"WINRIG_ALLOW_INSECURE_TLS":"true"}},
+            "winrig-http":{"type":"remote","command":["/opt/winrig","serve"]}
+        }}"#,
+    )
+    .expect("write config");
+
+    let output = run_doctor(&dir, &home);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "an HTTP entry must not fail the check; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("not compared:"), "{stdout}");
+    assert!(stdout.contains("winrig-http"), "{stdout}");
+    assert!(stdout.contains("differences: none"), "{stdout}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// AC-PRF-69, DR-4: an inline token value never reaches stdout or stderr.
+#[test]
+fn doctor_never_prints_an_inline_token() {
+    let dir = temp_dir("doctor-secret");
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::write(
+        home.join(".claude.json"),
+        r#"{"mcpServers":{"winrig":{"type":"stdio","command":"/opt/winrig","args":["stdio","--profile","corp"],"env":{"WINRIG_TOKEN":"deadbeefdeadbeefdeadbeefdeadbeef","WINRIG_AUTH_TOKEN":"cafebabecafebabecafebabecafebabe","HTTPS_PROXY":"http://u:p@h"}}}}"#,
+    )
+    .expect("write config");
+
+    let output = run_doctor(&dir, &home);
+    assert_eq!(output.status.code(), Some(0));
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!combined.contains("deadbeef"), "{combined}");
+    assert!(!combined.contains("cafebabe"), "{combined}");
+    assert!(!combined.contains("http://u:p@h"), "{combined}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// AC-PRF-69: a malformed configuration is skipped with the file name, the rest
+/// of the report stays, and the exit code is 1.
+#[test]
+fn doctor_malformed_config_is_skipped_not_hidden() {
+    let dir = temp_dir("doctor-bad");
+    let home = dir.join("home");
+    let opencode = home.join(".config").join("opencode");
+    std::fs::create_dir_all(&opencode).expect("opencode dir");
+    std::fs::write(opencode.join("opencode.json"), b"{ not json").expect("write config");
+
+    let output = run_doctor(&dir, &home);
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("skipped:"), "{stdout}");
+    assert!(stdout.contains("opencode.json"), "{stdout}");
+    assert!(stdout.contains("cannot parse JSON"), "{stdout}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// AC-PRF-69, DR-4: a TOML parse error must not echo the offending line, which
+/// can hold a token. A duplicated `WINRIG_TOKEN` is the worst case.
+#[test]
+fn doctor_toml_error_does_not_echo_a_token() {
+    let dir = temp_dir("doctor-toml-secret");
+    let home = dir.join("home");
+    let codex = home.join(".codex");
+    std::fs::create_dir_all(&codex).expect("codex dir");
+    std::fs::write(
+        codex.join("config.toml"),
+        "[mcp_servers.winrig]\ncommand = \"/opt/winrig\"\nargs = [\"stdio\", \"--profile\", \"corp\"]\n\n[mcp_servers.winrig.env]\nWINRIG_TOKEN = \"deadbeefdeadbeefdeadbeefdeadbeef\"\nWINRIG_TOKEN = \"deadbeefdeadbeefdeadbeefdeadbeef\"\n",
+    )
+    .expect("write config");
+
+    let output = run_doctor(&dir, &home);
+    assert_eq!(output.status.code(), Some(1));
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("deadbeef"),
+        "the token leaked: {combined}"
+    );
+    assert!(combined.contains("cannot parse TOML"), "{combined}");
+    assert!(combined.contains("config.toml"), "{combined}");
     std::fs::remove_dir_all(&dir).ok();
 }

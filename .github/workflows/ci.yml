@@ -83,4 +83,4 @@ jobs:
           curl -sfL "https://github.com/errata-ai/vale/releases/download/v${VALE_VERSION}/vale_${VALE_VERSION}_Linux_64-bit.tar.gz" | tar xz -C "$RUNNER_TEMP" vale
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - name: Check text
-        run: vale --minAlertLevel=error docs/style docs/adr/0016-documentation-language-and-style.md
+        run: vale --minAlertLevel=error README.md README.ru.md AGENTS.md CONTRIBUTING.md SECURITY.md CHANGELOG.md docs/IMPLEMENTATION_CYCLE.md docs/QUESTIONS.md docs/REQUIREMENTS.md docs/ROADMAP.md docs/adr docs/style docs/site/src/content .github/PULL_REQUEST_TEMPLATE.md

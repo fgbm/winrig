@@ -1,28 +1,29 @@
-//! Чистые функции исполнения: редактирование секретов, усечение, поля аудита.
+//! Pure execution helpers: secret redaction, truncation and audit fields.
 //!
-//! Модуль не знает о WinRM (ADR-0003): только текстовые преобразования.
-//! Порт `agent/executor.py`. В Rust отдельная off-loop обёртка не нужна:
-//! WinRM-вызов асинхронен по своей природе (TR-REL-01).
+//! The module knows nothing about WinRM (ADR-0003); it only transforms text. A
+//! port of `agent/executor.py`. Rust needs no separate off-loop wrapper: a WinRM
+//! call is asynchronous by nature (TR-REL-01).
 
-/// Предел вывода, возвращаемого агенту, в символах.
+/// Limit of the output returned to the agent, in characters.
 pub const MAX_OUTPUT_CHARS: usize = 60_000;
 
-/// Предел поля аудита в символах.
+/// Limit of an audit field, in characters.
 pub const AUDIT_FIELD_MAX_CHARS: usize = 200;
 
-/// Граничная линия блока аудита (TR-SEC-09).
+/// Boundary line of the audit block (TR-SEC-09).
 pub const SEPARATOR: &str =
     "════════════════════════════════════════════════════════════════════════════════";
 
-/// Чем заменяется секрет.
+/// What a secret is replaced with.
 const REDACTED: &str = "***";
 
-/// Заменяет секреты на `***` во всех формах (DR-4, Q-02).
+/// Replaces secrets with `***` in all forms (DR-4, Q-02).
 ///
-/// Редактируются и сырой вид, и PowerShell-экранированный (`'` → `''`), чтобы
-/// секрет не утёк через экранирование. Секреты короче `min_length` и пустые не
-/// трогаются: иначе вывод искажался бы. Более длинные секреты заменяются
-/// первыми, чтобы вложенные не оставляли хвостов. Функция идемпотентна.
+/// Both the raw form and the PowerShell-escaped form (`'` to `''`) are redacted,
+/// so the secret cannot leak through escaping. Secrets shorter than `min_length`
+/// and empty ones are left alone: otherwise the output would be distorted. Longer
+/// secrets are replaced first, so nested ones leave no tail. The function is
+/// idempotent.
 #[must_use]
 pub fn redact(text: &str, secrets: &[String], min_length: usize) -> String {
     if text.is_empty() {
@@ -37,8 +38,8 @@ pub fn redact(text: &str, secrets: &[String], min_length: usize) -> String {
     let mut result = text.to_owned();
     for secret in candidates {
         let escaped = secret.replace('\'', "''");
-        // Обе формы могут совпасть, если в секрете нет `'`; тогда вторая
-        // замена — no-op (идемпотентность).
+        // Both forms can be equal when the secret has no `'`; the second
+        // replacement is then a no-op.
         for form in [secret, escaped.as_str()] {
             result = result.replace(form, REDACTED);
         }
@@ -46,7 +47,7 @@ pub fn redact(text: &str, secrets: &[String], min_length: usize) -> String {
     result
 }
 
-/// Усекает вывод до `limit` с пометкой о полном размере.
+/// Truncates the output to `limit` with a note about the full size.
 #[must_use]
 pub fn truncate(text: &str, limit: usize) -> String {
     let total = text.chars().count();
@@ -57,10 +58,10 @@ pub fn truncate(text: &str, limit: usize) -> String {
     format!("{head}\n\n--- truncated ({total} chars total, showing first {limit}) ---")
 }
 
-/// Делает строку безопасной для одной строки аудита (TR-SEC-09).
+/// Makes a string safe for one audit line (TR-SEC-09).
 ///
-/// Переводы строк заменяются пробелом, разделитель `═` — на `-`, длина
-/// ограничивается, чтобы поле не подделывало структуру блока аудита.
+/// Line breaks become spaces, the `═` separator becomes `-`, and the length is
+/// capped, so the field cannot forge the audit block structure.
 #[must_use]
 pub fn escape_log_field(value: &str) -> String {
     let cleaned: String = value
@@ -74,32 +75,31 @@ pub fn escape_log_field(value: &str) -> String {
     cleaned.chars().take(AUDIT_FIELD_MAX_CHARS).collect()
 }
 
-/// Значение, пригодное для одной строки основного журнала (TR-SEC-09).
+/// A value suitable for one main log line (TR-SEC-09).
 ///
-/// Хост и идентификатор сессии приходят из аргументов инструмента, поэтому
-/// переводы строк схлопываются в пробел, чтобы значение не подделало строку.
+/// The host and the session id come from tool arguments, so line breaks collapse
+/// to a space and cannot forge the line.
 #[must_use]
 pub fn sanitize_log_value(value: &str) -> String {
     value.replace(['\r', '\n'], " ")
 }
 
-/// Делает тело аудита неспособным подделать границу блока (TR-SEC-09).
+/// Makes the audit body unable to forge the block boundary (TR-SEC-09).
 ///
-/// Тело (команда и вывод внешней системы) остаётся многострочным, поэтому
-/// нейтрализуется только последовательность разделителя. Строка-замена
-/// начинается с `[`, такую строку тело тоже не может выдать за маркер.
+/// The body (a command and the output of an external system) stays multi-line, so
+/// only the separator sequence is neutralized. The replacement starts with `[`,
+/// so the body cannot pass a line off as a marker either.
 #[must_use]
 pub fn neutralize_separator(body: &str) -> String {
     body.replace(SEPARATOR, "[separator]")
 }
 
-/// Делает значение диалога подтверждения неспособным подделать его структуру.
+/// Makes a confirmation prompt value unable to forge its structure.
 ///
-/// Имена сервисов, PID-значения, ключи реестра, пути и версии ПО приходят из
-/// аргументов инструмента и попадают в сообщение elicitation. Переводы строк
-/// схлопываются в пробел, разделитель `═` заменяется на `-`, длина
-/// ограничивается, чтобы аргумент не мог вставить собственную «строку» диалога
-/// или разорвать его до неверного согласия (DR-5).
+/// Service names, PIDs, registry keys, paths and software versions come from tool
+/// arguments and reach the elicitation message. Line breaks collapse to a space,
+/// the `═` separator becomes `-`, and the length is capped, so an argument cannot
+/// insert its own dialog "line" or break the dialog into a wrong consent (DR-5).
 #[must_use]
 pub fn sanitize_prompt_value(value: &str) -> String {
     let cleaned: String = value
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn truncate_counts_chars_not_bytes() {
-        // Многобайтовый текст не должен паниковать на срезе.
+        // Multi-byte text must not panic on the slice.
         let text = "ы".repeat(50);
         let result = truncate(&text, 10);
         assert!(result.starts_with(&"ы".repeat(10)));

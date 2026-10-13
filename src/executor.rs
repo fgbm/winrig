@@ -55,7 +55,7 @@ pub fn truncate(text: &str, limit: usize) -> String {
         return text.to_owned();
     }
     let head: String = text.chars().take(limit).collect();
-    format!("{head}\n\n--- truncated ({total} chars total, showing first {limit}) ---")
+    format!("{head}\n\n--- truncated ({total} characters total, showing the first {limit}) ---")
 }
 
 /// Makes a string safe for one audit line (TR-SEC-09).
@@ -239,6 +239,6 @@ mod tests {
         let text = "ы".repeat(50);
         let result = truncate(&text, 10);
         assert!(result.starts_with(&"ы".repeat(10)));
-        assert!(result.contains("50 chars total"));
+        assert!(result.contains("50 characters total"));
     }
 }

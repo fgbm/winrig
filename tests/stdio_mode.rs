@@ -112,9 +112,7 @@ fn stdio_serves_mcp_over_clean_stdout() {
 
     // Log lines go to stderr, not stdout.
     assert!(
-        err_lines
-            .iter()
-            .any(|line| line.contains("winrig starting")),
+        err_lines.iter().any(|line| line.contains("winrig starts")),
         "expected a startup log line on stderr"
     );
 

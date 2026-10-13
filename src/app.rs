@@ -135,8 +135,8 @@ fn ensure_auth_token_is_not_profile_key(
     };
     if profile::decrypts(profile_path, token) {
         return Err(StartupError::Usage(
-            "WINRIG_AUTH_TOKEN must not be the profile access token: the profile key must not be \
-             stored on the server"
+            "WINRIG_AUTH_TOKEN must not be the profile token. The server must not store the \
+             profile key."
                 .to_owned(),
         ));
     }
@@ -171,7 +171,7 @@ fn bind_profile(
                 target: "winrig::auth",
                 profile = %name,
                 reason = profile_bind_reason(&error),
-                "profile could not be bound"
+                "cannot bind the profile"
             );
             StartupError::Usage(format!("profile error: {error}"))
         })
@@ -335,10 +335,12 @@ fn setup_command(
                 scope.as_str()
             );
             if client.supports_file_reference() {
-                println!("The token is referenced from a private file, not inlined.");
+                println!(
+                    "The entry references the token in a private file and does not inline it."
+                );
             } else if scope.is_project() {
                 eprintln!(
-                    "warning: {} may be committed to version control and contains the profile \
+                    "warning: {} can go into version control and contains the profile \
                      token; keep it out of the repository",
                     written.display()
                 );
@@ -347,7 +349,7 @@ fn setup_command(
         None => println!("Profile {name:?} created at {}", path.display()),
     }
     println!();
-    println!("Access token (shown once, store it with the client; the server keeps no key):");
+    println!("Profile token (shown once, store it with the client; the server keeps no key):");
     println!("{token}");
     println!();
     println!("MCP server definition:");
@@ -368,7 +370,9 @@ fn setup_command(
 fn resolve_scope(explicit: Option<Scope>) -> Result<Scope, StartupError> {
     use std::io::IsTerminal;
     resolve_scope_with(explicit, std::io::stdin().is_terminal(), || {
-        prompt("Write the winrig MCP entry to (g)lobal or (p)roject config? [g/p]: ")
+        prompt(
+            "Write the winrig MCP entry to the (g)lobal or the (p)roject client configuration? [g/p]: ",
+        )
     })
 }
 
@@ -384,8 +388,8 @@ fn resolve_scope_with(
     }
     if !interactive {
         return Err(StartupError::Usage(
-            "no config scope: pass --scope global or --scope project (interactive input is not \
-             available)"
+            "no client configuration scope: pass --scope global or --scope project (interactive \
+             input is not available)"
                 .to_owned(),
         ));
     }
@@ -489,7 +493,7 @@ fn rotate_command(name: &str) -> Result<(), StartupError> {
         .map_err(|error| StartupError::Usage(format!("profile error: {error}")))?;
     warn_loose_permissions(&path);
     println!("Profile {name:?} rotated.");
-    println!("New access token (shown once):");
+    println!("New profile token (shown once):");
     println!("{token}");
     Ok(())
 }
@@ -550,7 +554,7 @@ fn run_serve(
     let has_profile_token = config.profile_token.is_some();
     if !has_token && !has_profile_token {
         return Err(StartupError::Usage(
-            "no secret configured: create a profile and pass --token/WINRIG_TOKEN, or set \
+            "no secret is set: create a profile and pass --token/WINRIG_TOKEN, or set \
              --auth-token/WINRIG_AUTH_TOKEN for the header path"
                 .to_owned(),
         ));
@@ -592,7 +596,7 @@ fn run_serve(
     // CLI flags override the environment.
     let bind_host = host.unwrap_or(&config.mcp_bind_host).to_owned();
     let bind_port = port.unwrap_or(config.mcpo_port);
-    tracing::info!(profile = %name, host = %bind_host, port = bind_port, "winrig starting (streamable-http on /mcp)");
+    tracing::info!(profile = %name, host = %bind_host, port = bind_port, "winrig starts (streamable-http on /mcp)");
     let runtime = build_runtime()?;
     runtime.block_on(serve_http(
         registry,
@@ -611,7 +615,7 @@ fn run_stdio(requested: Option<&str>) -> Result<(), StartupError> {
 
     let bound = bind_profile(&locations, &name, &token_from(&config)?)?;
     let registry = registry_for(&config);
-    tracing::info!(profile = %name, "winrig starting (stdio)");
+    tracing::info!(profile = %name, "winrig starts (stdio)");
     let runtime = build_runtime()?;
     runtime.block_on(serve_stdio(registry, Arc::new(config), bound))
 }
@@ -711,8 +715,8 @@ async fn serve_stdio(
 fn stdio_outcome(profile_refused: bool) -> Result<(), StartupError> {
     if profile_refused {
         return Err(StartupError::PasswordRejected(
-            "The profile password was rejected twice; the profile is refused until it is updated. \
-             Run 'winrig setup' to change it."
+            "The host rejected the profile password twice. The server refuses the profile until \
+             the operator updates it. Run 'winrig setup' to change it."
                 .to_owned(),
         ));
     }

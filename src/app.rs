@@ -1,8 +1,8 @@
-//! Оркестрация `winrig`: подкоманды, журналирование, режимы serve/stdio (ADR-0009).
+//! Orchestration of `winrig`: subcommands, logging and the serve/stdio modes (ADR-0009).
 //!
-//! Библиотечный слой держит всю логику, поэтому CLI-пути, журналирование и оба
-//! режима покрываются тестами без запуска процесса. `src/main.rs` — тонкая
-//! обёртка, возвращающая код выхода.
+//! The library layer holds all the logic, so the CLI paths, logging and both modes
+//! are covered by tests without starting a process. `src/main.rs` is a thin
+//! wrapper that returns the exit code.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,18 +21,18 @@ use crate::profile;
 use crate::server::WinrigServer;
 use crate::session::{RegistryConfig, SessionRegistry, WinrmTransportImpl};
 
-/// Ошибка верхнего уровня с кодом выхода.
+/// Top-level error with an exit code.
 pub enum StartupError {
-    /// Невалидная конфигурация или профиль: код 2.
+    /// Invalid configuration or profile: exit code 2.
     Usage(String),
-    /// Профиль отвергнут дважды: код 3 (AC-PRF-56).
+    /// Profile rejected twice: exit code 3 (AC-PRF-56).
     PasswordRejected(String),
-    /// Прочие ошибки времени выполнения: код 1.
+    /// Other failures at run time: exit code 1.
     Runtime(String),
 }
 
 impl StartupError {
-    /// Код выхода процесса.
+    /// Process status returned to the shell.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         match self {
@@ -53,7 +53,7 @@ impl std::fmt::Display for StartupError {
     }
 }
 
-/// Разбирает аргументы и выполняет подкоманду. Возвращает код выхода.
+/// Parses the arguments and runs the subcommand. Returns the exit code.
 #[must_use]
 pub fn main() -> i32 {
     match run(Cli::parse()) {
@@ -65,11 +65,11 @@ pub fn main() -> i32 {
     }
 }
 
-/// Выполняет разобранную команду.
+/// Dispatches the parsed command.
 ///
 /// # Errors
 ///
-/// [`StartupError`] с кодом выхода.
+/// [`StartupError`] with an exit code.
 pub fn run(cli: Cli) -> Result<(), StartupError> {
     match cli.command {
         Some(Command::Setup {
@@ -110,7 +110,7 @@ pub fn run(cli: Cli) -> Result<(), StartupError> {
     }
 }
 
-/// Каталоги и конфигурация, общие для подкоманд.
+/// Directories and configuration shared by the subcommands.
 fn load() -> Result<(Locations, AppConfig), StartupError> {
     let config = load_config_from(&|name| std::env::var(name).ok())
         .map_err(|error| StartupError::Usage(format!("configuration error: {error}")))?;
@@ -125,7 +125,7 @@ fn warn_loose_permissions(path: &std::path::Path) {
     }
 }
 
-/// AC-PRF-50: общий секрет не должен совпадать с токеном профиля.
+/// AC-PRF-50: the shared secret must not equal the profile token.
 fn ensure_auth_token_is_not_profile_key(
     config: &AppConfig,
     profile_path: &std::path::Path,
@@ -143,9 +143,8 @@ fn ensure_auth_token_is_not_profile_key(
     Ok(())
 }
 
-/// Загружает профиль и привязывает его к процессу.
-/// Причина отказа привязки профиля для журнала (AC-PRF-40/41). Значение
-/// токена не участвует.
+/// Why a binding failed, for the log (AC-PRF-40/41). The token value is not part
+/// of it.
 fn profile_bind_reason(error: &profile::ProfileError) -> &'static str {
     match error {
         profile::ProfileError::InvalidToken { .. } => "invalid profile token",
@@ -155,7 +154,7 @@ fn profile_bind_reason(error: &profile::ProfileError) -> &'static str {
     }
 }
 
-/// Загружает профиль и привязывает его к процессу.
+/// Loads the account and binds it to the process.
 fn bind_profile(
     locations: &Locations,
     name: &str,
@@ -166,8 +165,8 @@ fn bind_profile(
     BoundProfile::bind(path, token)
         .map(Arc::new)
         .map_err(|error| {
-            // AC-PRF-40/41: причина различается в журнале; значение токена не
-            // логируется.
+            // AC-PRF-40/41: the reason differs in the log; the token value is not
+            // logged.
             tracing::warn!(
                 target: "winrig::auth",
                 profile = %name,
@@ -178,7 +177,7 @@ fn bind_profile(
         })
 }
 
-/// Разрешает имя профиля и держит lock процесса (AC-PRF-54).
+/// Resolves the profile name and holds the process lock (AC-PRF-54).
 fn prepare_profile(
     requested: Option<&str>,
 ) -> Result<
@@ -206,7 +205,7 @@ fn prepare_profile(
     Ok((locations, config, name, lock, state_dir))
 }
 
-/// Журналы без `WINRIG_LOG_DIR` идут в каталог состояния профиля (AC-PRF-08/09).
+/// Logs without `WINRIG_LOG_DIR` go to the profile state directory (AC-PRF-08/09).
 fn resolve_log_dir(config: &AppConfig, profile_state: &std::path::Path) -> std::path::PathBuf {
     config
         .log_dir
@@ -236,13 +235,13 @@ fn build_runtime() -> Result<tokio::runtime::Runtime, StartupError> {
 }
 
 // ---------------------------------------------------------------------------
-// Профильные подкоманды
+// Profile subcommands
 // ---------------------------------------------------------------------------
 
-/// Читает пароль без эха с терминала; без tty берёт строку из stdin.
+/// Prompts on a terminal without echo; falls back to a line from stdin.
 ///
-/// В неинтерактивном запуске (скрипт, конвейер) эхо подавить нельзя, поэтому
-/// пароль читается построчно из stdin — это используется и тестами.
+/// In a non-interactive run (script, pipe) the echo cannot be suppressed, so the
+/// password is read line by line from stdin; the tests use this too.
 fn read_password(label: &str) -> Result<String, StartupError> {
     use std::io::IsTerminal;
     if std::io::stdin().is_terminal() {
@@ -277,8 +276,8 @@ fn setup_command(
             "profile name must not be empty".to_owned(),
         ));
     }
-    // Уровень записи решается до создания профиля: отказ не оставляет ни
-    // профиля, ни конфига (ADR-0012).
+    // The write scope is decided before the profile is created: a refusal leaves
+    // neither a profile nor a config (ADR-0012).
     let write_target = match (write_config, scope) {
         (None, Some(_)) => {
             return Err(StartupError::Usage(
@@ -309,9 +308,10 @@ fn setup_command(
         .map_err(|error| StartupError::Usage(format!("profile error: {error}")))?;
     warn_loose_permissions(&path);
 
-    // Каталог состояния профиля нужен и серверу, и клиенту: кладём его в
-    // определение, чтобы запись была самодостаточной (ADR-0009). В конфиг
-    // уходит корень — имя профиля сервер добавит сам, один раз (TR-PRF-15).
+    // The profile state directory is needed by both the server and the client, so
+    // it goes into the definition and the entry is self-contained (ADR-0009). The
+    // root goes to the config; the server adds the profile name itself, once
+    // (TR-PRF-15).
     locations
         .state_dir_for(name)
         .map_err(|error| StartupError::Usage(error.to_string()))?;
@@ -363,8 +363,8 @@ fn setup_command(
     Ok(())
 }
 
-/// Разрешает уровень записи конфига: явный флаг, вопрос в терминале либо
-/// отказ в неинтерактивном запуске (ADR-0012).
+/// Resolves the config write scope: the explicit flag, a terminal question, or a
+/// refusal in a non-interactive run (ADR-0012).
 fn resolve_scope(explicit: Option<Scope>) -> Result<Scope, StartupError> {
     use std::io::IsTerminal;
     resolve_scope_with(explicit, std::io::stdin().is_terminal(), || {
@@ -372,8 +372,8 @@ fn resolve_scope(explicit: Option<Scope>) -> Result<Scope, StartupError> {
     })
 }
 
-/// Тестируемое ядро выбора уровня: без флага и без терминала — отказ, а не
-/// молчаливый выбор (ADR-0012).
+/// Testable core of the scope choice: without a flag and without a terminal it
+/// refuses instead of choosing silently (ADR-0012).
 fn resolve_scope_with(
     explicit: Option<Scope>,
     interactive: bool,
@@ -398,7 +398,7 @@ fn resolve_scope_with(
     }
 }
 
-/// Читает строку из stdin, печатая приглашение в stderr.
+/// Reads a line from stdin, printing the label to stderr.
 fn prompt(label: &str) -> Result<String, StartupError> {
     use std::io::Write;
     eprint!("{label}");
@@ -410,10 +410,10 @@ fn prompt(label: &str) -> Result<String, StartupError> {
     Ok(line.trim().to_owned())
 }
 
-/// Печатает профили: таблицу с заголовками или JSON (`--json`).
+/// Prints the profiles: a table with headers, or JSON (`--json`).
 ///
-/// Секретов нет ни в одном формате: только имя, учётная запись, время
-/// создания и путь.
+/// There are no secrets in either format: only the name, the account, the creation
+/// time and the path.
 fn list_command(json: bool) -> Result<(), StartupError> {
     let (locations, _config) = load()?;
     let names = locations.profile_names();
@@ -494,10 +494,10 @@ fn rotate_command(name: &str) -> Result<(), StartupError> {
     Ok(())
 }
 
-/// Разрешает путь профиля, отвергая имя с символами пути (AC-PRF-27).
+/// Resolves the profile path, rejecting a name with path characters (AC-PRF-27).
 ///
-/// Без этой проверки `rotate`/`forget` с именем вида `../victim` обратились бы
-/// к файлу вне каталога профилей.
+/// Without this check `rotate`/`forget` with a name like `../victim` would reach a
+/// file outside the profile directory.
 fn resolve_profile_path(
     locations: &Locations,
     name: &str,
@@ -521,16 +521,16 @@ fn forget_command(name: &str) -> Result<(), StartupError> {
 }
 
 // ---------------------------------------------------------------------------
-// Серверные режимы
+// Server modes
 // ---------------------------------------------------------------------------
 
-/// Запускает HTTP-режим: с профилем (токен профиля) или только по общему
-/// секрету. Хотя бы один секрет обязателен (AC-PRF-47).
+/// Starts the HTTP mode: with a profile (profile token), or by the shared secret
+/// alone. At least one secret is required (AC-PRF-47).
 ///
-/// `port`/`host` и `token`/`auth_token` — явные флаги CLI; они перекрывают
-/// `WINRIG_PORT`/`WINRIG_BIND_HOST` и `WINRIG_TOKEN`/`WINRIG_AUTH_TOKEN`
-/// (CLI > env). Секреты, переданные аргументом, видны в списке процессов,
-/// поэтому их `Debug` редактирован.
+/// `port`/`host` and `token`/`auth_token` are explicit CLI flags; they override
+/// `WINRIG_PORT`/`WINRIG_BIND_HOST` and `WINRIG_TOKEN`/`WINRIG_AUTH_TOKEN`
+/// (CLI > env). A secret passed as an argument is visible in the process list, so
+/// its `Debug` is redacted.
 fn run_serve(
     requested: Option<&str>,
     port: Option<u16>,
@@ -539,7 +539,7 @@ fn run_serve(
     auth_token: Option<&SecretArg>,
 ) -> Result<(), StartupError> {
     let (locations, mut config) = load()?;
-    // Явные флаги перекрывают окружение.
+    // Explicit flags override the environment.
     if let Some(secret) = auth_token {
         config.mcp_auth_token = Some(secret.expose().to_owned());
     }
@@ -556,8 +556,8 @@ fn run_serve(
         ));
     }
 
-    // Профиль используется, если задан его токен; иначе работает только
-    // путь по заголовкам с WINRIG_AUTH_TOKEN.
+    // The profile is used when its token is set; otherwise only the header path
+    // with WINRIG_AUTH_TOKEN works.
     let (bound, name, state_dir, _lock) = if has_profile_token {
         locations
             .ensure()
@@ -589,7 +589,7 @@ fn run_serve(
         mcp_auth_token: config.mcp_auth_token.clone().map(Arc::new),
         profile: bound.clone(),
     };
-    // Флаги CLI перекрывают окружение.
+    // CLI flags override the environment.
     let bind_host = host.unwrap_or(&config.mcp_bind_host).to_owned();
     let bind_port = port.unwrap_or(config.mcpo_port);
     tracing::info!(profile = %name, host = %bind_host, port = bind_port, "winrig starting (streamable-http on /mcp)");
@@ -626,7 +626,7 @@ fn token_from(config: &AppConfig) -> Result<String, StartupError> {
     })
 }
 
-/// Собирает и запускает axum-сервер с гейтом и MCP-эндпоинтом.
+/// Builds and starts the axum server with the gate and the MCP endpoint.
 async fn serve_http(
     registry: Arc<SessionRegistry>,
     config: Arc<AppConfig>,
@@ -661,10 +661,11 @@ async fn serve_http(
         .map_err(|error| StartupError::Runtime(format!("server error: {error}")))
 }
 
-/// Обслуживает MCP по stdin/stdout до закрытия входа.
+/// Serves MCP over stdin/stdout until the input closes.
 ///
-/// Если профиль отвергнут дважды (AC-PRF-56), фоновая проверка отменяет
-/// сервис, и функция возвращает [`StartupError::PasswordRejected`] (код 3).
+/// When the profile is rejected twice (AC-PRF-56), a background check cancels the
+/// service and the function returns [`StartupError::PasswordRejected`] (exit code
+/// 3).
 async fn serve_stdio(
     registry: Arc<SessionRegistry>,
     config: Arc<AppConfig>,
@@ -681,8 +682,8 @@ async fn serve_stdio(
         .await
         .map_err(|error| StartupError::Runtime(format!("stdio error: {error}")))?;
 
-    // Наблюдатель за отказом профиля: stdio обслуживает один профиль, поэтому
-    // достаточно периодической проверки его имени.
+    // Watcher for a profile refusal: stdio serves one profile, so a periodic check
+    // of its name is enough.
     let token = running.cancellation_token();
     let watcher_registry = Arc::clone(&registry);
     let watcher_username = username.clone();
@@ -705,8 +706,8 @@ async fn serve_stdio(
     stdio_outcome(registry.is_profile_refused(&username))
 }
 
-/// Итог stdio-сессии: отказ профиля даёт [`StartupError::PasswordRejected`]
-/// (код 3), нормальное завершение — успех (AC-PRF-56).
+/// A profile refusal gives [`StartupError::PasswordRejected`] (exit code 3); a
+/// normal end is success (AC-PRF-56).
 fn stdio_outcome(profile_refused: bool) -> Result<(), StartupError> {
     if profile_refused {
         return Err(StartupError::PasswordRejected(
@@ -718,10 +719,10 @@ fn stdio_outcome(profile_refused: bool) -> Result<(), StartupError> {
     Ok(())
 }
 
-/// Ждёт SIGINT (Ctrl+C) или, на Unix, SIGTERM.
+/// Waits for SIGINT (Ctrl+C) or, on Unix, SIGTERM.
 ///
-/// systemd останавливает процесс SIGTERM; без его обработки сервер завершался
-/// без graceful shutdown, обрывая активные запросы.
+/// systemd stops the process with SIGTERM; without handling it the server ended
+/// without a graceful shutdown and cut active requests.
 async fn shutdown_signal(cancellation: CancellationToken) {
     #[cfg(unix)]
     {
@@ -745,10 +746,10 @@ async fn shutdown_signal(cancellation: CancellationToken) {
     cancellation.cancel();
 }
 
-/// Настраивает журналирование: stderr плюс файл с ротацией.
+/// Sets up logging: stderr plus a file with rotation.
 ///
-/// Аудит (`target = "winrig::audit"`) всегда пишется в отдельный файл на уровне
-/// INFO, независимо от `WINRIG_LOG_LEVEL`.
+/// The audit (`target = "winrig::audit"`) always goes to a separate file at INFO
+/// level, regardless of `WINRIG_LOG_LEVEL`.
 fn setup_logging(
     config: &AppConfig,
     log_dir: &std::path::Path,
@@ -784,7 +785,7 @@ fn setup_logging(
     Ok(())
 }
 
-/// Пишет и в stderr, и в файл: stderr виден в консоли, файл переживает рестарт.
+/// Mirrors every record to stderr plus the log file.
 struct FileAndStderr {
     file: RotatingFile,
 }
@@ -817,7 +818,7 @@ impl std::io::Write for FileAndStderrWriter<'_> {
     }
 }
 
-/// Абсолютный путь к текущему бинарю.
+/// Absolute location of the running executable.
 fn binary_path() -> std::path::PathBuf {
     std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("winrig"))
 }
@@ -838,7 +839,7 @@ mod tests {
         dir
     }
 
-    /// AC-PRF-08/09: журнал идёт в каталог состояния профиля либо в WINRIG_LOG_DIR.
+    /// AC-PRF-08/09: the log goes to the profile state directory, or to WINRIG_LOG_DIR.
     #[test]
     fn log_dir_prefers_explicit_override() {
         let profile_state = PathBuf::from("/tmp/profile-state");
@@ -858,7 +859,7 @@ mod tests {
         assert_eq!(resolve_log_dir(&config, &profile_state), profile_state);
     }
 
-    /// AC-PRF-50: общий секрет, совпавший с токеном профиля, отказывает старту.
+    /// AC-PRF-50: a shared secret equal to the profile token refuses startup.
     #[test]
     fn auth_token_equal_to_profile_key_is_refused() {
         let dir = temp_dir("key");
@@ -872,7 +873,7 @@ mod tests {
         .expect("config");
         let error = ensure_auth_token_is_not_profile_key(&config, &path).expect_err("must refuse");
         assert!(matches!(error, StartupError::Usage(_)));
-        // Отличный секрет не мешает.
+        // Another secret does not block.
         let config = load_config_from(&|name| match name {
             "WINRIG_AUTH_TOKEN" => Some("different".to_owned()),
             _ => None,
@@ -882,17 +883,17 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-47: без профиля и без токена HTTP-старт отказывает с кодом 2.
+    /// AC-PRF-47: without a profile and without a token the HTTP start refuses with exit code 2.
     #[test]
     fn serve_without_any_secret_is_refused() {
-        // Проверяем ветку через конфиг: оба секрета пусты.
+        // Check the branch through the config: both secrets are empty.
         let config = load_config_from(&|_| None::<String>).expect("config parses without secrets");
         assert!(config.mcp_auth_token.is_none());
         assert!(config.profile_token.is_none());
     }
 
-    /// AC-PRF-40/41: причина отказа в журнале различает неверный токен и
-    /// повреждённый файл.
+    /// AC-PRF-40/41: the refusal reason in the log tells a wrong token from a
+    /// corrupt file.
     #[test]
     fn profile_bind_reason_distinguishes_failures() {
         let dir = temp_dir("reason");
@@ -908,7 +909,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-42: токен не задан — отказ с упоминанием переменной.
+    /// AC-PRF-42: no token set is a refusal that names the variable.
     #[test]
     fn missing_profile_token_names_variable() {
         let config = load_config_from(&|_| None::<String>).expect("config parses without secrets");
@@ -916,7 +917,7 @@ mod tests {
         assert!(error.to_string().contains("WINRIG_TOKEN"));
     }
 
-    /// AC-PRF-43: профиль не найден — отказ с именем и каталогом.
+    /// AC-PRF-43: a missing profile is a refusal that names the profile and the directory.
     #[test]
     fn missing_profile_is_reported_by_locations() {
         let dir = temp_dir("missing");
@@ -930,7 +931,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-20: несколько профилей без имени — отказ.
+    /// AC-PRF-20: several profiles without a name are refused.
     #[test]
     fn ambiguous_profile_is_refused() {
         let dir = temp_dir("ambiguous");
@@ -953,8 +954,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-56: отказ профиля переводит stdio-итог в код 3, обычное
-    /// завершение — в 0.
+    /// AC-PRF-56: a profile refusal maps the stdio outcome to exit code 3, a
+    /// normal end to 0.
     #[test]
     fn stdio_outcome_maps_refusal_to_code_three() {
         let refused = stdio_outcome(true).expect_err("must refuse");
@@ -963,7 +964,7 @@ mod tests {
         assert!(stdio_outcome(false).is_ok());
     }
 
-    /// AC-PRF-27: `rotate`/`forget` отвергают имя с символами пути.
+    /// AC-PRF-27: `rotate`/`forget` reject a name with path characters.
     #[test]
     fn rotate_and_forget_reject_path_names() {
         let dir = temp_dir("traversal");
@@ -979,7 +980,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-60: без флага и без терминала уровень не угадывается.
+    /// AC-PRF-60: without a flag and without a terminal the scope is not guessed.
     #[test]
     fn resolve_scope_non_interactive_refuses_without_flag() {
         let error = resolve_scope_with(None, false, || unreachable!("must not read"))
@@ -987,7 +988,7 @@ mod tests {
         assert!(error.to_string().contains("--scope"), "{error}");
     }
 
-    /// AC-PRF-62: явный флаг не читает stdin.
+    /// AC-PRF-62: an explicit flag does not read stdin.
     #[test]
     fn resolve_scope_prefers_explicit() {
         let scope = resolve_scope_with(Some(Scope::Project), false, || {
@@ -998,7 +999,7 @@ mod tests {
         assert_eq!(scope, Scope::Project);
     }
 
-    /// ADR-0012: интерактивный ответ принимает g/global/p/project.
+    /// ADR-0012: an interactive answer accepts g/global/p/project.
     #[test]
     fn resolve_scope_interactive_accepts_forms() {
         for (answer, expected) in [

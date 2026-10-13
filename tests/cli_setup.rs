@@ -1,10 +1,10 @@
-//! Интеграционные проверки CLI-настройки: реальный бинарь, временные каталоги,
-//! фиктивный Windows-хост не нужен.
+//! Integration checks of the CLI setup: the real binary, temporary directories and
+//! no fake Windows host.
 //!
-//! Покрывает сценарии, которые unit-тесты библиотеки не видят: `setup` печатает
-//! токен один раз и не кладёт пароль в вывод (AC-PRF-01/21), повреждённый
-//! профиль не пускает stdio (AC-PRF-41), `serve` без секретов отказывает
-//! (AC-PRF-47), запись конфига клиента не теряет чужие записи (AC-PRF-15).
+//! Covers scenarios the library unit tests cannot see: `setup` prints the token
+//! once and never puts the password into the output (AC-PRF-01/21), a corrupt
+//! profile blocks stdio (AC-PRF-41), `serve` without secrets refuses (AC-PRF-47),
+//! and writing the client config loses no foreign entries (AC-PRF-15).
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -20,19 +20,18 @@ fn winrig() -> &'static str {
     env!("CARGO_BIN_EXE_winrig")
 }
 
-/// Изолирует дочерний процесс от конфигов клиента на машине сборки.
+/// Isolates the child process from the client configs on the build machine.
 ///
-/// `global_config_path` по XDG-спеке отдаёт `XDG_CONFIG_HOME` приоритет над
-/// `HOME`, поэтому один только `HOME` не герметичен: на раннере CI переменная
-/// задана, и `setup --write-config --scope global` пишет мимо временного
-/// каталога теста. Без этого тест проходил локально и падал в CI.
+/// `global_config_path` follows XDG and gives `XDG_CONFIG_HOME` priority over
+/// `HOME`, so `HOME` alone is not airtight: the CI runner sets the variable and
+/// `setup --write-config --scope global` writes outside the test directory.
 fn isolated_home(command: &mut Command, home: &std::path::Path) {
     command
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"));
 }
 
-/// AC-PRF-01/21: `setup` создаёт профиль, печатает токен и не печатает пароль.
+/// AC-PRF-01/21: `setup` creates the profile, prints the token and never prints the password.
 #[test]
 fn setup_prints_token_once_and_never_the_password() {
     let dir = temp_dir("setup");
@@ -62,12 +61,12 @@ fn setup_prints_token_once_and_never_the_password() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // Пароль не появляется ни в одном потоке (AC-PRF-21).
+    // The password appears in no stream (AC-PRF-21).
     assert!(!stdout.contains("super-secret-pass"), "password on stdout");
     assert!(!stderr.contains("super-secret-pass"), "password on stderr");
 
-    // Токен напечатан вместе с определением сервера и один раз как значение:
-    // извлекаем hex-токен и убеждаемся, что он же стоит в JSON-определении.
+    // The token is printed next to the server definition and once as a value:
+    // extract the hex token and check the same one is in the JSON definition.
     let token = stdout
         .lines()
         .find(|line| line.len() == 64 && line.chars().all(|c| c.is_ascii_hexdigit()))
@@ -77,7 +76,7 @@ fn setup_prints_token_once_and_never_the_password() {
         "the printed token must be the one in the server definition"
     );
 
-    // На диске токена нет (AC-PRF-03 на уровне CLI).
+    // No token on disk (AC-PRF-03 at the CLI level).
     let profile = dir.join("corp.json");
     assert!(profile.is_file(), "profile must exist");
     let raw = std::fs::read_to_string(&profile).expect("read");
@@ -87,7 +86,7 @@ fn setup_prints_token_once_and_never_the_password() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// AC-PRF-24: повторный `setup` без `--overwrite` отказывает.
+/// AC-PRF-24: a second `setup` without `--overwrite` refuses.
 #[test]
 fn setup_twice_without_overwrite_refuses() {
     let dir = temp_dir("overwrite");
@@ -123,13 +122,13 @@ fn setup_twice_without_overwrite_refuses() {
         "stderr: {}",
         String::from_utf8_lossy(&second.stderr)
     );
-    // С `--overwrite` повтор проходит.
+    // With `--overwrite` the second run passes.
     let third = create(&["--overwrite"]);
     assert_eq!(third.status.code(), Some(0), "overwrite must succeed");
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// AC-PRF-41: повреждённый профиль не пускает stdio и не раскрывает содержимое.
+/// AC-PRF-41: a corrupt profile blocks stdio and reveals no content.
 #[test]
 fn corrupt_profile_refuses_stdio() {
     let dir = temp_dir("corrupt");
@@ -151,7 +150,7 @@ fn corrupt_profile_refuses_stdio() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// AC-PRF-47: без профиля и без `WINRIG_AUTH_TOKEN` HTTP-режим отказывает.
+/// AC-PRF-47: without a profile and without `WINRIG_AUTH_TOKEN` the HTTP mode refuses.
 #[test]
 fn serve_without_secret_refuses() {
     let dir = temp_dir("nosecret");
@@ -173,8 +172,8 @@ fn serve_without_secret_refuses() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// AC-PRF-15: `setup --write-config` не теряет чужие записи и для opencode не
-/// кладёт токен в сам конфиг.
+/// AC-PRF-15: `setup --write-config` loses no foreign entries, and for opencode it
+/// keeps the token out of the config.
 #[test]
 fn write_config_preserves_other_entries() {
     let dir = temp_dir("writeconfig");
@@ -228,8 +227,8 @@ fn write_config_preserves_other_entries() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// AC-PRF-61: `--scope project` пишет в git-корень, а токен opencode — в
-/// приватный state-каталог профиля, не в дерево проекта.
+/// AC-PRF-61: `--scope project` writes to the git root, and the opencode token goes
+/// to the private profile state directory, not the project tree.
 #[test]
 fn write_config_project_writes_to_git_root() {
     let dir = temp_dir("writeconfig-project");
@@ -296,8 +295,8 @@ fn write_config_project_writes_to_git_root() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// AC-PRF-60: без `--scope` и без терминала setup отказывает, не создавая
-/// ни профиль, ни конфиг.
+/// AC-PRF-60: without `--scope` and without a terminal, setup refuses and creates
+/// neither a profile nor a config.
 #[test]
 fn write_config_without_scope_refuses_non_interactive() {
     let dir = temp_dir("writeconfig-noscope");
@@ -338,7 +337,7 @@ fn write_config_without_scope_refuses_non_interactive() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// AC-PRF-63: `--scope` без `--write-config` — ошибка использования.
+/// AC-PRF-63: `--scope` without `--write-config` is a usage error.
 #[test]
 fn scope_without_write_config_refuses() {
     let dir = temp_dir("scope-nowrite");
@@ -366,8 +365,8 @@ fn scope_without_write_config_refuses() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// ADR-0012: project-уровень клиента с инлайн-токеном предупреждает о
-/// возможном коммите.
+/// ADR-0012: a project-level client with an inline token warns about a possible
+/// commit.
 #[test]
 fn write_config_claude_project_warns_about_commit() {
     let dir = temp_dir("writeconfig-claude-project");
@@ -418,7 +417,7 @@ fn write_config_claude_project_warns_about_commit() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Создаёт профиль и возвращает токен из stdout.
+/// Sets up a profile and returns the token from stdout.
 fn create_profile(dir: &std::path::Path, name: &str, user: &str) -> String {
     let output = Command::new(winrig())
         .arg("setup")
@@ -446,7 +445,7 @@ fn create_profile(dir: &std::path::Path, name: &str, user: &str) -> String {
         .to_owned()
 }
 
-/// AC-PRF-10: `list` печатает таблицу с заголовками, без секретов.
+/// AC-PRF-10: `list` prints a table with column titles and no secrets.
 #[test]
 fn list_prints_table_with_headers() {
     let dir = temp_dir("list-table");
@@ -472,7 +471,7 @@ fn list_prints_table_with_headers() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// AC-PRF-10: `list --json` печатает валидный JSON без секретов.
+/// AC-PRF-10: `list --json` prints valid JSON with no secrets.
 #[test]
 fn list_json_is_valid_and_secret_free() {
     let dir = temp_dir("list-json");
@@ -497,7 +496,7 @@ fn list_json_is_valid_and_secret_free() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// `list --json` при отсутствии профилей даёт пустой список, не ошибку.
+/// `list --json` with no profiles gives an empty result, not an error.
 #[test]
 fn list_json_empty_directory() {
     let dir = temp_dir("list-empty");
@@ -517,7 +516,7 @@ fn list_json_empty_directory() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// `serve --port/--host` перекрывают `WINRIG_PORT`/`WINRIG_BIND_HOST`.
+/// `serve --port/--host` override `WINRIG_PORT`/`WINRIG_BIND_HOST`.
 #[test]
 fn serve_port_flag_overrides_env() {
     let dir = temp_dir("serve-port");
@@ -534,14 +533,14 @@ fn serve_port_flag_overrides_env() {
         .env("WINRIG_PROFILE_DIR", &dir)
         .env("WINRIG_STATE_DIR", dir.join("state"))
         .env("WINRIG_TOKEN", &token)
-        // Окружение задаёт другой порт: флаг должен победить.
+        // The environment sets another port: the flag must win.
         .env("WINRIG_PORT", "18422")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn serve");
 
-    // Ждём, пока сервер поднимется и ответит на выбранном флагом порту.
+    // Wait for the server to come up and answer on the port chosen by the flag.
     let mut reachable = false;
     for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -560,7 +559,7 @@ fn serve_port_flag_overrides_env() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Чистый разрыв: старое имя переменной отказывает старту и называет новое.
+/// A clean break: the old variable name refuses startup and names the new one.
 #[test]
 fn legacy_env_name_refuses_startup() {
     let dir = temp_dir("legacy-env");
@@ -585,7 +584,7 @@ fn legacy_env_name_refuses_startup() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// `serve --token` задаёт токен профиля аргументом, без WINRIG_TOKEN.
+/// `serve --token` sets the profile token as an argument, without WINRIG_TOKEN.
 #[test]
 fn serve_token_flag_authenticates_profile() {
     let dir = temp_dir("serve-token");
@@ -601,7 +600,7 @@ fn serve_token_flag_authenticates_profile() {
         .arg(&token)
         .env("WINRIG_PROFILE_DIR", &dir)
         .env("WINRIG_STATE_DIR", dir.join("state"))
-        // Токен в окружении отсутствует: единственный источник — аргумент.
+        // No token in the environment: the argument is the only source.
         .env_remove("WINRIG_TOKEN")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -615,7 +614,7 @@ fn serve_token_flag_authenticates_profile() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// `serve --auth-token` задаёт общий секрет аргументом, без WINRIG_AUTH_TOKEN.
+/// `serve --auth-token` sets the shared secret as an argument, without WINRIG_AUTH_TOKEN.
 #[test]
 fn serve_auth_token_flag_authenticates_header_path() {
     let dir = temp_dir("serve-auth");
@@ -641,7 +640,7 @@ fn serve_auth_token_flag_authenticates_header_path() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Флаг перекрывает окружение: с неверным env на порт берётся токен из флага.
+/// The flag overrides the environment: with a wrong env token, the port uses the flag token.
 #[test]
 fn serve_token_flag_overrides_env() {
     let dir = temp_dir("serve-token-override");
@@ -670,7 +669,7 @@ fn serve_token_flag_overrides_env() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Отправляет initialize и возвращает HTTP-код.
+/// Sends initialize and returns the HTTP code.
 fn probe_initialize(port: u16, bearer: &str) -> Option<u32> {
     probe_with_headers(port, &[("Authorization", &format!("Bearer {bearer}"))])
 }
@@ -720,7 +719,7 @@ fn probe_with_headers(port: u16, headers: &[(&str, &str)]) -> Option<u32> {
     None
 }
 
-/// Запускает `setup corp` с паролем на stdin и дополнительными аргументами.
+/// Starts `setup corp` with the password on stdin and extra arguments.
 fn run_setup(
     dir: &std::path::Path,
     home: &std::path::Path,
@@ -749,9 +748,9 @@ fn run_setup(
         .expect("run setup")
 }
 
-/// AC-PRF-68: `--allowed-hosts` пишет `WINRIG_ALLOWED_HOSTS` в запись клиента,
-/// повторный `setup` без флага её убирает, неверный список отвергается с
-/// именем флага (TR-PRF-17).
+/// AC-PRF-68: `--allowed-hosts` writes `WINRIG_ALLOWED_HOSTS` into the client entry,
+/// a second `setup` without the flag removes it, and a malformed list is refused
+/// with the flag name (TR-PRF-17).
 #[test]
 fn write_config_carries_allowed_hosts() {
     let dir = temp_dir("allowed-hosts");

@@ -103,3 +103,32 @@ jobs:
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - name: Check text
         run: vale --minAlertLevel=error README.md README.ru.md AGENTS.md CONTRIBUTING.md SECURITY.md CHANGELOG.md docs/IMPLEMENTATION_CYCLE.md docs/QUESTIONS.md docs/REQUIREMENTS.md docs/ROADMAP.md docs/adr docs/style docs/site/src/content .github/PULL_REQUEST_TEMPLATE.md
+
+  # The comment check of AGENTS.md section 10. The fixture proves the check is
+  # not a no-op: the good fixture passes and the bad fixture must fail with the
+  # expected number of findings.
+  comments:
+    name: Style (comments)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install ripgrep
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
+      - name: Check comments
+        run: |
+          scripts/check-comments.sh
+          scripts/check-comments.sh scripts/testdata/comments/good
+          set +e
+          bad="$(scripts/check-comments.sh scripts/testdata/comments/bad 2>&1)"
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "::error::check-comments.sh did not flag the fixture"
+            exit 1
+          fi
+          count="$(printf '%s\n' "$bad" | grep -c '\[rule: ' || true)"
+          if [ "$count" -ne 14 ]; then
+            echo "::error::expected 14 findings in the fixture, got $count"
+            printf '%s\n' "$bad"
+            exit 1
+          fi

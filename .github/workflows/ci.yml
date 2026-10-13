@@ -127,8 +127,8 @@ jobs:
             exit 1
           fi
           count="$(printf '%s\n' "$bad" | grep -c '\[rule: ' || true)"
-          if [ "$count" -ne 15 ]; then
-            echo "::error::expected 15 findings in the fixture, got $count"
+          if [ "$count" -ne 19 ]; then
+            echo "::error::expected 19 findings in the fixture, got $count"
             printf '%s\n' "$bad"
             exit 1
           fi

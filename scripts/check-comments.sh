@@ -45,6 +45,9 @@ emit() {
 
 # A short restatement of the code, such as "The user." or "Creates a tenant.".
 restatement='^\s*//[/!]?\s*(The|A|An|Returns?|Creates?|Gets?|Sets?|Checks?|Builds?|Reads?|Writes?)\b[^.]{0,40}\.$'
+# A one-line doc of at most six words that opens with the item noun instead of its
+# contract, such as "Location of the profile." or "Requested profile.".
+restatement_dodge='^\s*//[/!]?\s*(Location|File|Where|Which|Requested|Cause|Value|Name|Path|Number)\b( \S+){0,5}\.\s*$'
 # A reference to a review finding, an issue or a change slice. A winrig ID such as
 # DR-4 or ADR-0009 has a letter then a hyphen, so the letter-then-digit rule does not
 # match it and such a reference stays permitted.
@@ -59,6 +62,7 @@ boilerplate='^\s*//[/!]?\s*The function (returns|selects|takes|checks)\b'
 cyrillic='^\s*//.*[А-Яа-яЁё]'
 
 emit restatement < <(scan "$restatement" "${dirs[@]}")
+emit restatement < <(scan "$restatement_dodge" "${dirs[@]}")
 emit review-reference < <(scan "$review_id" "${dirs[@]}")
 emit review-reference < <(scan "$review_text" "${dirs[@]}")
 emit review-reference < <(scan "$slice_id" "${dirs[@]}")
@@ -68,7 +72,8 @@ emit cyrillic-not-english < <(scan "$cyrillic" "${dirs[@]}")
 
 # The doc-comment rules need the item that the block documents, so they run in awk.
 # Rule 1: the first sentence of a doc block restates the item name.
-# Rule 2: three or more sentences of one doc block start with the same subject.
+# Rule 2: a short single-line doc on a field carries no format, unit or reference.
+# Rule 3: three or more sentences of one doc block start with the same two words.
 while IFS= read -r file; do
   [ -n "$file" ] || continue
   awk_findings="$(
@@ -96,6 +101,9 @@ while IFS= read -r file; do
           return rest
         }
         return ""
+      }
+      function is_field(line) {
+        return (line ~ /^[ \t]*(pub(\([^)]*\))?[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]*:/)
       }
       { line[NR] = $0 }
       END {
@@ -138,37 +146,56 @@ while IFS= read -r file; do
               s = (p > 0) ? substr(s, 1, p - 1) : ""
               if (s != "") {
                 nw = split(s, sw, /[ \t]+/)
-                if (nw <= 10) {
-                  for (k = 1; k <= nw; k++) sw[k] = stem(clean(sw[k]))
-                  nm = name
-                  gsub(/([a-z0-9])([A-Z])/, "\\1_\\2", nm)
-                  cnt = split(nm, np, "_")
-                  all = (cnt > 0)
-                  for (k = 1; k <= cnt; k++) {
-                    w = stem(clean(np[k]))
-                    if (w == "") continue
-                    hit = 0
-                    for (m = 1; m <= nw; m++) if (sw[m] == w) { hit = 1; break }
-                    if (!hit) { all = 0; break }
-                  }
-                  if (all) print FILENAME ":" start ": doc first sentence restates the item name  [rule: doc-name]"
+                for (k = 1; k <= nw; k++) sw[k] = stem(clean(sw[k]))
+                nm = name
+                gsub(/([a-z0-9])([A-Z])/, "\\1_\\2", nm)
+                cnt = split(nm, np, "_")
+                all = (cnt > 0); last = 0
+                for (k = 1; k <= cnt; k++) {
+                  w = stem(clean(np[k]))
+                  if (w == "") continue
+                  hit = 0
+                  for (m = 1; m <= nw; m++) if (sw[m] == w) { hit = 1; if (m > last) last = m; break }
+                  if (!hit) { all = 0; break }
                 }
+                # A restatement is short, or it opens with the name words. A long
+                # first sentence that only mentions them later is left alone.
+                if (all && (nw <= 15 || last <= 6))
+                  print FILENAME ":" start ": doc first sentence restates the item name  [rule: doc-name]"
               }
             }
           }
-          # Rule 2.
-          c_caller = 0; c_function = 0; c_server = 0
+          # Rule 2. A short field doc that carries no number, unit, reference or
+          # parenthesised value says only what the field name says.
+          if (is_field(itemline) && bend == start) {
+            nwall = split(text, tw, /[ \t]+/)
+            if (nwall <= 5 \
+                && text !~ /[0-9]/ \
+                && text !~ /`/ \
+                && text !~ /DR-|TR-|AC-|ADR-/ \
+                && text !~ /\(/ \
+                && text !~ /(second|minute|hour|day|byte|bit|char|character|millisecond|microsecond|nanosecond|percent)/) {
+              print FILENAME ":" start ": short field doc carries no format, unit or reference  [rule: field-doc]"
+            }
+          }
+          # Rule 3.
+          maxrep = 0
           rest = text
           while (rest != "") {
             p = index(rest, ".")
             if (p == 0) { sent = rest; rest = "" }
             else { sent = substr(rest, 1, p - 1); rest = substr(rest, p + 1) }
-            sent = clean(sent)
-            if (sent ~ /^Thecaller/) c_caller++
-            else if (sent ~ /^Thefunction/) c_function++
-            else if (sent ~ /^Theserver/) c_server++
+            sub(/^[ \t]+/, "", sent)
+            nsw = split(sent, swd, /[ \t]+/)
+            w1 = ""; w2 = ""
+            if (nsw >= 1) w1 = tolower(clean(swd[1]))
+            if (nsw >= 2) w2 = tolower(clean(swd[2]))
+            if (w1 == "") continue
+            key = start "|" w1 "|" w2
+            pair[key]++
+            if (pair[key] > maxrep) maxrep = pair[key]
           }
-          if (c_caller >= 3 || c_function >= 3 || c_server >= 3)
+          if (maxrep >= 3)
             print FILENAME ":" start ": doc block repeats the same subject  [rule: doc-subject]"
         }
       }

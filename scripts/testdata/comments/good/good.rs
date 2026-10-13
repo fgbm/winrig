@@ -17,3 +17,12 @@ pub fn endpoint() -> &'static str {
     let url = "http://example"; // an English trailing comment
     url
 }
+
+/// A transient host error makes the client retry, and the limit stops the loop,
+/// so a broken host cannot hold the process forever while the operator waits.
+pub fn retry_limit() {}
+
+pub struct RetryPolicy {
+    /// Timeout in seconds (1–3600).
+    pub read_timeout: u64,
+}

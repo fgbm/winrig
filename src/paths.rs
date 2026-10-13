@@ -1,11 +1,10 @@
-//! Каталоги профилей и состояния, выбор профиля и блокировка процесса (ADR-0009).
+//! Profile and state directories, profile selection and the process lock (ADR-0009).
 //!
-//! Каталог профилей берётся из `AppDirs::config_dir` с переопределением
-//! `WINRIG_PROFILE_DIR`; каталог состояния — из `AppDirs::state_dir`, который
-//! на Linux следует `XDG_STATE_HOME`, а на macOS и Windows совпадает с
-//! локальным каталогом данных (на этих ОС отдельного состояния нет). Один
-//! профиль на процесс: второй процесс с тем же профилем отказывает по
-//! lock-файлу.
+//! The profile directory comes from `AppDirs::config_dir` and `WINRIG_PROFILE_DIR`
+//! overrides it; the state directory comes from `AppDirs::state_dir`, which follows
+//! `XDG_STATE_HOME` on Linux and equals the local data directory on macOS and
+//! Windows (those systems have no separate state). One profile per process: a
+//! second process on the same profile is refused by the lock file.
 
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -14,55 +13,54 @@ use platform_dirs::AppDirs;
 
 use crate::config::Env;
 
-/// Имя переменной окружения с переопределением каталога профилей.
+/// Environment variable that overrides the profile directory.
 pub const PROFILE_DIR_ENV: &str = "WINRIG_PROFILE_DIR";
-/// Имя переменной окружения с переопределением каталога состояния.
+/// Environment variable that overrides the state directory.
 pub const STATE_DIR_ENV: &str = "WINRIG_STATE_DIR";
-/// Расширение файла профиля.
 pub const PROFILE_EXTENSION: &str = "json";
-/// Имя lock-файла процесса в каталоге состояния профиля.
+/// Name of the process lock in the profile state directory.
 pub const LOCK_FILE: &str = "process.lock";
 
 #[cfg(unix)]
 const DIR_MODE: u32 = 0o700;
 
-/// Ошибка разрешения каталогов профилей и состояния.
+/// Error when resolving the profile and state directories.
 #[derive(Debug)]
 pub enum PathError {
-    /// Домашний каталог недоступен и переопределение не задано.
+    /// The home directory is unavailable and the override variable is not set.
     NoHome {
-        /// Имя переменной, которой каталог можно задать явно.
+        /// The override that sets the directory explicitly.
         variable: &'static str,
     },
-    /// Каталог нельзя создать или открыть.
+    /// Cannot create or open the directory.
     Io {
-        /// Путь, на котором произошла ошибка.
+        /// File the error occurred on.
         path: PathBuf,
-        /// Причина.
+        /// Underlying cause.
         source: std::io::Error,
     },
-    /// Ограничение на символы пути нарушено.
+    /// The name violates a path character restriction.
     InvalidName {
-        /// Отвергнутое имя.
+        /// Value that was rejected.
         name: String,
-        /// Что именно нарушено.
+        /// Which restriction was violated.
         reason: &'static str,
     },
-    /// Профиль не найден в каталоге профилей.
+    /// The requested profile is absent from the profile directory.
     NotFound {
-        /// Запрошенное имя.
+        /// Requested profile.
         name: String,
-        /// Каталог, в котором искали.
+        /// Directory that was searched.
         dir: PathBuf,
     },
-    /// Профилей несколько, а имя не указано.
+    /// Several profiles exist and no name is given.
     Ambiguous {
-        /// Найденные имена.
+        /// Profiles that were found.
         names: Vec<String>,
     },
-    /// Профиль уже занят другим процессом.
+    /// The profile is already held by another process.
     Locked {
-        /// Путь lock-файла.
+        /// Lock file location.
         path: PathBuf,
     },
 }
@@ -100,12 +98,12 @@ impl std::fmt::Display for PathError {
 
 impl std::error::Error for PathError {}
 
-/// Проверяет, что имя профиля допустимо как имя файла.
+/// Ensures a profile name is usable as a file name.
 ///
 /// # Errors
 ///
-/// [`PathError::InvalidName`], если имя пустое, состоит из точек, содержит
-/// разделитель пути или управляющий символ.
+/// [`PathError::InvalidName`] if the name is empty, all dots, or contains a path
+/// separator or a control character.
 pub fn validate_profile_name(name: &str) -> Result<(), PathError> {
     let invalid = |reason: &'static str| PathError::InvalidName {
         name: name.to_owned(),
@@ -132,7 +130,7 @@ pub fn validate_profile_name(name: &str) -> Result<(), PathError> {
     Ok(())
 }
 
-/// Каталоги профилей и состояния.
+/// Profile and state directories.
 #[derive(Debug, Clone)]
 pub struct Locations {
     profile_dir: PathBuf,
@@ -140,12 +138,12 @@ pub struct Locations {
 }
 
 impl Locations {
-    /// Разрешает каталоги из окружения и стандартных путей ОС.
+    /// Resolves the directories from the environment and the OS defaults.
     ///
     /// # Errors
     ///
-    /// [`PathError::NoHome`], если стандартные пути недоступны и каталог
-    /// профилей не задан явно; [`PathError::Io`] при ошибке создания.
+    /// [`PathError::NoHome`] if the OS paths are unavailable and no profile
+    /// directory is set explicitly; [`PathError::Io`] on a creation error.
     pub fn resolve(env: &Env) -> Result<Self, PathError> {
         let profile_dir = match env(PROFILE_DIR_ENV)
             .map(|value| value.trim().to_owned())
@@ -175,30 +173,30 @@ impl Locations {
         })
     }
 
-    /// Создаёт каталоги с приватными правами.
+    /// Makes the directories with private modes.
     ///
     /// # Errors
     ///
-    /// [`PathError::Io`], если каталог нельзя создать.
+    /// [`PathError::Io`] if a directory cannot be created.
     pub fn ensure(&self) -> Result<(), PathError> {
         create_private_dir(&self.profile_dir)?;
         create_private_dir(&self.state_root)?;
         Ok(())
     }
 
-    /// Каталог профилей.
+    /// Where the profiles are stored.
     #[must_use]
     pub fn profile_dir(&self) -> &Path {
         &self.profile_dir
     }
 
-    /// Путь к файлу профиля по имени.
+    /// Location of the profile file for a name.
     #[must_use]
     pub fn profile_path(&self, name: &str) -> PathBuf {
         self.profile_dir.join(format!("{name}.{PROFILE_EXTENSION}"))
     }
 
-    /// Имена профилей в каталоге, отсортированные.
+    /// Stored names, sorted.
     #[must_use]
     pub fn profile_names(&self) -> Vec<String> {
         let mut names = Vec::new();
@@ -218,11 +216,11 @@ impl Locations {
         names
     }
 
-    /// Выбирает имя профиля: явное, либо единственное доступное.
+    /// Chooses the profile name: the explicit one, or the only available one.
     ///
     /// # Errors
     ///
-    /// [`PathError::NotFound`], [`PathError::Ambiguous`] или
+    /// [`PathError::NotFound`], [`PathError::Ambiguous`] or
     /// [`PathError::InvalidName`].
     pub fn select(&self, requested: Option<&str>) -> Result<String, PathError> {
         if let Some(name) = requested {
@@ -249,29 +247,29 @@ impl Locations {
         }
     }
 
-    /// Каталог состояния выбранного профиля, создаваемый при вызове.
+    /// State directory of the selected profile, created on call.
     ///
     /// # Errors
     ///
-    /// [`PathError::Io`], если каталог нельзя создать.
+    /// [`PathError::Io`] if the directory cannot be created.
     pub fn state_dir_for(&self, profile: &str) -> Result<PathBuf, PathError> {
         let dir = self.state_root.join(profile);
         create_private_dir(&dir)?;
         Ok(dir)
     }
 
-    /// Корень каталога состояния: к нему имя профиля добавляется ровно один
-    /// раз, и делает это [`Self::state_dir_for`] (TR-PRF-15).
+    /// The state directory the profile name is appended to exactly once, by
+    /// [`Self::state_dir_for`] (TR-PRF-15).
     #[must_use]
     pub fn state_root(&self) -> &Path {
         &self.state_root
     }
 
-    /// Каталог состояния без профиля (HTTP только по общему секрету).
+    /// State directory without a profile (HTTP with the shared secret only).
     ///
     /// # Errors
     ///
-    /// [`PathError::Io`], если каталог нельзя создать.
+    /// [`PathError::Io`] if the directory cannot be created.
     pub fn state_dir_default(&self) -> Result<PathBuf, PathError> {
         let dir = self.state_root.join("http");
         create_private_dir(&dir)?;
@@ -279,10 +277,9 @@ impl Locations {
     }
 }
 
-/// Держатель эксклюзивной блокировки процесса на профиль.
+/// Holds one profile exclusively for the life of the process.
 ///
-/// Блокировка снимается операционной системой при закрытии файла, поэтому
-/// аварийное завершение процесса её не оставляет (AC-PRF-55).
+/// The OS releases it when the file closes, so a crash leaves no lock (AC-PRF-55).
 #[derive(Debug)]
 pub struct ProcessLock {
     file: File,
@@ -290,12 +287,12 @@ pub struct ProcessLock {
 }
 
 impl ProcessLock {
-    /// Захватывает блокировку профиля или отказывает, если он занят.
+    /// Takes the profile lock or refuses when another process holds it.
     ///
     /// # Errors
     ///
-    /// [`PathError::Locked`], если блокировку держит другой процесс;
-    /// [`PathError::Io`] при ошибке доступа к файлу.
+    /// [`PathError::Locked`] if another process holds the lock; [`PathError::Io`]
+    /// on a file access error.
     pub fn acquire(dir: &Path) -> Result<Self, PathError> {
         create_private_dir(dir)?;
         let path = dir.join(LOCK_FILE);
@@ -315,7 +312,7 @@ impl ProcessLock {
         }
     }
 
-    /// Путь lock-файла.
+    /// Lock file location.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
@@ -328,7 +325,7 @@ impl Drop for ProcessLock {
     }
 }
 
-/// Создаёт каталог и выставляет приватные права на Unix.
+/// Makes the directory and applies private modes on Unix.
 fn create_private_dir(path: &Path) -> Result<(), PathError> {
     fs::create_dir_all(path).map_err(|source| PathError::Io {
         path: path.to_path_buf(),
@@ -370,7 +367,7 @@ mod tests {
         Locations::resolve(&source(&[(PROFILE_DIR_ENV, &dir)])).expect("locations")
     }
 
-    /// AC-PRF-27: символы пути в имени профиля отвергаются.
+    /// AC-PRF-27: path characters in a profile name are rejected.
     #[test]
     fn invalid_profile_names_are_rejected() {
         for name in ["", ".", "..", "../x", "a/b", "a\\b", ".hidden", "C:name"] {
@@ -384,7 +381,7 @@ mod tests {
         }
     }
 
-    /// AC-PRF-27: ни один файл вне каталога профилей не создаётся.
+    /// AC-PRF-27: no file outside the profile directory is created.
     #[test]
     fn path_traversal_creates_nothing() {
         let base = temp_dir("traversal");
@@ -399,7 +396,7 @@ mod tests {
         fs::remove_dir_all(&base).ok();
     }
 
-    /// AC-PRF-20: несколько профилей без имени — отказ.
+    /// AC-PRF-20: several profiles without a name are refused.
     #[test]
     fn ambiguous_selection_is_rejected() {
         let base = temp_dir("ambiguous");
@@ -415,7 +412,7 @@ mod tests {
         fs::remove_dir_all(&base).ok();
     }
 
-    /// AC-PRF-04: единственный профиль выбирается без имени.
+    /// AC-PRF-04: the only profile is chosen without a name.
     #[test]
     fn single_profile_is_default() {
         let base = temp_dir("single");
@@ -426,7 +423,7 @@ mod tests {
         fs::remove_dir_all(&base).ok();
     }
 
-    /// AC-PRF-43: профиль не найден.
+    /// AC-PRF-43: the profile is not found.
     #[test]
     fn missing_profile_is_reported() {
         let base = temp_dir("missing");
@@ -439,7 +436,7 @@ mod tests {
         fs::remove_dir_all(&base).ok();
     }
 
-    /// AC-PRF-54: второй процесс с тем же профилем отказывает.
+    /// AC-PRF-54: a second process on the same profile is refused.
     #[test]
     fn second_process_lock_is_refused() {
         let base = temp_dir("lock");
@@ -454,7 +451,7 @@ mod tests {
         fs::remove_dir_all(&base).ok();
     }
 
-    /// AC-PRF-08: каталог состояния делится по имени профиля.
+    /// AC-PRF-08: the state directory is split by profile name.
     #[test]
     fn state_dir_is_per_profile() {
         let base = temp_dir("state");
@@ -474,7 +471,7 @@ mod tests {
         fs::remove_dir_all(&base).ok();
     }
 
-    /// AC-PRF-08: каталог состояния переопределяется отдельной переменной.
+    /// AC-PRF-08: a separate variable overrides the state directory.
     #[test]
     fn state_dir_override_wins() {
         let base = temp_dir("stateoverride");

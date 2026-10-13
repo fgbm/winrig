@@ -49,7 +49,7 @@ All parameters go through environment variables (ADR-0004). The full table is in
 
 ## 6. Tests and quality
 
-- Run: `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` and `cargo deny check`. The full run must be green, clippy must have no warnings, the formatting must have no differences, and cargo-deny must have no refusals.
+- Run: `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `cargo deny check` and `scripts/check-comments.sh`. The full run must be green. Clippy must have no warnings, the formatting must have no differences, cargo-deny must have no refusals, and the comment check must report no findings.
 - First the test that fails, then the code.
 - The checks that are sensitive to the locale of the host run in the code, and a test covers them. PowerShell commands must not depend on the language of the system.
 - A green full run is a mandatory condition of a commit.

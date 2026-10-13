@@ -79,7 +79,7 @@ impl std::fmt::Display for ProfileError {
             Self::InvalidToken { path } => {
                 write!(
                     f,
-                    "profile {} could not be decrypted: wrong token",
+                    "profile {} did not decrypt: the token is wrong",
                     path.display()
                 )
             }

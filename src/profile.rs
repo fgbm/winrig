@@ -33,7 +33,7 @@ pub const NONCE_LEN: usize = 24;
 pub const KEY_LEN: usize = 32;
 /// Generated access token length in bytes.
 pub const TOKEN_LEN: usize = 32;
-/// HKDF info string that separates this key from any other use.
+/// Distinguishes this key from any other use.
 const HKDF_INFO: &[u8] = b"winrig-profile-v1";
 /// Failure in a profile operation.
 #[derive(Debug)]
@@ -48,16 +48,9 @@ pub enum ProfileError {
     /// Damaged file or a file that is not a profile.
     Corrupt { path: PathBuf, reason: String },
     /// Format version newer than this build knows.
-    UnsupportedVersion {
-        /// File with the newer version.
-        path: PathBuf,
-        version: u32,
-    },
+    UnsupportedVersion { path: PathBuf, version: u32 },
     /// Decryption failed: wrong token or substituted data.
-    InvalidToken {
-        /// Profile file whose decryption failed.
-        path: PathBuf,
-    },
+    InvalidToken { path: PathBuf },
     /// Profile name that is not allowed.
     InvalidName { name: String },
     /// Empty password or user name.
@@ -106,9 +99,8 @@ impl std::error::Error for ProfileError {}
 /// A loaded profile: the user name and the password in memory.
 #[derive(Debug)]
 pub struct LoadedProfile {
-    /// Canonical account name.
     pub username: String,
-    /// AD secret, zeroized on drop.
+    /// AD secret, zeroized on drop (DR-4).
     pub password: SecretString,
 }
 
@@ -117,7 +109,6 @@ pub struct LoadedProfile {
 pub struct ProfileSummary {
     /// Profile file stem without its extension.
     pub name: String,
-    /// Canonical account name.
     pub username: String,
     /// Creation time in Unix seconds.
     pub created_at: u64,
@@ -318,7 +309,7 @@ pub fn rotate(path: &Path, password: &str) -> Result<String, ProfileError> {
     Ok(token)
 }
 
-/// Loads the profile and decrypts the password with the presented token.
+/// Reads the profile file and decrypts the password with the presented token.
 ///
 /// # Errors
 ///

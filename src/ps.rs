@@ -214,8 +214,7 @@ pub const HOST_ROOTS: &str = "Roots=[PSCustomObject]@{ SystemRoot=$env:SystemRoo
      ProgramData=$env:ProgramData; \
      Users=$(if ($env:PUBLIC) { Split-Path -Parent $env:PUBLIC } else { $null }) }";
 
-/// The write target scan: both path resolutions, existence and the host roots
-/// (TR-FS-03, TR-FS-06).
+/// Both path resolutions, existence and the host roots (TR-FS-03, TR-FS-06).
 ///
 /// .NET writes the chunks and `Move-Item` replaces the target, and they resolve
 /// a relative path from different directories, so the host returns both

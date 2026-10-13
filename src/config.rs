@@ -120,7 +120,6 @@ pub struct AppConfig {
     pub ad_password_idle_ttl_seconds: u64,
     /// Directory for logs and audit; `None` means the profile state directory.
     pub log_dir: Option<String>,
-    /// Severity of the server journal.
     pub log_level: LogLevel,
     /// Journal size before rotation, in bytes.
     pub log_max_bytes: u64,
@@ -133,8 +132,7 @@ pub struct AppConfig {
     pub ad_lockout_window_seconds: u64,
     /// Smallest secret length that is redacted in the reply to the agent.
     pub secret_redact_min_length: usize,
-    /// Host allowlist; an empty list allows loopback only, `*` allows any host
-    /// (TR-SEC-14).
+    /// Empty means loopback only; `*` means any host (TR-SEC-14).
     pub allowed_hosts: Vec<String>,
     /// Whether the TLS check downgrade is allowed (TR-SEC-06).
     pub allow_insecure_tls: bool,
@@ -192,7 +190,7 @@ impl fmt::Debug for AppConfig {
     }
 }
 
-/// Reads a variable and trims spaces; an empty string means absent.
+/// The value is trimmed of spaces; an empty string means absent.
 fn read(env: &Env, name: &str) -> Option<String> {
     env(name)
         .map(|value| value.trim().to_owned())

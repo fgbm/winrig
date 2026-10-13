@@ -47,7 +47,7 @@ pub struct BoundProfile {
     pub path: std::path::PathBuf,
     /// HMAC of the first accepted profile token, compared in constant time.
     token_mac: [u8; 32],
-    /// Decrypted on the first check.
+    /// Decrypted on the first check (ADR-0009).
     identity: ProfileIdentity,
 }
 

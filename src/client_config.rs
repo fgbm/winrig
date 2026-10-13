@@ -166,10 +166,10 @@ pub struct ServerDefinition {
     /// Absolute profile directory; passed to the client so it finds the profile
     /// even when the directory differs from the default (ADR-0009).
     pub profile_dir: Option<String>,
-    /// Absolute **root** of the state directory; passed to the client for the
-    /// same reason. The server adds the profile name to it, exactly once: the
-    /// definition carries the root, otherwise `WINRIG_STATE_DIR` and the real
-    /// state directory drift apart by one level (TR-PRF-15).
+    /// The server adds the profile name to it, exactly once, and the client
+    /// receives the root for the same reason as the directory: the definition
+    /// carries the root, otherwise `WINRIG_STATE_DIR` and the real state
+    /// directory drift apart by one level (TR-PRF-15).
     pub state_root: Option<String>,
     /// Explicit key for the entry (`--server-name`). Without it the key comes
     /// from an existing entry for the same profile, otherwise
@@ -192,7 +192,7 @@ impl ServerDefinition {
             .unwrap_or_else(|| DEFAULT_SERVER_NAME.to_owned())
     }
 
-    /// Which key the new entry takes in an existing client config (TR-PRF-14).
+    /// The name the new entry takes among the entries of an existing config (TR-PRF-14).
     ///
     /// Priority: an explicit `--server-name`; the key of an entry already
     /// declared for the same profile; [`DEFAULT_SERVER_NAME`]. The middle step
@@ -377,7 +377,7 @@ fn entry_object(map: &Map<String, Value>, key: &str) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
-/// The profile of an opencode entry: the command is an array and the profile follows the flag.
+/// The command is an array and the profile follows the flag.
 fn opencode_profile(entry: &Value) -> Option<&str> {
     profile_after_flag(entry.get("command")?.as_array()?)
 }
@@ -588,7 +588,7 @@ fn write_json(path: &Path, value: &Value, protect: bool) -> Result<(), ClientCon
     Ok(())
 }
 
-/// Turns a profile error into CLI text (for one output shape).
+/// Turns an error into CLI text (for one output shape).
 pub fn profile_error_text(error: &ProfileError) -> String {
     error.to_string()
 }

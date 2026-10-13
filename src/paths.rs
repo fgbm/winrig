@@ -39,17 +39,9 @@ pub enum PathError {
         source: std::io::Error,
     },
     /// The name violates a path character restriction.
-    InvalidName {
-        name: String,
-        /// Which restriction was violated.
-        reason: &'static str,
-    },
+    InvalidName { name: String, reason: &'static str },
     /// The requested profile is absent from the profile directory.
-    NotFound {
-        name: String,
-        /// Directory that was searched.
-        dir: PathBuf,
-    },
+    NotFound { name: String, dir: PathBuf },
     /// Several profiles exist and no name is given.
     Ambiguous { names: Vec<String> },
     /// The profile is already held by another process.

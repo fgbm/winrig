@@ -826,7 +826,7 @@ impl FileScan {
 pub struct WriteScan {
     /// Path as PowerShell resolves it for `-LiteralPath`.
     pub full_name: String,
-    /// Path as .NET (`[IO.Path]::GetFullPath`) resolves it.
+    /// The path as .NET (`[IO.Path]::GetFullPath`) resolves it.
     pub dotnet_full_name: String,
     pub exists: bool,
     pub roots: HostRoots,

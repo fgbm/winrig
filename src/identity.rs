@@ -27,7 +27,6 @@ pub enum IdentitySource {
 /// Identity of the calling user.
 #[derive(Debug, Clone)]
 pub struct RequestIdentity {
-    /// Canonical account name.
     pub username: String,
     /// AD secret, given or recovered from the profile.
     pub password: Option<SecretString>,

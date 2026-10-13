@@ -1,26 +1,26 @@
-# ADR-0007 — Стек: winrm-rs, rmcp, axum, tokio
+# ADR-0007 — Stack: `winrm-rs`, `rmcp`, `axum`, `tokio`
 
-- Статус: принято
-- Дата: 2026-09-19
-- Связано: AGENTS.md §2, §5
+- Status: accepted
+- Date: 2026-09-19
+- Related: AGENTS.md §2, §5
 
-## Контекст
+## Context
 
-Нужен MCP-сервер на Rust с удалённым выполнением PowerShell по WinRM/NTLM. Ключевое требование — минимум зависимостей, низкое потребление памяти, скорость и отсутствие контейнера. Своя реализация NTLM и WS-Management была бы крупным источником риска безопасности.
+The project needs an MCP server in Rust with remote PowerShell execution over WinRM/NTLM. The key requirements are a minimum of dependencies, low memory use, speed and no container. An own implementation of NTLM and WS-Management would be a large source of security risk.
 
-## Решение
+## Decision
 
-1. **WinRM/NTLM — крэйт `winrm-rs`** (async, NTLMv2, `secrecy::SecretString`, `run_powershell`, повторное использование shell). Своя реализация SOAP+NTLM не пишется.
-   - Версия — `1.2.2`. Пин `=1.1.2` держался, пока ветка 1.2.x требовала rustc 1.98, которого не было на stable; 1.98 вышел 2026-09-01, и пин снят вместе с подъёмом MSRV до 1.98 (Q-07, срез W18). Проверено при переходе: `auth/ntlm.rs` между версиями идентичен, поэтому разбор ошибок в `session::classify_auth_failure` (TR-SEC-10) остаётся верным, а `CHUNK_SIZE` по-прежнему 2000, поэтому `ps::WRITE_CHUNK_BYTES` менять не потребовалось.
-   - Кодировка вывода по умолчанию `65001` (UTF-8), поэтому преамбула `[Console]::OutputEncoding` из Python-версии не нужна.
-2. **MCP — официальный SDK `rmcp`** с транспортом `transport-streamable-http-server`; макросы `#[tool]`/`#[tool_router]`.
-3. **HTTP — `axum`**; MCP-сервис встраивается через `nest_service("/mcp", service)`.
+1. **WinRM/NTLM — the crate `winrm-rs`** (async, NTLMv2, `secrecy::SecretString`, `run_powershell`, the reuse of the shell). The project does not write an own implementation of SOAP+NTLM.
+   - The version is `1.2.2`. The pin `=1.1.2` stayed while the branch 1.2.x needed rustc 1.98, which stable did not have. Version 1.98 came out on 2026-09-01, and the project removed the pin together with the rise of the MSRV to 1.98 (Q-07, slice W18). The check at the change: `auth/ntlm.rs` is identical between the versions, so the analysis of errors in `session::classify_auth_failure` (TR-SEC-10) stays correct. `CHUNK_SIZE` is still 2000, so `ps::WRITE_CHUNK_BYTES` needed no change.
+   - The default output encoding is `65001` (UTF-8), so the preamble `[Console]::OutputEncoding` from the Python version is not necessary.
+2. **MCP — the official SDK `rmcp`** with the transport `transport-streamable-http-server`; the macros `#[tool]`/`#[tool_router]`.
+3. **HTTP — `axum`**; the MCP service embeds through `nest_service("/mcp", service)`.
 4. **Runtime — `tokio`** (multi-thread).
-5. **Идентичность — `http::request::Parts`** из расширений запроса `rmcp`; заголовки текущего запроса доступны в контексте инструмента (DR-2). В stdio идентичность берётся из профиля (ADR-0009).
-6. **Контейнер не используется.** Деплой — один release-бинарь в двух режимах, `serve` и `stdio` (ADR-0009).
+5. **Identity — `http::request::Parts`** from the request extensions of `rmcp`; the headers of the current request are available in the context of the tool (DR-2). In stdio the identity comes from the profile (ADR-0009).
+6. **The project does not use a container.** The deploy is one release binary in two modes, `serve` and `stdio` (ADR-0009).
 
-## Последствия
+## Consequences
 
-- Набор зависимостей ограничен транспортным и MCP-слоем; тяжёлых фреймворков нет.
-- Kerberos и CredSSP (`winrm-rs`) выключены по умолчанию: включаются фичей только при необходимости. CredSSP тянет OpenSSL и помечен у автора как preview.
-- Возможности, которых нет в `rmcp` (например, иной способ подтверждения), вводятся только через новый ADR.
+- The project limits the set of dependencies to the transport layer and the MCP layer; there are no heavy frameworks.
+- Kerberos and CredSSP (`winrm-rs`) are off by default: a feature turns them on only when necessary. CredSSP pulls in OpenSSL and the author marks it as a preview.
+- The project introduces capabilities that `rmcp` does not have (for example, a different confirmation method) only through a new ADR.

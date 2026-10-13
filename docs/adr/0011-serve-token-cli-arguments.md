@@ -1,26 +1,26 @@
-# ADR-0011 — Токены `serve` можно задавать аргументами CLI
+# ADR-0011 — CLI arguments can set the `serve` tokens
 
-- Статус: принято
-- Дата: 2026-09-20
-- Связано: ADR-0001, ADR-0009, DR-1, DR-4
+- Status: accepted
+- Date: 2026-09-20
+- Related: ADR-0001, ADR-0009, DR-1, DR-4
 
-## Контекст
+## Context
 
-`serve` принимал секреты только через окружение (`WINRIG_TOKEN`, `WINRIG_AUTH_TOKEN`), а `--port`/`--host` уже перекрывали окружение. Для запуска в контейнере, под тестовым супервизором или в одной строке без `export` оператору не хватало способа передать токен аргументом, как это делают многие CLI-серверы (`--token`, `--api-key`).
+`serve` took secrets only from the environment (`WINRIG_TOKEN`, `WINRIG_AUTH_TOKEN`), but `--port`/`--host` already overrode the environment. The operator needed a way to give the profile token as an argument. Such a start occurs in a container, under a test supervisor or in one line without `export`. Many CLI servers do this (`--token`, `--api-key`).
 
-Плата за аргументы известна: значения аргументов видны в списке процессов (`ps`) и в истории оболочки. Это осознанный компромисс, а не скрытая утечка, поэтому решение должно его назвать.
+The price of the arguments is known: the values of the arguments are visible in the process list (`ps`) and in the shell history. This is a conscious compromise, not a hidden leak, so the decision must name it.
 
-## Решение
+## Decision
 
-1. **`serve --token <TOKEN>`** задаёт токен профиля и перекрывает `WINRIG_TOKEN`.
-2. **`serve --auth-token <SECRET>`** задаёт общий секрет и перекрывает `WINRIG_AUTH_TOKEN`.
-3. **Приоритет: CLI > env.** Флаг применяется после чтения конфигурации и до проверки «хотя бы один секрет».
-4. **Секрет не течёт в диагностику.** Аргумент разбирается в тип `SecretArg` с ручным `Debug`, печатающим `[REDACTED]`; поэтому clap, сообщения об ошибках и журналы не раскрывают значение. Прямого логирования значения нет.
-5. **Честность в `--help`.** Оба флага несут предупреждение: секрет-аргумент виден в списке процессов, предпочитать окружение или конфиг клиента.
-6. **Только `serve`.** `stdio` оставлен как есть: там токен приходит из окружения, которое задаёт клиент запуска, и аргумент не нужен. При необходимости флаг добавляется отдельным решением.
+1. **`serve --token <TOKEN>`** sets the profile token and overrides `WINRIG_TOKEN`.
+2. **`serve --auth-token <SECRET>`** sets the shared secret and overrides `WINRIG_AUTH_TOKEN`.
+3. **Priority: CLI > env.** The server applies the flag after the reading of the configuration and before the check "at least one secret".
+4. **The secret does not flow into diagnostics.** The code parses the argument into the type `SecretArg` with a manual `Debug` that prints `[REDACTED]`. Thus clap, the error messages and the logs do not expose the value. There is no direct logging of the value.
+5. **Honesty in `--help`.** Both flags carry a warning: an argument secret is visible in the process list, and the operator must prefer the environment or the client configuration.
+6. **Only `serve`.** The code leaves `stdio` as it is: there the profile token comes from the environment that the client of the start sets. The argument is not necessary. If necessary, a separate decision adds the flag.
 
-## Последствия
+## Consequences
 
-- Покрытие: `tests/cli_setup.rs::serve_token_flag_authenticates_profile` (профиль только по флагу), `serve_auth_token_flag_authenticates_header_path` (заголовочный путь только по флагу), `serve_token_flag_overrides_env` (флаг перекрывает неверное окружение).
-- README получил примеры обоих флагов и предупреждение о видимости в списке процессов.
-- Другие секреты (`WINRIG_PASSWORD_TTL_SECONDS` не секрет; пароль профиля) аргументами не передаются: пароль вводится в `setup` или лежит в шифртексте профиля, общего секрета-пароля у сервера нет.
+- Coverage: `tests/cli_setup.rs::serve_token_flag_authenticates_profile` (the profile only by the flag), `serve_auth_token_flag_authenticates_header_path` (the header path only by the flag), `serve_token_flag_overrides_env` (the flag overrides an incorrect environment).
+- The README received examples of both flags and a warning about the visibility in the process list.
+- The code does not pass other secrets as arguments (`WINRIG_PASSWORD_TTL_SECONDS` is not a secret; the profile password is one). The operator enters the password in `setup`, or the password lies in the profile ciphertext. The server has no shared secret password.

@@ -1,8 +1,8 @@
-//! MCP-сервер: инструменты и их привязка к реестру сессий.
+//! MCP server: tools bound to the session registry.
 //!
-//! Идентичность читается из заголовков текущего запроса (DR-2,
-//! [`crate::identity`]). Модифицирующие инструменты требуют подтверждения через
-//! elicitation и при его недоступности не выполняются (DR-5, fail-closed).
+//! Identity comes from the headers of the current request (DR-2,
+//! [`crate::identity`]). Mutating tools require confirmation through elicitation
+//! and do not run without it (DR-5, fail-closed).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,12 +26,11 @@ use crate::policy::{
 use crate::ps;
 use crate::session::{SessionRegistry, UserIdentity};
 
-/// Сервер инструментов `winrig`.
 #[derive(Clone)]
 pub struct WinrigServer {
     registry: Arc<SessionRegistry>,
     config: Arc<AppConfig>,
-    /// Идентичность профиля для stdio, где нет HTTP-запроса (ADR-0009).
+    /// Profile identity for stdio, which has no HTTP request (ADR-0009).
     local_identity: Option<Arc<crate::identity::ProfileIdentity>>,
     tool_router: ToolRouter<Self>,
 }
@@ -42,7 +41,6 @@ impl std::fmt::Debug for WinrigServer {
     }
 }
 
-/// Ответ на подтверждение модифицирующей операции.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ConfirmResponse {
     #[schemars(description = "`true` runs the operation.")]
@@ -52,7 +50,6 @@ struct ConfirmResponse {
 rmcp::elicit_safe!(ConfirmResponse);
 
 impl WinrigServer {
-    /// Создаёт сервер поверх готового реестра и конфигурации.
     #[must_use]
     pub fn new(registry: Arc<SessionRegistry>, config: Arc<AppConfig>) -> Self {
         let tool_router = Self::router_for(&config);
@@ -64,11 +61,11 @@ impl WinrigServer {
         }
     }
 
-    /// Собирает маршрутизатор под конфигурацию: выключенные инструменты
-    /// снимаются, а не прячутся (TR-FS-01, ADR-0013 §2).
+    /// Disabled tools are removed from the router, not hidden (TR-FS-01,
+    /// ADR-0013 §2).
     ///
-    /// Снятый маршрут не появляется в `tools/list` и не вызывается: агент не
-    /// должен видеть возможность, которой у него нет, и строить на ней план.
+    /// A removed route does not appear in `tools/list` and cannot be called:
+    /// the agent must not see a capability it lacks and build a plan on it.
     fn router_for(config: &AppConfig) -> ToolRouter<Self> {
         let mut router = Self::tool_router();
         if !config.allow_file_write {
@@ -77,7 +74,6 @@ impl WinrigServer {
         router
     }
 
-    /// Создаёт сервер stdio: идентичность берётся из профиля, HTTP-запроса нет.
     #[must_use]
     pub fn with_profile_identity(
         registry: Arc<SessionRegistry>,
@@ -93,11 +89,9 @@ impl WinrigServer {
         }
     }
 
-    /// Возвращает идентичность вызова: из запроса либо из профиля (stdio).
-    ///
     /// # Errors
     ///
-    /// [`rmcp::model::ErrorData`] с `INVALID_PARAMS`, если идентичности нет.
+    /// [`rmcp::model::ErrorData`] with `INVALID_PARAMS` when none is available.
     fn identity(
         &self,
         ctx: &RequestContext<RoleServer>,
@@ -115,7 +109,6 @@ impl WinrigServer {
         }
     }
 
-    /// Преобразует идентичность запроса в идентичность сессии.
     fn user(identity: &RequestIdentity) -> UserIdentity {
         UserIdentity {
             username: identity.username.clone(),
@@ -127,13 +120,12 @@ impl WinrigServer {
         }
     }
 
-    /// Пишет отказ политики в аудит (TR-OBS-03, ADR-0015 §14).
+    /// Policy refusals are recorded for observability (TR-OBS-03, ADR-0015 §14).
     fn audit_refusal(&self, identity: &RequestIdentity, tool: &str, decision: &PolicyDecision) {
         self.registry
             .audit_refusal(&identity.username, tool, decision.code, &decision.reason);
     }
 
-    /// Выполняет команду в сессии и оборачивает ответ в результат инструмента.
     async fn run(
         &self,
         identity: &RequestIdentity,
@@ -145,7 +137,6 @@ impl WinrigServer {
             .await
     }
 
-    /// Выполняет команду с дополнительными секретами для редактирования.
     async fn run_redacted(
         &self,
         identity: &RequestIdentity,
@@ -160,7 +151,6 @@ impl WinrigServer {
         )
     }
 
-    /// Выполняет команду в сессии и возвращает ответ реестра как JSON.
     async fn run_value(
         &self,
         identity: &RequestIdentity,
@@ -172,11 +162,9 @@ impl WinrigServer {
             .await
     }
 
-    /// Выполняет команду с дополнительными секретами для редактирования.
-    ///
-    /// Пароль самой сессии `run_ps` добавляет всегда; здесь передаются
-    /// значения из аргументов инструмента (например значение реестра), чтобы
-    /// они не попали в аудит открытым текстом (DR-4).
+    /// `run_ps` always adds the session password; the values passed here come
+    /// from the tool arguments (for example a registry value), so they do not
+    /// reach the audit in cleartext (DR-4).
     async fn run_value_redacted(
         &self,
         identity: &RequestIdentity,
@@ -196,10 +184,8 @@ impl WinrigServer {
             .await
     }
 
-    /// Извлекает `stdout` из ответа реестра, если команда завершилась успешно.
-    ///
-    /// `None` означает, что команда не выполнилась или хост вернул ошибку —
-    /// вызывающая сторона обязана отказать (fail-closed).
+    /// `None` means the command did not run or the host returned an error — the
+    /// caller must refuse (fail-closed).
     fn successful_stdout(reply: &serde_json::Value) -> Option<String> {
         if reply.get("error").is_some() {
             return None;
@@ -214,10 +200,8 @@ impl WinrigServer {
             .map(str::to_owned)
     }
 
-    /// Возвращает состояние службы для показа в подтверждении.
-    ///
-    /// Чтение read-only и выполняется до подтверждения: если оно не удалось,
-    /// подтверждение всё равно показывается, просто без блока состояния.
+    /// Read-only, and it runs before the confirmation: if it fails, the prompt
+    /// still shows, just without the state block.
     async fn service_state(
         &self,
         identity: &RequestIdentity,
@@ -238,10 +222,8 @@ impl WinrigServer {
             .unwrap_or_else(|| "(state unavailable)".to_owned())
     }
 
-    /// Возвращает имя и старт процесса для показа в подтверждении.
-    ///
-    /// Пустой PID или несуществующий процесс дают честную строку, а не пустоту:
-    /// подтверждение должно показывать цель даже тогда, когда её уже нет.
+    /// An empty PID or a missing process yields an honest string, not an empty
+    /// one: the prompt must show the target even when it no longer exists.
     async fn process_details(
         &self,
         identity: &RequestIdentity,
@@ -263,12 +245,11 @@ impl WinrigServer {
             .unwrap_or_else(|| "process details unavailable".to_owned())
     }
 
-    /// Запрашивает подтверждение.
-    ///
-    /// `Ok(())` — пользователь явно согласился. `Err(result)` — операция не
-    /// выполняется: отказ, отмена, таймаут или отсутствие канала подтверждения
-    /// (DR-5, fail-closed); `result` — готовый ответ инструмента. Аргументы
-    /// санитизируются, чтобы значение не подделало структуру диалога.
+    /// `Ok(())` means the user agreed explicitly. `Err(result)` means the
+    /// operation does not run: refusal, cancellation, timeout, or no
+    /// confirmation channel (DR-5, fail-closed); `result` is a ready tool
+    /// reply. The arguments are sanitized so a value cannot forge the dialog
+    /// structure.
     async fn confirm(
         ctx: &RequestContext<RoleServer>,
         action: &str,
@@ -306,7 +287,6 @@ impl WinrigServer {
     }
 }
 
-/// Случайный шестнадцатеричный суффикс для имени временного файла.
 fn random_suffix() -> String {
     let mut bytes = [0u8; 8];
     rand::fill(&mut bytes);
@@ -317,10 +297,8 @@ fn random_suffix() -> String {
     })
 }
 
-/// Вытаскивает аргументы `FromBase64String('...')` для редакции (DR-4).
-///
-/// Тело записываемого файла попадает в команду только так, поэтому список
-/// из одного-двух элементов покрывает весь секрет в теле команды.
+/// The written file body reaches the command only as `FromBase64String('...')`,
+/// so a list of one or two items covers the whole secret in the command (DR-4).
 fn base64_payloads(command: &str) -> Vec<String> {
     const OPEN: &str = "FromBase64String('";
     let mut out = Vec::new();
@@ -344,7 +322,7 @@ fn cancelled(action: &str) -> CallToolResult {
     }))
 }
 
-/// Возвращает из инструмента готовый ответ, если подтверждение не получено.
+/// Returns a ready tool reply when confirmation is not obtained.
 macro_rules! require_confirmation {
     ($self:expr, $ctx:expr, $action:expr, $details:expr) => {
         if let Err(result) = WinrigServer::confirm(
@@ -361,7 +339,7 @@ macro_rules! require_confirmation {
 }
 
 // ---------------------------------------------------------------------------
-// Параметры инструментов
+// Tool parameters
 // ---------------------------------------------------------------------------
 
 // User-facing text lives in explicit attributes, so doc comments never reach `tools/list`.
@@ -802,13 +780,11 @@ fn default_5000() -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Инструменты
+// Tools
 // ---------------------------------------------------------------------------
 
 #[tool_router]
 impl WinrigServer {
-    /// Open a WinRM session to a Windows host and return a session_id; this is
-    /// the required first step before any other tool.
     #[tool(
         name = "connect",
         description = "Open a WinRM session to a Windows host and return a session_id; this is the required first step before any other tool. The AD password is taken from the X-AD-Password request header and cached only in server memory."
@@ -819,7 +795,7 @@ impl WinrigServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let identity = self.identity(&ctx)?;
-        // Политика и транспорт видят одну и ту же строку хоста.
+        // Policy and transport see the same host string.
         let host = params.host.trim();
         for decision in [
             decide_host(host, &self.config.allowed_hosts),
@@ -847,7 +823,6 @@ impl WinrigServer {
         Ok(CallToolResult::structured(reply))
     }
 
-    /// Close an active WinRM session.
     #[tool(
         name = "disconnect",
         description = "Close an active WinRM session and release it; sessions are not auto-cleaned, so always disconnect when done."
@@ -864,7 +839,6 @@ impl WinrigServer {
         ))
     }
 
-    /// List active WinRM sessions.
     #[tool(
         name = "list_sessions",
         description = "List active WinRM sessions with host, connection time, last used time, and command count."
@@ -879,7 +853,6 @@ impl WinrigServer {
         ))
     }
 
-    /// List files and directories at a path.
     #[tool(
         name = "list_directory",
         description = "List files and directories at a path as tabular text (Mode, LastWriteTime, Length, Name)."
@@ -900,7 +873,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Recursively find files matching a wildcard pattern.
     #[tool(
         name = "find_files",
         description = "Recursively find files matching a wildcard pattern (max 100 results). Matches files only."
@@ -926,7 +898,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Read file contents as numbered lines.
     #[tool(
         name = "read_file",
         description = "Read file contents as numbered lines (max 500 per call). Range mode reads start_line through end_line; tail mode reads the last N lines."
@@ -952,7 +923,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Search for literal text inside files like grep.
     #[tool(
         name = "search_file_content",
         description = "Search for literal text inside files like grep; pass a file path to search one file or a directory to search recursively."
@@ -980,7 +950,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Return JSON metadata for one file or directory.
     #[tool(
         name = "file_info",
         description = "Return JSON metadata for one file or directory: size, timestamps, and attributes."
@@ -1001,7 +970,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Compare two files line by line.
     #[tool(
         name = "compare_files",
         description = "Compare two files line by line like diff, showing each differing line and which file it came from."
@@ -1022,7 +990,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Read the Windows Event Log.
     #[tool(
         name = "get_event_log",
         description = "Read the Windows Event Log for crashes, service failures, auth errors, and disk warnings."
@@ -1048,7 +1015,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// List Windows services.
     #[tool(
         name = "get_services",
         description = "List Windows services: summary mode returns tabular Name, Status, StartType, DisplayName; detail mode returns JSON per service."
@@ -1069,7 +1035,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// List running processes.
     #[tool(
         name = "list_processes",
         description = "List running processes as tabular text with PID, name, CPU seconds, memory MB, handle count, and start time."
@@ -1090,7 +1055,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Return a JSON system overview.
     #[tool(
         name = "get_system_info",
         description = "Return a JSON system overview in one call: OS version, uptime, last boot, total/free RAM, CPU count, domain, and timezone."
@@ -1111,7 +1075,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Return disk space for all fixed drives.
     #[tool(
         name = "get_disk_space",
         description = "Return disk space for all fixed drives as tabular text: DeviceID, Total_GB, Free_GB, and Used_Pct."
@@ -1132,7 +1095,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Capture a locale-independent performance snapshot.
     #[tool(
         name = "get_perf_snapshot",
         description = "Capture a locale-independent performance snapshot as JSON: CPU, memory, disk I/O, network, and optionally per-process stats."
@@ -1153,7 +1115,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Read a registry key or a single value.
     #[tool(
         name = "get_registry",
         description = "Read a registry key or a single value (read-only) and return JSON."
@@ -1174,7 +1135,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// List certificates from the Personal store.
     #[tool(
         name = "get_certificates",
         description = "List certificates from the Personal (My) store sorted by days until expiry, showing Subject, Expires, DaysLeft, and Thumbprint."
@@ -1194,7 +1154,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Return per-NIC network configuration.
     #[tool(
         name = "get_network_config",
         description = "Return per-NIC network configuration as tabular text: interface name, status, IPv4, gateway, and DNS servers."
@@ -1215,7 +1174,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Test connectivity from the remote host.
     #[tool(
         name = "test_network",
         description = "Test connectivity from the remote Windows host's perspective: port=0 sends three ICMP pings; port>0 runs a TCP test."
@@ -1236,7 +1194,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Return environment variables by scope.
     #[tool(
         name = "get_environment_variables",
         description = "Return environment variables (name and value) for the chosen scope as tabular text."
@@ -1261,7 +1218,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// List Windows scheduled tasks.
     #[tool(
         name = "get_scheduled_tasks",
         description = "List Windows scheduled tasks as tabular text with name, state, last run time, last result, and next run time."
@@ -1282,7 +1238,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// List local user accounts.
     #[tool(
         name = "get_local_users",
         description = "List local user accounts as tabular text with name, enabled status, last logon, and description."
@@ -1303,7 +1258,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Show local group memberships.
     #[tool(
         name = "get_user_groups",
         description = "Show local group memberships: with no username it lists all local groups and members; with a username it shows that user's local groups."
@@ -1324,7 +1278,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Show the session security context (like whoami /all).
     #[tool(
         name = "get_security_context",
         description = "Show the current WinRM session's security context as JSON: identity, group memberships, privileges, and integrity level."
@@ -1345,7 +1298,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Return the ACL for a file or folder.
     #[tool(
         name = "get_permissions",
         description = "Return the access control list (ACL) for a file or folder as tabular text: identity, Allow/Deny type, rights, and inheritance."
@@ -1366,7 +1318,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// List active TCP connections.
     #[tool(
         name = "get_tcp_connections",
         description = "List active TCP connections as tabular text with local/remote addresses, ports, state, and owning process."
@@ -1387,7 +1338,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Read the local DNS client cache.
     #[tool(
         name = "get_dns_cache",
         description = "Read the local DNS client cache as tabular text: record name, type, TTL, and resolved data."
@@ -1408,7 +1358,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// List installed software.
     #[tool(
         name = "get_installed_software",
         description = "List installed software as tabular text with name, version, publisher, and install date, reading both 64-bit and 32-bit uninstall keys."
@@ -1429,7 +1378,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Resolve a DNS name from the remote host.
     #[tool(
         name = "resolve_dns_name",
         description = "Resolve a DNS name from the remote server's perspective as tabular text, showing the full resolution chain including CNAMEs."
@@ -1450,9 +1398,8 @@ impl WinrigServer {
             .await)
     }
 
-    // ---- Модифицирующие операции: требуют подтверждения (DR-5) ----
+    // ---- Mutating operations: they require confirmation (DR-5) ----
 
-    /// Clear the DNS client cache on the remote server.
     #[tool(
         name = "flush_dns",
         description = "Clear the local DNS client cache on the remote server; prompts for confirmation."
@@ -1478,7 +1425,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Restart a Windows service.
     #[tool(
         name = "restart_service",
         description = "Restart a Windows service, prompting for confirmation and returning pre and post state."
@@ -1511,7 +1457,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Stop a Windows service.
     #[tool(
         name = "stop_service",
         description = "Stop a running Windows service, prompting for confirmation and returning pre and post state."
@@ -1541,7 +1486,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Start a stopped Windows service.
     #[tool(
         name = "start_service",
         description = "Start a stopped Windows service, prompting for confirmation and returning pre and post state."
@@ -1571,7 +1515,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Force-terminate a process by PID.
     #[tool(
         name = "kill_process",
         description = "Force-terminate a process by PID, showing its details in the confirmation prompt."
@@ -1590,8 +1533,8 @@ impl WinrigServer {
              if ($still) {{ Write-Output 'WARNING: process still running' }} \
              else {{ Write-Output 'Confirmed: process no longer exists' }}"
         );
-        // Показываем, что именно будет завершено: PID без имени — слепое
-        // подтверждение.
+        // Show exactly what will be terminated: a PID without a name is a
+        // blind confirmation.
         let details = format!(
             "PID: {pid}\n{}",
             self.process_details(&identity, &params.session_id, pid)
@@ -1603,7 +1546,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Set a registry value.
     #[tool(
         name = "set_registry",
         description = "Set a registry value, creating it if absent, and show old vs new in the confirmation prompt."
@@ -1643,8 +1585,8 @@ impl WinrigServer {
              [PSCustomObject]@{{ Key='{safe_key}'; Name='{safe_value}'; Value=[string]$v.'{safe_value}'; Type='{ps_type}' }} \
              | ConvertTo-Json -Compress"
         );
-        // Показываем текущее значение до записи: подтверждение без «старого»
-        // не даёт оператору увидеть, что именно меняется.
+        // Show the current value before the write: without the old value the
+        // operator cannot see what changes.
         let read_command = ps::get_registry(&key, &params.value_name);
         let before_reply = self
             .run_value_redacted(
@@ -1668,8 +1610,8 @@ impl WinrigServer {
                 params.value_name
             )
         );
-        // Значение записывается как секрет: оно может содержать пароль, и
-        // аудит не должен его раскрывать (DR-4).
+        // The value is treated as a secret: it may hold a password, and the
+        // audit must not reveal it (DR-4).
         let secrets = vec![params.value_data.clone()];
         Ok(self
             .run_redacted(
@@ -1682,7 +1624,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Write a file on the remote host.
     #[tool(
         name = "write_file",
         description = "Write a file on the remote host, replacing it as a whole. Refuses protected paths, and refuses an existing file unless overwrite is set. Content travels in ~2 KB chunks because the WinRS command line is limited, so this suits configuration files and scripts rather than large payloads. To run a script too long for one command, write it here and then execute it by path."
@@ -1693,7 +1634,7 @@ impl WinrigServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let identity = self.identity(&ctx)?;
-        // DR-6: лексический отказ до любой сети.
+        // DR-6: lexical refusal before any network access.
         let decision = decide_write_path(&params.path);
         if !decision.allow {
             self.audit_refusal(&identity, "write_file", &decision);
@@ -1701,13 +1642,14 @@ impl WinrigServer {
                 json!({ "error": decision.reason }),
             ));
         }
-        // План строится целиком до сети: предел размера и неизвестная кодировка
-        // отказывают, не оставив на хосте ничего (TR-FS-04).
-        // Уникальность на вызов: два параллельных вызова в один путь иначе
-        // делят временный файл, куски перемешиваются, и первое же
-        // переименование забирает файл из-под второго вызова. Суффикс
-        // случайный, а не pid со счётчиком: два экземпляра winrig на разных
-        // машинах могут получить одинаковый pid и писать на один хост.
+        // The plan is built entirely before the network: the size limit and an
+        // unknown encoding refuse without leaving anything on the host
+        // (TR-FS-04).
+        // Unique per call: two parallel calls to one path would otherwise share
+        // the temporary file, mix their chunks, and the first rename would take
+        // the file from under the second call. The suffix is random, not a pid
+        // with a counter: two winrig instances on different machines can get
+        // the same pid and write to one host.
         let temp_path = format!("{}.winrig-{}.part", params.path, random_suffix());
         let plan = match ps::write_plan(
             &params.path,
@@ -1720,9 +1662,10 @@ impl WinrigServer {
             Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
         };
 
-        // Скан хостом: путь, как его разрешат .NET и PowerShell, существование
-        // цели и защищённые корни хоста (TR-FS-03, TR-FS-06). Гонку это не
-        // закрывает, но отличает создание от перезаписи в подтверждении.
+        // Host-side scan: the path as .NET and PowerShell resolve it, the
+        // target's existence, and the host's protected roots (TR-FS-03,
+        // TR-FS-06). It does not close the race, but it tells creation from
+        // overwrite in the prompt.
         let probe = self
             .run_value(
                 &identity,
@@ -1779,11 +1722,12 @@ impl WinrigServer {
             )
         );
 
-        // Куски и замена идут одной последовательностью: отказ на середине
-        // убирает временный файл, цель остаётся прежней (TR-FS-05).
-        // DR-4: содержимое едет в команде как base64 и может быть секретом.
-        // `redact` ищет подстроку, поэтому редактируем именно то, что в команде
-        // и лежит, — саму строку base64. Открытый текст сюда не попадает.
+        // Chunks and the rename run as one sequence: a failure in the middle
+        // removes the temporary file and the target stays unchanged (TR-FS-05).
+        // DR-4: the content travels in the command as base64 and may be a
+        // secret. `redact` searches for a substring, so we redact exactly what
+        // the command carries — the base64 string itself. Cleartext never
+        // reaches it.
         let steps = plan.len();
         for (index, command) in plan.iter().enumerate() {
             let secrets = base64_payloads(command);
@@ -1823,7 +1767,6 @@ impl WinrigServer {
         })))
     }
 
-    /// Permanently delete a single file.
     #[tool(
         name = "delete_file",
         description = "Permanently delete a single file, scanning first and refusing protected paths and directories. Shows the resolved path and metadata in the confirmation prompt."
@@ -1834,7 +1777,7 @@ impl WinrigServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let identity = self.identity(&ctx)?;
-        // DR-6: лексический отказ до любой сети.
+        // DR-6: lexical refusal before any network access.
         let decision = decide_delete_path(&params.path);
         if !decision.allow {
             self.audit_refusal(&identity, "delete_file", &decision);
@@ -1844,8 +1787,8 @@ impl WinrigServer {
         }
         let safe = ps::escape(&params.path);
 
-        // Скан хостом: раскрывает полный путь (8.3, reparse) и не даёт удалить
-        // каталог через delete_file.
+        // Host-side scan: it reveals the full path (8.3, reparse) and prevents
+        // deleting a directory through delete_file.
         let scan_command = ps::delete_file_scan(&params.path);
         let pre = self
             .run_value(&identity, &params.session_id, &scan_command, "delete_file")
@@ -1897,7 +1840,6 @@ impl WinrigServer {
             .await)
     }
 
-    /// Recursively delete a directory.
     #[tool(
         name = "delete_directory",
         description = "Recursively delete a directory and all contents. Scans first and refuses drive roots, system directories and reparse points (junction/symlink), and when the item count exceeds max_items."
@@ -1908,7 +1850,7 @@ impl WinrigServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let identity = self.identity(&ctx)?;
-        // DR-6: лексический отказ до любой сети.
+        // DR-6: lexical refusal before any network access.
         let decision = decide_delete_path(&params.path);
         if !decision.allow {
             self.audit_refusal(&identity, "delete_directory", &decision);
@@ -1919,8 +1861,8 @@ impl WinrigServer {
         let cap = params.max_items.clamp(1, 50_000);
         let safe = ps::escape(&params.path);
 
-        // ADR-0005 §5: предварительный скан хостом — единственный способ
-        // увидеть реальный FullName (8.3-имена) и признак reparse point.
+        // ADR-0005 §5: the host-side pre-scan is the only way to see the real
+        // FullName (8.3 names) and the reparse point flag.
         let scan_command = ps::delete_directory_scan(&params.path, cap + 1);
         let pre = self
             .run_value(
@@ -1967,10 +1909,10 @@ impl WinrigServer {
                 params.path, scan.full_name, scan.file_count, scan.dir_count
             )
         );
-        // TOCTOU: между сканом и удалением дерево могло измениться, поэтому
-        // команда удаления сама повторяет защитные проверки и отказывает,
-        // если путь стал точкой повторной обработки или в поддереве появилась
-        // такая точка. Только после этого вызывается Remove-Item.
+        // TOCTOU: the tree can change between the scan and the delete, so the
+        // delete command repeats the safety checks and refuses if the path
+        // became a reparse point or the subtree gained one. Only then does it
+        // call Remove-Item.
         let command = format!(
             "$item = Get-Item -LiteralPath '{safe}' -Force -ErrorAction Stop; \
              if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {{ throw 'Refusing to delete: path is a reparse point (junction/symlink)' }}; \
@@ -2015,7 +1957,6 @@ mod tests {
     };
     use std::sync::Mutex;
 
-    /// Фиктивный транспорт для проверок слоя сервера.
     struct FakeTransport {
         calls: Mutex<Vec<String>>,
     }
@@ -2053,7 +1994,6 @@ mod tests {
 
     #[test]
     fn policy_refuses_protected_delete_before_transport() {
-        // Проверяем чистую политику, которую использует инструмент (DR-6).
         assert!(!decide_delete_path("C:\\Windows").allow);
         assert!(decide_delete_path("C:\\App\\logs").allow);
     }
@@ -2063,8 +2003,8 @@ mod tests {
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect();
-        // `Env` не несёт времени жизни, поэтому замыкание обязано владеть
-        // данными: ссылка на локальный вектор здесь не живёт достаточно долго.
+        // `Env` carries no lifetime, so the closure must own the data: a
+        // reference to a local vector does not live long enough here.
         let lookup: Box<crate::config::Env> = Box::new(move |name: &str| {
             if name == "WINRIG_AUTH_TOKEN" {
                 return Some("token".to_owned());
@@ -2082,8 +2022,8 @@ mod tests {
         WinrigServer::new(registry, Arc::new(config))
     }
 
-    /// TR-FS-01: выключенный инструмент не объявляется. Иначе агент строит
-    /// план вокруг возможности, в которой ему откажут.
+    /// TR-FS-01: a disabled tool is not advertised. Otherwise the agent builds
+    /// a plan around a capability it will be refused.
     #[test]
     fn write_file_is_absent_until_the_operator_enables_it() {
         let off = server_with(&[]);
@@ -2110,7 +2050,7 @@ mod tests {
         assert_eq!(names.len(), 38, "expected 38 tools with write_file");
     }
 
-    /// TR-FS-01: снятый маршрут не только скрыт из списка, но и не вызывается.
+    /// TR-FS-01: a removed route is not only hidden from the list but also uncallable.
     #[test]
     fn disabled_write_file_has_no_route() {
         assert!(!server_with(&[]).tool_router.has_route("write_file"));
@@ -2121,8 +2061,8 @@ mod tests {
         );
     }
 
-    /// TR-FS-05: имя временного файла не повторяется между вызовами, иначе
-    /// два параллельных вызова в один путь делят его на двоих.
+    /// TR-FS-05: the temporary file name does not repeat between calls, or two
+    /// parallel calls to one path would share it.
     #[test]
     fn temporary_suffix_differs_between_calls() {
         let first = random_suffix();
@@ -2132,19 +2072,19 @@ mod tests {
         assert!(first.chars().all(|c| c.is_ascii_hexdigit()), "{first}");
     }
 
-    /// DR-4: тело файла едет в команде как base64, и в аудит оно попасть не
-    /// должно. Редактируется именно то, что в команде и лежит.
+    /// DR-4: the file body travels in the command as base64 and must not reach
+    /// the audit. Exactly what the command carries is redacted.
     #[test]
     fn base64_payload_is_extracted_for_redaction() {
         let command = ps::write_chunk("C:\\Temp\\p", "c2VjcmV0", true);
         assert_eq!(base64_payloads(&command), vec!["c2VjcmV0".to_owned()]);
-        // Команда без полезной нагрузки не даёт ложных секретов: пустая строка
-        // редактировала бы весь вывод.
+        // A command with no payload yields no false secrets: an empty string
+        // would redact the whole output.
         assert!(base64_payloads(&ps::write_scan("C:\\a")).is_empty());
         assert!(base64_payloads(&ps::write_chunk("C:\\Temp\\p", "", true)).is_empty());
     }
 
-    /// TR-FS-02: запись по защищённому пути отвергается политикой до сети.
+    /// TR-FS-02: a write to a protected path is refused by the policy before the network.
     #[test]
     fn policy_refuses_protected_write_before_transport() {
         assert!(!decide_write_path("C:\\Windows\\System32\\config").allow);
@@ -2158,10 +2098,10 @@ mod tests {
         assert!(tools.iter().any(|tool| tool.name == "connect"));
         assert!(tools.iter().any(|tool| tool.name == "get_system_info"));
         assert!(tools.iter().any(|tool| tool.name == "delete_directory"));
-        // Точное число: «не меньше 30» не поймает ни потерю одного, ни
-        // дубликат. Здесь объявленные инструменты целиком; сколько из них
-        // увидит агент, решает конфигурация (TR-FS-01), и это проверяет
-        // `write_file_is_absent_until_the_operator_enables_it`.
+        // An exact count: "at least 30" would catch neither a lost tool nor a
+        // duplicate. These are all declared tools; the configuration decides
+        // how many the agent sees (TR-FS-01), and
+        // `write_file_is_absent_until_the_operator_enables_it` checks that.
         assert_eq!(tools.len(), 38, "expected 38 declared tools");
         let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         names.sort_unstable();
@@ -2171,8 +2111,8 @@ mod tests {
 
     #[test]
     fn known_mutating_tools_are_present() {
-        // DR-5: список модифицирующих инструментов фиксирован; рост множества
-        // меняет обещание README и должен быть осознанным.
+        // DR-5: the set of mutating tools is fixed; growing it changes the
+        // README promise and must be deliberate.
         let router = WinrigServer::tool_router();
         let tools = router.list_all();
         let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();

@@ -1,13 +1,14 @@
-//! Профиль учётной записи: аутентифицированный шифртекст пароля (ADR-0009).
+//! Account profile: the authenticated ciphertext of the password (ADR-0009).
 //!
-//! На диске лежит только шифртекст. Ключ выводится из токена доступа, который
-//! печатается один раз при создании и хранится у клиента; на сервере ключа нет.
-//! Формат несёт номер версии, каноническое имя пользователя (оно же — связанные
-//! данные AEAD, поэтому подмена имени обнаруживается), соль KDF и nonce.
+//! Only ciphertext is on disk. The key is derived from the access token, which
+//! is printed once at creation and kept by the client; the server has no key.
+//! The format carries a version number, the canonical user name (which is also
+//! the AEAD associated data, so a swapped name is detected), the KDF salt and
+//! the nonce.
 //!
-//! Ошибка расшифровки (неверный токен) и ошибка разбора (повреждённый файл или
-//! неподдерживаемая версия) — разные варианты [`ProfileError`]: журнал должен
-//! их различать, клиент получает одинаковый отказ (AC-PRF-40, AC-PRF-41).
+//! A decryption error (wrong token) and a parse error (a damaged file or an
+//! unsupported version) are different [`ProfileError`] variants: the journal
+//! must tell them apart, the client gets the same refusal (AC-PRF-40, AC-PRF-41).
 
 use std::fs;
 use std::io::Write;
@@ -23,65 +24,62 @@ use zeroize::Zeroizing;
 
 use crate::paths::validate_profile_name;
 
-/// Версия текущего формата профиля.
 pub const FORMAT_VERSION: u32 = 1;
-/// Длина соли KDF в байтах.
+/// KDF salt length in bytes.
 pub const SALT_LEN: usize = 32;
-/// Длина nonce XChaCha20 в байтах.
+/// XChaCha20 nonce length in bytes.
 pub const NONCE_LEN: usize = 24;
-/// Длина ключа шифрования в байтах.
+/// Encryption key length in bytes.
 pub const KEY_LEN: usize = 32;
-/// Длина генерируемого токена доступа в байтах.
+/// Generated access token length in bytes.
 pub const TOKEN_LEN: usize = 32;
-/// Контекст вывода ключа HKDF, отделяющий этот ключ от любых других применений.
+/// HKDF key-output context that separates this key from any other use.
 const HKDF_INFO: &[u8] = b"winrig-profile-v1";
-/// Ошибка работы с профилем.
+/// Failure in a profile operation.
 #[derive(Debug)]
 pub enum ProfileError {
-    /// Ошибка ввода-вывода.
+    /// Input or output error.
     Io {
-        /// Путь, на котором произошла ошибка.
         path: PathBuf,
-        /// Причина.
         source: std::io::Error,
     },
-    /// Профиль уже существует, перезапись не запрошена.
+    /// The profile already exists and overwrite was not requested.
     Exists {
-        /// Путь к существующему профилю.
+        /// File that already exists.
         path: PathBuf,
     },
-    /// Файл повреждён или не является профилем.
+    /// Damaged file or a file that is not a profile.
     Corrupt {
-        /// Путь к файлу.
+        /// File that failed the parse.
         path: PathBuf,
-        /// Что именно не так.
+        /// Cause of the failure.
         reason: String,
     },
-    /// Версия формата новее известной.
+    /// Format version newer than this build knows.
     UnsupportedVersion {
-        /// Путь к файлу.
+        /// File with the newer version.
         path: PathBuf,
-        /// Версия из файла.
+        /// Number read from the file.
         version: u32,
     },
-    /// Расшифровка не удалась: неверный токен или подменённые данные.
+    /// Decryption failed: wrong token or substituted data.
     InvalidToken {
-        /// Путь к файлу.
+        /// File that could not be opened.
         path: PathBuf,
     },
-    /// Недопустимое имя профиля.
+    /// Profile name that is not allowed.
     InvalidName {
-        /// Отвергнутое имя.
+        /// Rejected profile string.
         name: String,
     },
-    /// Пустой пароль или имя пользователя.
+    /// Empty password or user name.
     EmptyInput {
-        /// Что именно пусто.
+        /// Which input was empty.
         field: &'static str,
     },
-    /// Учётная запись без домена: ни `DOMAIN\user`, ни UPN (TR-PRF-16).
+    /// An account with no domain: neither `DOMAIN\user` nor a UPN (TR-PRF-16).
     InvalidAccount {
-        /// Отвергнутая учётная запись.
+        /// Login string without a domain.
         account: String,
     },
 }
@@ -123,25 +121,25 @@ impl std::fmt::Display for ProfileError {
 
 impl std::error::Error for ProfileError {}
 
-/// Развёрнутый профиль: имя пользователя и пароль в памяти.
+/// A loaded profile: the user name and the password in memory.
 #[derive(Debug)]
 pub struct LoadedProfile {
-    /// Каноническое имя учётной записи.
+    /// Canonical account name.
     pub username: String,
-    /// Пароль AD; обнуляется при освобождении.
+    /// AD secret, zeroized on drop.
     pub password: SecretString,
 }
 
-/// Сведения о профиле для вывода списка, без секретов.
+/// Profile information for the list output, without secrets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileSummary {
-    /// Имя профиля (имя файла без расширения).
+    /// Profile file stem without its extension.
     pub name: String,
-    /// Каноническое имя учётной записи.
+    /// Canonical account name.
     pub username: String,
-    /// Время создания в секундах Unix.
+    /// Creation time in Unix seconds.
     pub created_at: u64,
-    /// Путь к файлу профиля.
+    /// Location of the profile file.
     pub path: PathBuf,
 }
 
@@ -169,7 +167,7 @@ struct CipherSection {
     ciphertext: String,
 }
 
-/// Генерирует токен доступа из системного источника случайности.
+/// Generates an access token from the system random source.
 #[must_use]
 pub fn generate_token() -> String {
     let mut bytes = [0u8; TOKEN_LEN];
@@ -177,7 +175,7 @@ pub fn generate_token() -> String {
     hex_encode(&bytes)
 }
 
-/// Выводит ключ шифрования из токена и соли.
+/// Derives the encryption key from the token and the salt.
 fn derive_key(token: &str, salt: &[u8]) -> Zeroizing<[u8; KEY_LEN]> {
     let hkdf = Hkdf::<Sha256>::new(Some(salt), token.as_bytes());
     let mut key = Zeroizing::new([0u8; KEY_LEN]);
@@ -250,16 +248,17 @@ fn parse_file(path: &Path, raw: &str) -> Result<ProfileFile, ProfileError> {
     Ok(file)
 }
 
-/// Отвергает учётную запись без домена (TR-PRF-16).
+/// Rejects an account with no domain (TR-PRF-16).
 ///
-/// `split_account` делит по первому `\`, а UPN не делит вовсе. Голое имя
-/// поэтому уходит в NTLM с пустым доменом, и AD отвечает отказом — но уже
-/// на первом `connect`, далеко от места ошибки. Разделитель легко теряется по
-/// дороге: в shell без кавычек, в JSON, в аргументе, собранном агентом.
+/// `split_account` splits at the first `\` and a UPN not at all. A bare name
+/// therefore goes to NTLM with an empty domain, and AD answers with a refusal —
+/// but only at the first `connect`, far from the place of the error. The
+/// separator is easily lost on the way: in a shell without quotes, in JSON, in
+/// an argument built by an agent.
 ///
 /// # Errors
 ///
-/// [`ProfileError::InvalidAccount`], если нет ни `\`, ни `@`.
+/// [`ProfileError::InvalidAccount`] when there is neither `\` nor `@`.
 fn validate_account(account: &str) -> Result<(), ProfileError> {
     if account.contains('\\') || account.contains('@') {
         return Ok(());
@@ -269,12 +268,12 @@ fn validate_account(account: &str) -> Result<(), ProfileError> {
     })
 }
 
-/// Создаёт профиль и возвращает токен, которым зашифрован пароль.
+/// Creates a profile and returns the token that encrypts the password.
 ///
 /// # Errors
 ///
 /// [`ProfileError::InvalidName`], [`ProfileError::EmptyInput`],
-/// [`ProfileError::Exists`] без `overwrite`, [`ProfileError::Io`].
+/// [`ProfileError::Exists`] without `overwrite`, [`ProfileError::Io`].
 pub fn create(
     path: &Path,
     name: &str,
@@ -307,7 +306,7 @@ pub fn create(
     Ok(token)
 }
 
-/// Перешифровывает профиль новым токеном, сохраняя имя пользователя.
+/// Re-encrypts the profile with a new token and keeps the user name.
 ///
 /// # Errors
 ///
@@ -338,12 +337,12 @@ pub fn rotate(path: &Path, password: &str) -> Result<String, ProfileError> {
     Ok(token)
 }
 
-/// Загружает профиль, расшифровывая пароль предъявленным токеном.
+/// Loads the profile and decrypts the password with the presented token.
 ///
 /// # Errors
 ///
-/// [`ProfileError::Corrupt`] при повреждённом файле или неизвестной версии,
-/// [`ProfileError::InvalidToken`] при неверном токене, [`ProfileError::Io`].
+/// [`ProfileError::Corrupt`] for a damaged file or an unknown version,
+/// [`ProfileError::InvalidToken`] for a wrong token, [`ProfileError::Io`].
 pub fn load(path: &Path, token: &str) -> Result<LoadedProfile, ProfileError> {
     let raw = fs::read_to_string(path).map_err(|source| ProfileError::Io {
         path: path.to_path_buf(),
@@ -371,7 +370,7 @@ pub fn load(path: &Path, token: &str) -> Result<LoadedProfile, ProfileError> {
     })
 }
 
-/// Читает сведения о профилях каталога без секретов.
+/// Profile summaries of a directory, without secrets.
 #[must_use]
 pub fn list(paths: &[PathBuf], names: &[String]) -> Vec<ProfileSummary> {
     let mut out = Vec::new();
@@ -392,11 +391,11 @@ pub fn list(paths: &[PathBuf], names: &[String]) -> Vec<ProfileSummary> {
     out
 }
 
-/// Удаляет профиль; отсутствие файла не считается ошибкой.
+/// Deletes the profile; a missing file is not an error.
 ///
 /// # Errors
 ///
-/// [`ProfileError::Io`], если файл существует, но его нельзя удалить.
+/// [`ProfileError::Io`] when the file exists but cannot be removed.
 pub fn forget(path: &Path) -> Result<bool, ProfileError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(true),
@@ -408,7 +407,7 @@ pub fn forget(path: &Path) -> Result<bool, ProfileError> {
     }
 }
 
-/// Ожидаемый на текущей платформе режим файла профиля.
+/// Warning when the profile mode is looser than expected on this platform.
 #[must_use]
 pub fn permissions_warning(path: &Path) -> Option<String> {
     crate::private_fs::loose_file_mode(path).map(|mode| {
@@ -419,7 +418,7 @@ pub fn permissions_warning(path: &Path) -> Option<String> {
     })
 }
 
-/// Истина, если токен расшифровывает профиль. Для проверки совпадения ключей.
+/// True when the given token opens the profile, for key comparison.
 #[must_use]
 pub fn decrypts(path: &Path, token: &str) -> bool {
     load(path, token).is_ok()
@@ -455,11 +454,10 @@ fn build_file(
     }
 }
 
-/// Пишет файл атомарно: временный файл в том же каталоге, затем переименование.
+/// Writes the file atomically: a temporary file in the same directory, then a rename.
 ///
-/// Имя временного файла случайно, чтобы его нельзя было предугадать и
-/// подготовить по нему симлинк; существующий временный файл удаляется до
-/// открытия (AC-PRF-31).
+/// The temporary name is random so it cannot be predicted and used to plant a
+/// symlink; an existing temporary file is removed before the open (AC-PRF-31).
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), ProfileError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     crate::private_fs::create_private_dir(parent).map_err(|source| ProfileError::Io {
@@ -491,7 +489,7 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), ProfileError> {
         })?;
     }
     if let Err(source) = fs::rename(&temp, path) {
-        // Windows не заменяет существующий файл переименованием.
+        // Windows does not replace an existing file by rename.
         if path.exists() {
             fs::remove_file(path).map_err(|source| ProfileError::Io {
                 path: path.to_path_buf(),
@@ -520,7 +518,7 @@ fn decode_field(path: &Path, value: &str, field: &str) -> Result<Vec<u8>, Profil
     })
 }
 
-/// Декодирует hex-поле фиксированной длины.
+/// Decodes a hex field of fixed length.
 fn decode_fixed<const N: usize>(
     path: &Path,
     value: &str,
@@ -583,7 +581,7 @@ mod tests {
         (path, token)
     }
 
-    /// AC-PRF-01: файл не содержит пароль, токен не сохранён, права приватны.
+    /// AC-PRF-01: the file holds no password, the token is not stored, the permissions are private.
     #[test]
     fn create_writes_only_ciphertext() {
         let dir = temp_dir("create");
@@ -606,7 +604,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-02: верный токен возвращает имя и пароль.
+    /// AC-PRF-02: the correct token returns the user name and the password.
     #[test]
     fn load_with_correct_token() {
         let dir = temp_dir("load");
@@ -618,9 +616,10 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-67: учётка без разделителя не создаёт профиль молча. Именно так
-    /// был потерян `\` в `contoso\alice`: NTLM ушёл с пустым доменом, и
-    /// оператор узнал об этом только по отказу AD.
+    /// AC-PRF-67: an account without a separator does not create a profile
+    /// silently. This is how the `\` in `contoso\alice` was lost: NTLM left
+    /// with an empty domain, and the operator learned it only from the AD
+    /// refusal.
     #[test]
     fn account_without_a_separator_is_refused() {
         let dir = temp_dir("bareaccount");
@@ -636,7 +635,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-67: обе законные формы проходят.
+    /// AC-PRF-67: both legal forms pass.
     #[test]
     fn domain_and_upn_accounts_are_accepted() {
         let dir = temp_dir("goodaccount");
@@ -651,7 +650,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-40: неверный токен — отдельная ошибка InvalidToken.
+    /// AC-PRF-40: a wrong token is a separate InvalidToken error.
     #[test]
     fn wrong_token_is_invalid_token_error() {
         let dir = temp_dir("wrongtoken");
@@ -663,7 +662,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-41: повреждённый файл — Corrupt, не InvalidToken.
+    /// AC-PRF-41: a damaged file is Corrupt, not InvalidToken.
     #[test]
     fn corrupt_file_is_distinct_error() {
         let dir = temp_dir("corrupt");
@@ -676,15 +675,15 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// `hex_decode` отвергает вход, который не является парами hex-цифр.
+    /// `hex_decode` rejects input that is not pairs of hex digits.
     ///
-    /// Тест держит гвард на чётность. `as_chunks::<2>()` молча отбрасывает
-    /// хвостовой байт: без проверки `is_multiple_of(2)` строка "abc"
-    /// декодировалась бы в один байт 0xab вместо отказа, и обрезанные соль,
-    /// nonce или шифротекст ушли бы в расшифровку как якобы целые — вместо
-    /// `ProfileError::Corrupt` операторa ждал бы отказ аутентификации AEAD
-    /// или просто более короткий ключевой материал. Вторая ветка — `?` от
-    /// `to_digit(16)` — единственное, что отсеивает не-hex символ.
+    /// The test holds the even-length guard. `as_chunks::<2>()` silently drops
+    /// a trailing byte: without the `is_multiple_of(2)` check the string "abc"
+    /// would decode to one byte 0xab instead of failing, and a truncated salt,
+    /// nonce or ciphertext would reach decryption as if whole; instead of
+    /// `ProfileError::Corrupt` the operator would get an AEAD authentication
+    /// failure or just shorter key material. The second branch, the `?` from
+    /// `to_digit(16)`, is the only thing that rejects a non-hex character.
     #[test]
     fn hex_decode_rejects_odd_length_and_non_hex() {
         assert_eq!(hex_decode(""), Some(vec![]), "пустая строка — ноль байт");
@@ -698,8 +697,8 @@ mod tests {
             "нечётная длина: хвост не отбросить"
         );
 
-        // Все входы ниже чётной длины В БАЙТАХ, иначе их отсеял бы гвард
-        // выше и ветка `to_digit` осталась бы непроверенной.
+        // All inputs below are of even length IN BYTES, otherwise the guard
+        // above would drop them and the `to_digit` branch would stay untested.
         assert_eq!(hex_decode("zz"), None, "не-hex буква");
         assert_eq!(hex_decode("0g"), None, "не-hex во второй цифре пары");
         assert_eq!(hex_decode("00 1"), None, "пробел как цифра не проходит");
@@ -710,7 +709,7 @@ mod tests {
         );
     }
 
-    /// AC-PRF-46: версия выше известной отвергается отдельно.
+    /// AC-PRF-46: a version above the known one is refused separately.
     #[test]
     fn unsupported_version_is_reported() {
         let dir = temp_dir("version");
@@ -725,7 +724,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-23: без метаданных шифрования пароль не восстановим.
+    /// AC-PRF-23: without the crypto metadata the password cannot be recovered.
     #[test]
     fn stripped_crypto_metadata_is_unrecoverable() {
         let dir = temp_dir("stripped");
@@ -737,7 +736,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-24: повторное создание без overwrite отвергается, файл не меняется.
+    /// AC-PRF-24: a second create without overwrite is refused and the file does not change.
     #[test]
     fn create_twice_without_overwrite_fails() {
         let dir = temp_dir("exists");
@@ -751,7 +750,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-45: пустой ввод отвергается без создания файла.
+    /// AC-PRF-45: empty input is refused with no file created.
     #[test]
     fn empty_input_is_rejected() {
         let dir = temp_dir("empty");
@@ -768,7 +767,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-11: ротация меняет токен, сохраняя имя и пароль.
+    /// AC-PRF-11: rotation changes the token and keeps the user name and the password.
     #[test]
     fn rotate_changes_token_only() {
         let dir = temp_dir("rotate");
@@ -786,7 +785,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-12 и AC-PRF-30: удаление идемпотентно.
+    /// AC-PRF-12 and AC-PRF-30: removal is idempotent.
     #[test]
     fn forget_is_idempotent() {
         let dir = temp_dir("forget");
@@ -797,7 +796,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-10: список не содержит секретов.
+    /// AC-PRF-10: the list holds no secrets.
     #[test]
     fn list_exposes_no_secrets() {
         let dir = temp_dir("list");
@@ -817,7 +816,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// Расширение файла профиля — `.json`.
+    /// Profile file extension is `.json`.
     #[test]
     fn profile_files_use_json_extension() {
         let dir = temp_dir("extension");
@@ -831,7 +830,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-27: имя с символами пути отвергается.
+    /// AC-PRF-27: a name with path characters is refused.
     #[test]
     fn invalid_name_is_rejected() {
         let dir = temp_dir("badname");
@@ -846,7 +845,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-25: слишком широкие права дают предупреждение, не отказ.
+    /// AC-PRF-25: loose permissions give a warning, not a refusal.
     #[cfg(unix)]
     #[test]
     fn loose_permissions_warn_but_load() {
@@ -859,7 +858,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-03: токена нет в файле и каталоге.
+    /// AC-PRF-03: the token is absent from the file and the directory.
     #[test]
     fn token_is_absent_from_disk() {
         let dir = temp_dir("notoken");
@@ -872,7 +871,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-26: канонизация имени совпадает с заголовком.
+    /// AC-PRF-26: the name canonicalization matches the header path.
     #[test]
     fn canonical_username_matches_identity() {
         let dir = temp_dir("canon");
@@ -885,7 +884,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-31: ротация оставляет каталог без временных файлов.
+    /// AC-PRF-31: rotation leaves no temporary files in the directory.
     #[test]
     fn rotation_leaves_no_temp_files() {
         let dir = temp_dir("notemp");
@@ -901,7 +900,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// AC-PRF-32: повторная загрузка не меняет файл.
+    /// AC-PRF-32: a repeated load does not change the file.
     #[test]
     fn repeated_load_keeps_file_unchanged() {
         let dir = temp_dir("repeat");

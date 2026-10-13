@@ -719,6 +719,16 @@ fn default_established() -> String {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct OpenHandlesParams {
+    #[schemars(description = "Session ID that connect returns.")]
+    session_id: String,
+    #[schemars(
+        description = "Absolute path of a file, or of a directory. For a directory the tool checks the files under it."
+    )]
+    path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct DnsCacheParams {
     #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
@@ -1446,6 +1456,25 @@ impl WinrigServer {
     }
 
     #[tool(
+        name = "get_open_handles",
+        description = "Return the processes that hold a file open, with the PID, the process name and the start time. Pass a file path, or a directory path to check each file under it (up to 200 files): a handle on the directory itself, such as a process working directory, is not visible. A directory with a deep tree can take a long time. The tool uses the Restart Manager, so the host needs no Sysinternals handle.exe. The Restart Manager reports the applications and services that hold the resource, so a process with only a low-level handle can be absent. The result reports files_checked and skipped. Read-only."
+    )]
+    async fn get_open_handles(
+        &self,
+        Parameters(params): Parameters<OpenHandlesParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let identity = self.identity(&ctx)?;
+        let command = match ps::get_open_handles(&params.path) {
+            Ok(command) => command,
+            Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
+        };
+        Ok(self
+            .run(&identity, &params.session_id, &command, "get_open_handles")
+            .await)
+    }
+
+    #[tool(
         name = "get_dns_cache",
         description = "Read the local DNS client cache as tabular text: record name, type, TTL and resolved data."
     )]
@@ -2145,7 +2174,7 @@ mod tests {
             !names.iter().any(|name| name == "write_file"),
             "write_file must not be advertised while disabled"
         );
-        assert_eq!(names.len(), 38, "expected 38 tools without write_file");
+        assert_eq!(names.len(), 39, "expected 39 tools without write_file");
 
         let on = server_with(&[("WINRIG_ALLOW_FILE_WRITE", "true")]);
         let names: Vec<String> = on
@@ -2155,7 +2184,7 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect();
         assert!(names.iter().any(|name| name == "write_file"));
-        assert_eq!(names.len(), 39, "expected 39 tools with write_file");
+        assert_eq!(names.len(), 40, "expected 40 tools with write_file");
     }
 
     /// TR-FS-01: a removed route is not only hidden from the list but also uncallable.
@@ -2205,16 +2234,17 @@ mod tests {
         let tools = router.list_all();
         assert!(tools.iter().any(|tool| tool.name == "connect"));
         assert!(tools.iter().any(|tool| tool.name == "get_system_info"));
+        assert!(tools.iter().any(|tool| tool.name == "get_open_handles"));
         assert!(tools.iter().any(|tool| tool.name == "delete_directory"));
         // An exact count: "at least 30" would catch neither a lost tool nor a
         // duplicate. These are all declared tools; the configuration decides
         // how many the agent sees (TR-FS-01), and
         // `write_file_is_absent_until_the_operator_enables_it` checks that.
-        assert_eq!(tools.len(), 39, "expected 39 declared tools");
+        assert_eq!(tools.len(), 40, "expected 40 declared tools");
         let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 39, "tool names must be unique");
+        assert_eq!(names.len(), 40, "tool names must be unique");
     }
 
     #[test]

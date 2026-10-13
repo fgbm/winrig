@@ -14,7 +14,7 @@ The full documentation is at https://fgbm.github.io/winrig/.
 `winrig` is the Rust successor of the Python project `win-mcp-server`. It keeps the same domain rules, module boundaries and tool contracts. It ships as one static binary without a container or an interpreter. It runs either as an HTTP service (`winrig serve`) or as a local stdio process (`winrig stdio`).
 
 - **Low memory, one binary**: one release binary, with no runtime and no container. Resident memory stays near 11 MiB after start and repeated requests on the development computer (`VmRSS` from `/proc`).
-- **38 tools** plus `write_file`, when the operator enables it: file system, services, registry, event logs, certificates, processes, network, scheduled tasks and more. The current version includes these ported tools. The Python version `win-mcp-server` had file transfer (copy, move, rename, archives), `invoke_http_request` and SFTP tools. The current version does not include those tools yet.
+- **39 tools** plus `write_file`, when the operator enables it: file system, services, registry, event logs, certificates, processes, network, scheduled tasks and more. The current version includes these ported tools. The Python version `win-mcp-server` had file transfer (copy, move, rename, archives), `invoke_http_request` and SFTP tools. The current version does not include those tools yet.
 - **One process for each profile**: `winrig setup` creates an encrypted profile. The printed profile token is the only key, and `setup` shows it one time. A second process on the same profile refuses to start and points to the HTTP mode.
 - **Two secrets, one for each request**: a request authenticates with `WINRIG_AUTH_TOKEN` (the header path with `X-AD-User`) or with a profile token. The profile token gives the identity and makes the server ignore `X-AD-*`.
 - **No secrets on disk**: no account credentials in configurations or in logs. The profile file holds only authenticated ciphertext.
@@ -54,6 +54,7 @@ The full documentation is at https://fgbm.github.io/winrig/.
 | `list_event_logs` | The event log channels with the record count and the enabled state |
 | `get_services` | A summary of the services, or the full details of each service in JSON |
 | `list_processes` | The processes with a sort by CPU, memory or handles |
+| `get_open_handles` | The processes that hold a file open, with the PID, the name and the start time. It uses the Restart Manager, so a host needs no Sysinternals `handle.exe` |
 | `get_system_info` | The OS version, uptime, RAM, CPU count, domain, time zone |
 | `get_disk_space` | The free space on all fixed disks |
 | `get_perf_snapshot` | A snapshot of CPU, memory, disk I/O and network, independent of the locale |

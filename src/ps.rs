@@ -983,6 +983,71 @@ pub fn resolve_dns_name(name: &str, record_type: &str, dns_server: &str) -> Resu
     ))
 }
 
+/// The read-only script that reaches the Restart Manager for the holder list (TR-REL-14).
+///
+/// A dynamic type carries the P/Invoke methods, built by `Reflection.Emit` inside the
+/// PowerShell process: no compiler runs and no file goes to the host disk (unlike
+/// `Add-Type`). Type attributes `'Public,Class'` are explicit, because the
+/// one-argument `DefineType` overload makes the type not public. Method attributes `22` are `Public|Static`; `DefinePInvokeMethod` adds
+/// `PinvokeImpl` itself, and the value `86` would wrongly add `Virtual`. The trailing
+/// `1,3` pair is `CallingConvention.Winapi` and `CharSet.Unicode`, so `string[]` goes
+/// as `LPWSTR[]` and the 33-`char` session key stays wide. `SetImplementationFlags(128)`
+/// is `PreserveSig`, so a non-zero return is the Restart Manager error code, not a
+/// translated HRESULT. The `RM_PROCESS_INFO` array is one raw byte buffer of 668 bytes
+/// for each holder; the offsets come from the Restart Manager header, and `strAppName`
+/// and `strServiceShortName` are NUL-terminated inside their fields, so the first NUL
+/// ends the name; the script still guards the no-NUL case. The path enters a
+/// single-quoted string ([`escape`]) at `@PATH@`.
+const OPEN_HANDLES_SCRIPT: &str = r#"$ErrorActionPreference='Stop';$p='@PATH@';try{$i=Get-Item -LiteralPath $p -Force -ea Stop}catch[Management.Automation.ItemNotFoundException]{throw "Path not found: $p"}catch[UnauthorizedAccessException]{throw "Access denied: $p"};if($i.PSProvider.Name -ne 'FileSystem'){throw "NotFile: $p"};$p=$i.FullName;$a=[AppDomain]::CurrentDomain.DefineDynamicAssembly([Reflection.AssemblyName]::new('Winrig'),1).DefineDynamicModule('Winrig').DefineType('Winrig','Public,Class');$w={$m=$a.DefinePInvokeMethod($args[0],'rstrtmgr.dll',22,1,[int],$args[1],1,3);$null=$m.SetImplementationFlags(128)};$q=[int].MakeByRefType();&$w RmStartSession @($q,[int],[char[]]);&$w RmRegisterResources @([int],[int],[string[]],[int],[IntPtr],[int],[IntPtr]);&$w RmGetList @([int],$q,$q,[byte[]],$q);&$w RmEndSession @([int]);$t=$a.CreateType();$e=@{5='Deny';87='Bad';121='Timeout';234='More';353='Max'};function RmFail($m,$r){throw "$m ${r}: $($e[$r])"};function RmStr($b,$o,$n){$s=[Text.Encoding]::Unicode.GetString($b,$o,$n);$k=$s.IndexOf([char]0);if($k -ge 0){$s.Substring(0,$k)}else{$s}};$s=0;if($i.PSIsContainer){$x=@();$f=@(Get-ChildItem -LiteralPath $p -Recurse -File -Force -ea 0 -ev +x|Select -First @FO@ -Expand FullName);$ft=$f.Count -gt @FL@;$f=@($f|Select -First @FL@);$s=@($x).Count}else{$f=@($p);$ft=$false};$h=0;$r=$t::RmStartSession([ref]$h,0,[char[]]::new(33));if($r){RmFail RmStartSession $r};$o=@();try{if($f.Count){$r=$t::RmRegisterResources($h,$f.Count,[string[]]$f,0,[IntPtr]::Zero,0,[IntPtr]::Zero);if($r){RmFail RmRegisterResources $r};$n=$c=$b=0;$d=$null;$r=234;for($j=0;$j++ -lt 5 -and $r -eq 234;){$r=$t::RmGetList($h,[ref]$n,[ref]$c,$d,[ref]$b);if($r -eq 234){$c=$n;$d=[byte[]]::new($c*668)}};if($r){RmFail RmGetList $r};for($j=0;$j -lt $c;$j++){$y=$j*668;$z=[BitConverter]::ToInt64($d,$y+4);$o+=[PSCustomObject]@{pid=[BitConverter]::ToUInt32($d,$y);name=(RmStr $d ($y+12) 512);service=(RmStr $d ($y+524) 128);started=if($z -gt 0){[DateTime]::FromFileTimeUtc($z).ToString('yyyy-MM-ddTHH:mm:ssZ',[Globalization.CultureInfo]::InvariantCulture)}else{$null}}}}}finally{$null=$t::RmEndSession($h)};$rt=$o.Count -gt @RL@;[PSCustomObject]@{path=$p;holders=@($o|Select -First @RL@);count=$o.Count;files_checked=$f.Count;skipped=$s;files_truncated=$ft;rows_truncated=$rt}|ConvertTo-Json -Compress -Depth 3"#;
+
+/// Sanity upper bound in characters: the Windows long-path maximum, 32767 (TR-REL-14).
+///
+/// The real limit is the WinRS command line, which the Restart Manager script fills
+/// much more than a plain script; this bound only stops an absurd input before the
+/// command is built. A plain 260-character path and even a worst-case all-quote path
+/// of 260 characters still fit.
+pub const OPEN_HANDLES_PATH_MAX_CHARS: usize = 32_767;
+/// The cap on the holders in one answer, like the other diagnostic tools.
+const OPEN_HANDLES_ROW_LIMIT: usize = 100;
+/// The cap on the files registered for a directory path. The Restart Manager
+/// refuses a directory itself (`ERROR_ACCESS_DENIED`), so a directory is walked.
+const OPEN_HANDLES_FILE_LIMIT: usize = 200;
+
+/// The processes that hold a file open, with the PID, the name and the start time (TR-REL-14).
+///
+/// The Restart Manager refuses a directory path itself (`ERROR_ACCESS_DENIED`), so
+/// a directory is enumerated file by file up to [`OPEN_HANDLES_FILE_LIMIT`], and
+/// the answer carries `files_checked` and `skipped`. An empty holder set is an
+/// empty array, not an error; a missing path throws.
+///
+/// # Errors
+///
+/// A path above [`OPEN_HANDLES_PATH_MAX_CHARS`], or a command that does not fit
+/// one WinRS command line. Both refusals name the path length and the limit.
+pub fn get_open_handles(path: &str) -> Result<String, String> {
+    let chars = path.chars().count();
+    if chars > OPEN_HANDLES_PATH_MAX_CHARS {
+        return Err(format!(
+            "path is {chars} characters; the limit is {OPEN_HANDLES_PATH_MAX_CHARS}"
+        ));
+    }
+    let safe = escape(path);
+    // The path is substituted last, so a `@…@` sequence inside it cannot match a
+    // later placeholder.
+    let command = OPEN_HANDLES_SCRIPT
+        .replace("@FO@", &(OPEN_HANDLES_FILE_LIMIT + 1).to_string())
+        .replace("@FL@", &OPEN_HANDLES_FILE_LIMIT.to_string())
+        .replace("@RL@", &OPEN_HANDLES_ROW_LIMIT.to_string())
+        .replace("@PATH@", &safe);
+    if !fits_command_line(&command) {
+        return Err(format!(
+            "path is {chars} characters; the command does not fit the WinRS command line of \
+             {WINRS_COMMAND_LINE_LIMIT} characters; shorten the path"
+        ));
+    }
+    Ok(command)
+}
+
 #[must_use]
 pub fn json_str(value: &Value, key: &str) -> String {
     value
@@ -1739,6 +1804,397 @@ mod tests {
         );
     }
 
+    /// AC-REL14-1: the command reaches the Restart Manager through a dynamic
+    /// P/Invoke type, so the host needs no Sysinternals `handle.exe` and no
+    /// compiler runs (unlike `Add-Type`).
+    #[test]
+    fn get_open_handles_uses_reflection_emit_without_add_type() {
+        let cmd = get_open_handles("C:\\App\\data.mdb").expect("valid");
+        for api in [
+            "DefineDynamicAssembly",
+            "DefineDynamicModule",
+            "DefinePInvokeMethod",
+            "rstrtmgr.dll",
+            "RmStartSession",
+            "RmRegisterResources",
+            "RmGetList",
+            "RmEndSession",
+        ] {
+            assert!(cmd.contains(api), "missing {api}: {cmd}");
+        }
+        assert!(
+            !cmd.contains("Add-Type"),
+            "Add-Type writes to the host disk: {cmd}"
+        );
+        // Reflection through `MethodInfo.Invoke` cannot bind `[ref]` and does not
+        // coerce `object[]` to `string[]`; the PowerShell binder on `$t::…` is used.
+        assert!(
+            !cmd.contains(".Invoke($null,"),
+            "the P/Invoke must be called through the PowerShell binder: {cmd}"
+        );
+    }
+
+    /// `$name:` inside a double-quoted string is a scope qualifier and breaks the
+    /// parse; the safe form is `${name}`. The error text must stay free of an
+    /// unbraced variable followed by a colon (TR-REL-14).
+    #[test]
+    fn get_open_handles_has_no_scope_qualified_variable_in_a_string() {
+        let cmd = get_open_handles("C:\\App\\data.mdb").expect("valid");
+        assert_eq!(
+            unbraced_variable_colon(&cmd),
+            None,
+            "an unbraced $name: lives in a double-quoted string"
+        );
+        assert!(!cmd.contains("$r:"), "{cmd}");
+        assert!(cmd.contains("${r}: $($e[$r])"), "{cmd}");
+    }
+
+    /// The P/Invoke signatures, declared through one helper over a signature
+    /// table: an out handle and a 33-character session key for `RmStartSession`;
+    /// a 7-argument `RmRegisterResources`; a byte buffer of 668 bytes for each
+    /// `RM_PROCESS_INFO` and three out/ref counts for `RmGetList` (TR-REL-14).
+    #[test]
+    fn get_open_handles_declares_the_pinvoke_signatures() {
+        let cmd = get_open_handles("C:\\App\\data.mdb").expect("valid");
+        assert!(
+            cmd.contains("DefinePInvokeMethod($args[0],'rstrtmgr.dll',22,1,[int],$args[1],1,3)"),
+            "{cmd}"
+        );
+        // 22 = Public|Static (DefinePInvokeMethod adds PinvokeImpl); the trailing
+        // 1,3 is CallingConvention.Winapi and CharSet.Unicode; 128 is PreserveSig.
+        assert!(cmd.contains("SetImplementationFlags(128)"), "{cmd}");
+        assert!(cmd.contains("$q=[int].MakeByRefType()"), "{cmd}");
+        for call in [
+            "&$w RmStartSession @($q,[int],[char[]])",
+            "&$w RmRegisterResources @([int],[int],[string[]],[int],[IntPtr],[int],[IntPtr])",
+            "&$w RmGetList @([int],$q,$q,[byte[]],$q)",
+            "&$w RmEndSession @([int])",
+        ] {
+            assert!(cmd.contains(call), "missing {call}: {cmd}");
+        }
+        assert!(
+            cmd.contains("$r=$t::RmStartSession([ref]$h,0,[char[]]::new(33))"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains("$t::RmRegisterResources($h,$f.Count,[string[]]$f,0,[IntPtr]::Zero,0,[IntPtr]::Zero)"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains("$t::RmGetList($h,[ref]$n,[ref]$c,$d,[ref]$b)"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("$t::RmEndSession($h)"), "{cmd}");
+        assert!(cmd.contains("$d=[byte[]]::new($c*668)"), "{cmd}");
+    }
+
+    /// TR-SEC-12: the path enters a single-quoted string, so every single-quote
+    /// form is doubled (AC-OBS02-1).
+    #[test]
+    fn get_open_handles_escapes_the_path() {
+        for quote in SINGLE_QUOTES {
+            let path = format!("C:\\a{quote}b\\data.mdb");
+            let cmd = get_open_handles(&path).expect("valid");
+            let doubled = format!("C:\\a{quote}{quote}b\\data.mdb");
+            assert!(cmd.contains(&doubled), "the quote must be doubled: {cmd}");
+        }
+    }
+
+    /// A path above the Windows long-path maximum is refused before any host call,
+    /// and the refusal names the length and the limit (TR-REL-14).
+    #[test]
+    fn get_open_handles_refuses_a_path_above_the_sanity_bound() {
+        let path = "C:\\".to_owned() + &"a".repeat(OPEN_HANDLES_PATH_MAX_CHARS);
+        let error = get_open_handles(&path).expect_err("above the sanity bound");
+        assert!(error.contains(&path.chars().count().to_string()), "{error}");
+        assert!(
+            error.contains(&OPEN_HANDLES_PATH_MAX_CHARS.to_string()),
+            "{error}"
+        );
+    }
+
+    /// TR-REL-14: a plain path of 260 characters, the Windows `MAX_PATH`, fits one
+    /// command line.
+    #[test]
+    fn get_open_handles_accepts_a_260_character_plain_path() {
+        let path = "C:\\".to_owned() + &"a".repeat(257);
+        assert_eq!(path.chars().count(), 260);
+        let cmd = get_open_handles(&path).expect("260 plain characters must fit");
+        assert!(
+            fits_command_line(&cmd),
+            "chars: {}",
+            command_line_chars(&cmd)
+        );
+    }
+
+    /// TR-REL-14: the command fits up to a computed path limit; the next character
+    /// is refused before any host call, and the error names the path and the WinRS
+    /// limit. The plain limit is far above 260 characters.
+    #[test]
+    fn get_open_handles_fits_up_to_the_computed_path_limit() {
+        let path_of = |chars: usize| format!("C:\\{}", "a".repeat(chars.saturating_sub(3)));
+        let mut limit = 0;
+        while limit < 4000 && get_open_handles(&path_of(limit + 1)).is_ok() {
+            limit += 1;
+        }
+        assert!(limit < 4000, "no path limit found");
+        assert!(
+            limit >= 260,
+            "the budget must allow at least 260 characters: {limit}"
+        );
+
+        let boundary = path_of(limit);
+        let cmd = get_open_handles(&boundary).expect("the boundary fits");
+        assert!(
+            fits_command_line(&cmd),
+            "chars: {}",
+            command_line_chars(&cmd)
+        );
+
+        let over = path_of(limit + 1);
+        let error = get_open_handles(&over).expect_err("beyond the limit");
+        assert!(error.contains(&over.chars().count().to_string()), "{error}");
+        assert!(
+            error.contains(&WINRS_COMMAND_LINE_LIMIT.to_string()),
+            "{error}"
+        );
+    }
+
+    /// TR-REL-14: a directory is walked file by file. The Restart Manager refuses
+    /// a directory itself, so the enumeration is capped at the file limit and the
+    /// errors of the walk are counted.
+    #[test]
+    fn get_open_handles_checks_a_directory_file_by_file() {
+        let cmd = get_open_handles("C:\\App\\data").expect("valid");
+        assert!(cmd.contains("$i.PSIsContainer"), "{cmd}");
+        assert!(
+            cmd.contains("Get-ChildItem -LiteralPath $p -Recurse -File"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("-ev +x"), "{cmd}");
+        assert!(
+            cmd.contains(&format!(
+                "Select -First {} -Expand FullName",
+                OPEN_HANDLES_FILE_LIMIT + 1
+            )),
+            "{cmd}"
+        );
+    }
+
+    /// The answer reports how many files were checked and how many were skipped
+    /// by the directory walk (TR-REL-14).
+    #[test]
+    fn get_open_handles_reports_files_checked_and_skipped() {
+        let cmd = get_open_handles("C:\\App\\data").expect("valid");
+        assert!(cmd.contains("files_checked=$f.Count"), "{cmd}");
+        assert!(cmd.contains("skipped=$s"), "{cmd}");
+        assert!(cmd.contains("$s=@($x).Count"), "{cmd}");
+    }
+
+    /// A missing path (or a parent directory that denies access) throws before the
+    /// Restart Manager runs, so the agent sees a clear refusal, not an empty result.
+    #[test]
+    fn get_open_handles_reports_a_missing_path() {
+        let cmd = get_open_handles("C:\\gone\\data.mdb").expect("valid");
+        assert!(
+            cmd.contains(
+                "catch[Management.Automation.ItemNotFoundException]{throw \"Path not found: $p\"}"
+            ),
+            "{cmd}"
+        );
+    }
+
+    /// An access-denied path says so, and the branch is on the exception type,
+    /// not on localized text (AGENTS.md §6).
+    #[test]
+    fn get_open_handles_reports_access_denied() {
+        let cmd = get_open_handles("C:\\App\\data.mdb").expect("valid");
+        assert!(
+            cmd.contains("catch[UnauthorizedAccessException]{throw \"Access denied: $p\"}"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains("if($i.PSProvider.Name -ne 'FileSystem')"),
+            "the item must be a filesystem item: {cmd}"
+        );
+    }
+
+    /// The Restart Manager error codes map to fixed English names, not to a
+    /// localized `Win32Exception.Message`.
+    #[test]
+    fn get_open_handles_maps_restart_manager_error_codes() {
+        let cmd = get_open_handles("C:\\App\\data.mdb").expect("valid");
+        for code in ["5", "87", "121", "234", "353"] {
+            assert!(cmd.contains(&format!("{code}='")), "code {code}: {cmd}");
+        }
+        assert!(cmd.contains("$($e[$r])"), "{cmd}");
+    }
+
+    /// A `RmGetList` that reports `ERROR_MORE_DATA` (234) is retried with a
+    /// larger buffer, up to five attempts (TR-REL-14).
+    #[test]
+    fn get_open_handles_retries_on_more_data() {
+        let cmd = get_open_handles("C:\\App\\data.mdb").expect("valid");
+        assert!(
+            cmd.contains("for($j=0;$j++ -lt 5 -and $r -eq 234;)"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains("$r=$t::RmGetList($h,[ref]$n,[ref]$c,$d,[ref]$b)"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("$d=[byte[]]::new($c*668)"), "{cmd}");
+    }
+
+    /// The holders are capped and flagged, and an empty holder set is an empty
+    /// array, not an error: the Restart Manager returns zero entries.
+    #[test]
+    fn get_open_handles_caps_the_rows_and_returns_an_empty_array() {
+        let cmd = get_open_handles("C:\\App\\data.mdb").expect("valid");
+        assert!(cmd.contains("$o=@()"), "{cmd}");
+        assert!(cmd.contains("if($f.Count){"), "{cmd}");
+        assert!(
+            cmd.contains(&format!("Select -First {}", OPEN_HANDLES_ROW_LIMIT)),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains(&format!("$rt=$o.Count -gt {OPEN_HANDLES_ROW_LIMIT}")),
+            "{cmd}"
+        );
+        assert!(cmd.contains("holders=@($o|Select -First"), "{cmd}");
+        assert!(cmd.contains("count=$o.Count"), "{cmd}");
+        assert!(cmd.contains("rows_truncated=$rt"), "{cmd}");
+        assert!(cmd.contains("files_truncated=$ft"), "{cmd}");
+    }
+
+    /// AC-REL14-1: the result names the PID, the app name, the service short name
+    /// and the start time. All of them come from the `RM_PROCESS_INFO` buffer, so
+    /// no `Get-Process` and no `.StartTime` (TR-REL-14).
+    #[test]
+    fn get_open_handles_returns_pid_name_and_start_time() {
+        let cmd = get_open_handles("C:\\App\\data.mdb").expect("valid");
+        assert!(cmd.contains("pid=[BitConverter]::ToUInt32($d,$y)"), "{cmd}");
+        // strAppName is 256 WCHAR at offset 12; strServiceShortName is 64 WCHAR at
+        // offset 524 (12 + 512). `RmStr` trims each at the first NUL.
+        assert!(cmd.contains("name=(RmStr $d ($y+12) 512)"), "{cmd}");
+        assert!(cmd.contains("service=(RmStr $d ($y+524) 128)"), "{cmd}");
+        assert!(
+            cmd.contains("$k=$s.IndexOf([char]0);if($k -ge 0){$s.Substring(0,$k)}else{$s}"),
+            "RmStr must guard a missing NUL: {cmd}"
+        );
+        // ProcessStartTime is a FILETIME at offset 4, shown as invariant ISO UTC.
+        assert!(cmd.contains("[DateTime]::FromFileTimeUtc($z)"), "{cmd}");
+        assert!(
+            cmd.contains("[Globalization.CultureInfo]::InvariantCulture"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains(
+                ".ToString('yyyy-MM-ddTHH:mm:ssZ',[Globalization.CultureInfo]::InvariantCulture)"
+            ),
+            "the start time must be ISO UTC: {cmd}"
+        );
+        assert!(!cmd.contains("Get-Process"), "{cmd}");
+        assert!(!cmd.contains(".StartTime"), "{cmd}");
+        assert!(cmd.contains("ConvertTo-Json -Compress"), "{cmd}");
+    }
+
+    /// In command/argument mode a comma builds one array argument, so `RmStr $d,$y+12,512`
+    /// would pass a single array and `$y+12` would stay the string "0+12". The call
+    /// uses parenthesised arguments with spaces (TR-REL-14).
+    #[test]
+    fn get_open_handles_calls_rmstr_with_separate_arguments() {
+        let cmd = get_open_handles("C:\\App\\data.mdb").expect("valid");
+        assert!(
+            !cmd.contains("RmStr $d,"),
+            "a comma would pass one array argument: {cmd}"
+        );
+        assert!(cmd.contains("(RmStr $d ($y+12) 512)"), "{cmd}");
+        assert!(cmd.contains("(RmStr $d ($y+524) 128)"), "{cmd}");
+    }
+
+    /// TR-REL-14: a function the script declares must not collide with a Windows
+    /// PowerShell 5.1 default alias. An alias wins over a function, and the names
+    /// are case-insensitive, so an old `function R` would run the alias `r`
+    /// (`Invoke-History`) instead of the helper.
+    #[test]
+    fn get_open_handles_function_names_avoid_default_aliases() {
+        let cmd = get_open_handles("C:\\App\\data.mdb").expect("valid");
+        assert!(
+            !cmd.contains("function R("),
+            "the one-letter helper collides with the alias r: {cmd}"
+        );
+        assert!(
+            !cmd.contains("R Rm"),
+            "the helper calls must use the renamed name: {cmd}"
+        );
+        const ALIASES: [&str; 40] = [
+            "r", "h", "ls", "gc", "gi", "sl", "ft", "fl", "gl", "gm", "gp", "gu", "gv", "iex",
+            "ii", "ni", "ri", "rm", "si", "sc", "sp", "cd", "cls", "dir", "echo", "kill", "man",
+            "ps", "pwd", "sort", "type", "where", "foreach", "select", "measure", "group",
+            "compare", "diff", "tee", "sleep",
+        ];
+        let names = function_names(&cmd);
+        assert!(!names.is_empty(), "the script must declare helpers: {cmd}");
+        for name in &names {
+            assert!(
+                !ALIASES.contains(&name.to_lowercase().as_str()),
+                "the function {name} collides with a PowerShell 5.1 default alias"
+            );
+        }
+    }
+
+    /// Worst case for the WinRS command line: a path whose every character is a
+    /// single quote, so the escape doubles it. 260 such characters, the Windows
+    /// `MAX_PATH` length, still fit one command line (TR-REL-14).
+    #[test]
+    fn get_open_handles_command_fits_the_winrs_line_for_the_worst_case() {
+        let path = "'".repeat(260);
+        let cmd = get_open_handles(&path).expect("the worst case must fit one command line");
+        assert!(
+            fits_command_line(&cmd),
+            "chars: {}",
+            command_line_chars(&cmd)
+        );
+        assert!(
+            command_line_chars(&cmd) < WINRS_COMMAND_LINE_LIMIT,
+            "chars: {}",
+            command_line_chars(&cmd)
+        );
+    }
+
+    /// The cap keeps the JSON result inside the executor output limit even with
+    /// the longest plausible process names and a long path.
+    #[test]
+    fn get_open_handles_output_fits_the_executor_cap() {
+        let rows: Vec<Value> = (0..OPEN_HANDLES_ROW_LIMIT)
+            .map(|_| {
+                serde_json::json!({
+                    "pid": 9_999_999_i64,
+                    "name": "A".repeat(255),
+                    "service": "B".repeat(63),
+                    "started": "2099-12-31T23:59:59Z",
+                })
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "path": "C:\\".to_owned() + &"a".repeat(517),
+            "holders": rows,
+            "count": OPEN_HANDLES_ROW_LIMIT,
+            "files_checked": OPEN_HANDLES_FILE_LIMIT,
+            "skipped": 0,
+            "files_truncated": true,
+            "rows_truncated": false,
+        });
+        let text = serde_json::to_string(&payload).expect("serialize");
+        assert!(
+            text.len() <= crate::executor::MAX_OUTPUT_CHARS,
+            "the capped result is {} characters, over the {} limit",
+            text.len(),
+            crate::executor::MAX_OUTPUT_CHARS
+        );
+    }
+
     #[test]
     fn compare_files_does_not_interpolate_paths_in_double_quotes() {
         // Injection: a path in double quotes expands $(...) in PowerShell.
@@ -1768,6 +2224,61 @@ mod tests {
             cmd.contains("ConvertFrom-Csv -Header"),
             "explicit headers expected: {cmd}"
         );
+    }
+
+    /// The first `$name:` (a single, unbraced colon) inside a double-quoted string, if
+    /// any. PowerShell reads `$name:` as a scope qualifier and fails to parse; `${name}`
+    /// is the safe form. The scan ignores a `::` (a static call such as `$t::Method`).
+    fn unbraced_variable_colon(script: &str) -> Option<String> {
+        let chars: Vec<char> = script.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '"' {
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '`' {
+                        i += 2;
+                        continue;
+                    }
+                    if chars[i] == '$' && i + 1 < chars.len() {
+                        let mut j = i + 1;
+                        if chars[j].is_ascii_alphabetic() || chars[j] == '_' {
+                            j += 1;
+                            while j < chars.len()
+                                && (chars[j].is_ascii_alphanumeric() || chars[j] == '_')
+                            {
+                                j += 1;
+                            }
+                            if j < chars.len() && chars[j] == ':' && chars.get(j + 1) != Some(&':')
+                            {
+                                return Some(chars[i..=j].iter().collect());
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Collects the helpers the script declares, in order. A name ends at the
+    /// first character that is not part of a name.
+    fn function_names(script: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut rest = script;
+        while let Some(index) = rest.find("function ") {
+            rest = &rest[index + "function ".len()..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                .collect();
+            if !name.is_empty() {
+                names.push(name);
+            }
+        }
+        names
     }
 
     /// The temporary path the server builds for a target.
@@ -2030,6 +2541,7 @@ mod tests {
             test_network(text, 443),
             get_tcp_connections("established", 1, 0, text, false).expect("valid"),
             get_tcp_connections("listen", 0, 0, text, true).expect("valid"),
+            get_open_handles(text).expect("valid"),
             resolve_dns_name(text, "A", text).expect("valid"),
             get_perf_snapshot(2, text),
             get_scheduled_tasks(text, false),

@@ -761,6 +761,377 @@ async fn get_tcp_connections_refuses_an_unknown_state_before_the_network() {
     harness.client.cancel().await.ok();
 }
 
+/// AC-REL16-1: `search_file_content` with `from_end=true` records a command that
+/// takes the last matches and streams the file. The tool is read-only (TR-REL-16).
+#[tokio::test]
+async fn search_file_content_from_end_takes_the_last_matches() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let before = harness.elicitations();
+    let result = harness
+        .call(
+            CallToolRequestParams::new("search_file_content").with_arguments(args(
+                &serde_json::json!({
+                    "session_id": HOST,
+                    "path": "C:\\logs\\app.log",
+                    "pattern": "ERROR",
+                    "from_end": true
+                }),
+            )),
+        )
+        .await;
+    assert_eq!(
+        error_of(&result),
+        None,
+        "the search must not fail: {:?}",
+        result.structured_content
+    );
+    assert_eq!(
+        harness.elicitations(),
+        before,
+        "a read-only tool asked for confirmation"
+    );
+    assert!(
+        harness
+            .transport
+            .saw("Select-String -Pattern 'ERROR' -SimpleMatch"),
+        "the pattern never reached the host"
+    );
+    assert!(
+        harness.transport.saw("Select-Object -Last 50"),
+        "the command does not take the last matches"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// AC-REL16-1: `count_only=true` records a command that counts with
+/// `Measure-Object` and returns no matching lines.
+#[tokio::test]
+async fn search_file_content_count_only_counts_matches() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let result = harness
+        .call(
+            CallToolRequestParams::new("search_file_content").with_arguments(args(
+                &serde_json::json!({
+                    "session_id": HOST,
+                    "path": "C:\\logs\\app.log",
+                    "pattern": "ERROR",
+                    "count_only": true
+                }),
+            )),
+        )
+        .await;
+    assert_eq!(
+        error_of(&result),
+        None,
+        "the count must not fail: {:?}",
+        result.structured_content
+    );
+    assert!(
+        harness.transport.saw("Measure-Object).Count"),
+        "the command does not count the matches"
+    );
+    assert!(
+        !harness.transport.saw("Select-Object -First"),
+        "the count must not return matching lines"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// AC-REL16-2: `since`, `until` and `timestamp_format` record a command that
+/// filters the lines by the timestamp at the start of the line, with the
+/// invariant culture (TR-REL-16, Q-22).
+#[tokio::test]
+async fn search_file_content_time_filter_reaches_the_host() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let result = harness
+        .call(
+            CallToolRequestParams::new("search_file_content").with_arguments(args(
+                &serde_json::json!({
+                    "session_id": HOST,
+                    "path": "C:\\logs\\app.log",
+                    "pattern": "ERROR",
+                    "since": "2026-01-01 09:30:00",
+                    "until": "2026-01-01 11:00:00",
+                    "timestamp_format": "yyyy-MM-dd HH:mm:ss"
+                }),
+            )),
+        )
+        .await;
+    assert_eq!(
+        error_of(&result),
+        None,
+        "the time filter must not fail: {:?}",
+        result.structured_content
+    );
+    assert!(
+        harness
+            .transport
+            .saw("TryParseExact($ln.Substring(0,$len),$fmt,$inv"),
+        "the command does not parse the line timestamp"
+    );
+    assert!(
+        harness
+            .transport
+            .saw("[Globalization.CultureInfo]::InvariantCulture"),
+        "the command does not use the invariant culture"
+    );
+    assert!(
+        harness
+            .transport
+            .saw("ParseExact('2026-01-01T09:30:00.0000000','yyyy-MM-ddTHH:mm:ss.fffffff'"),
+        "the lower bound is not an invariant ISO value"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// TR-REL-16: with `from_end` the directory search orders the files by their last
+/// write time before `Select-String`, so the oldest file is not last.
+#[tokio::test]
+async fn search_file_content_from_end_sorts_the_directory() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let result = harness
+        .call(
+            CallToolRequestParams::new("search_file_content").with_arguments(args(
+                &serde_json::json!({
+                    "session_id": HOST,
+                    "path": "C:\\logs",
+                    "pattern": "ERROR",
+                    "from_end": true
+                }),
+            )),
+        )
+        .await;
+    assert_eq!(
+        error_of(&result),
+        None,
+        "the search must not fail: {:?}",
+        result.structured_content
+    );
+    assert!(
+        harness.transport.saw("Sort-Object LastWriteTime"),
+        "the directory search does not sort the files"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// TR-REL-16: a time bound with an empty pattern records a command that matches
+/// every line, without `-SimpleMatch` (AC-REL16-2).
+#[tokio::test]
+async fn search_file_content_time_only_uses_a_match_all_pattern() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let result = harness
+        .call(
+            CallToolRequestParams::new("search_file_content").with_arguments(args(
+                &serde_json::json!({
+                    "session_id": HOST,
+                    "path": "C:\\logs\\app.log",
+                    "pattern": "",
+                    "since": "2026-01-01 00:00:00"
+                }),
+            )),
+        )
+        .await;
+    assert_eq!(
+        error_of(&result),
+        None,
+        "the time-only filter must not fail: {:?}",
+        result.structured_content
+    );
+    assert!(
+        harness.transport.saw("Select-String -Pattern '.'"),
+        "the time-only filter does not match every line"
+    );
+    assert!(
+        !harness.transport.saw("-SimpleMatch"),
+        "the time-only filter must not use SimpleMatch"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// TR-REL-16: an empty pattern without a time bound is refused before any host
+/// call, because `Select-String -Pattern ''` rejects an empty string.
+#[tokio::test]
+async fn search_file_content_refuses_an_empty_pattern_before_the_host() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let result = harness
+        .call(
+            CallToolRequestParams::new("search_file_content").with_arguments(args(
+                &serde_json::json!({
+                    "session_id": HOST,
+                    "path": "C:\\logs\\app.log",
+                    "pattern": ""
+                }),
+            )),
+        )
+        .await;
+    let error = error_of(&result).expect("a refusal");
+    assert!(error.contains("pattern is empty"), "{error}");
+    assert!(
+        !harness.transport.saw("Select-String"),
+        "the refused search reached the host"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// TR-REL-16: `count_only` over a directory prints a summary line after the
+/// per-file counts.
+#[tokio::test]
+async fn search_file_content_count_only_prints_the_summary() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let result = harness
+        .call(
+            CallToolRequestParams::new("search_file_content").with_arguments(args(
+                &serde_json::json!({
+                    "session_id": HOST,
+                    "path": "C:\\logs",
+                    "pattern": "ERROR",
+                    "count_only": true
+                }),
+            )),
+        )
+        .await;
+    assert_eq!(
+        error_of(&result),
+        None,
+        "the count must not fail: {:?}",
+        result.structured_content
+    );
+    assert!(
+        harness.transport.saw("files scanned"),
+        "the count over a directory prints no summary line"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// TR-REL-16 backward compatibility: the default search keeps the first matches
+/// and adds no time filter.
+#[tokio::test]
+async fn search_file_content_default_stays_first_and_without_time() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let result = harness
+        .call(
+            CallToolRequestParams::new("search_file_content").with_arguments(args(
+                &serde_json::json!({
+                    "session_id": HOST,
+                    "path": "C:\\logs\\app.log",
+                    "pattern": "ERROR"
+                }),
+            )),
+        )
+        .await;
+    assert_eq!(
+        error_of(&result),
+        None,
+        "the default search must not fail: {:?}",
+        result.structured_content
+    );
+    assert!(
+        harness.transport.saw("Select-Object -First 50"),
+        "the default does not keep the first matches"
+    );
+    assert!(
+        !harness.transport.saw("TryParseExact"),
+        "the default call must not add a time filter"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// TR-REL-16: an invalid time bound is refused before any host call, with the
+/// accepted shape in the message.
+#[tokio::test]
+async fn search_file_content_refuses_an_invalid_time_bound_before_the_host() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let result = harness
+        .call(
+            CallToolRequestParams::new("search_file_content").with_arguments(args(
+                &serde_json::json!({
+                    "session_id": HOST,
+                    "path": "C:\\logs\\app.log",
+                    "pattern": "ERROR",
+                    "since": "yesterday"
+                }),
+            )),
+        )
+        .await;
+    let error = error_of(&result).expect("a refusal");
+    assert!(error.contains("Invalid timestamp"), "{error}");
+    assert!(
+        !harness.transport.saw("Select-String"),
+        "the refused search reached the host"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// TR-REL-16, Q-22: `read_file` in the tail mode with `exclude` records a command
+/// that drops the lines with the literal text. The tool is read-only.
+#[tokio::test]
+async fn read_file_tail_exclude_reaches_the_host() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let before = harness.elicitations();
+    let result = harness
+        .call(
+            CallToolRequestParams::new("read_file").with_arguments(args(&serde_json::json!({
+                "session_id": HOST,
+                "path": "C:\\logs\\app.log",
+                "tail": true,
+                "end_line": 100,
+                "exclude": "heartbeat"
+            }))),
+        )
+        .await;
+    assert_eq!(
+        error_of(&result),
+        None,
+        "the tail must not fail: {:?}",
+        result.structured_content
+    );
+    assert_eq!(
+        harness.elicitations(),
+        before,
+        "a read-only tool asked for confirmation"
+    );
+    assert!(
+        harness
+            .transport
+            .saw("IndexOf('heartbeat', [StringComparison]::OrdinalIgnoreCase) -lt 0"),
+        "the exclude filter never reached the host"
+    );
+    assert!(
+        harness.transport.saw("-Tail $W"),
+        "the tail does not grow a window from the end"
+    );
+    assert!(
+        !harness.transport.saw("Where-Object"),
+        "the exclude filter must not use Where-Object"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// TR-REL-16: `exclude` without `tail=true` is refused before any host call.
+#[tokio::test]
+async fn read_file_refuses_exclude_without_tail_before_the_host() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let result = harness
+        .call(
+            CallToolRequestParams::new("read_file").with_arguments(args(&serde_json::json!({
+                "session_id": HOST,
+                "path": "C:\\logs\\app.log",
+                "exclude": "heartbeat"
+            }))),
+        )
+        .await;
+    let error = error_of(&result).expect("a refusal");
+    assert!(
+        error.contains("exclude works only with tail=true"),
+        "{error}"
+    );
+    assert!(
+        !harness.transport.saw("Get-Content"),
+        "the refused read reached the host"
+    );
+    harness.client.cancel().await.ok();
+}
+
 /// AC-SEC05-1, AC-SEC05-2: without `WINRIG_ALLOWED_HOSTS` a remote host is refused
 /// before the network, and loopback passes (TR-SEC-14).
 #[tokio::test]

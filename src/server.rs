@@ -425,6 +425,11 @@ struct ReadFileParams {
     #[schemars(description = "File encoding. The default is UTF8.")]
     #[serde(default = "default_utf8")]
     encoding: String,
+    #[schemars(
+        description = "In the tail mode, drop the lines that contain this literal text. The match is case-insensitive and uses no wildcards."
+    )]
+    #[serde(default)]
+    exclude: String,
 }
 
 fn default_one() -> i64 {
@@ -465,6 +470,31 @@ struct SearchFileContentParams {
     )]
     #[serde(default)]
     modified_after_hours: i64,
+    #[schemars(
+        description = "Return the last matches instead of the first. The directory search orders the files by their last write time, oldest first. Use it to read the end of a large log."
+    )]
+    #[serde(default)]
+    from_end: bool,
+    #[schemars(
+        description = "Return only the number of matching lines for each file. It ignores max_results, context_lines and from_end."
+    )]
+    #[serde(default)]
+    count_only: bool,
+    #[schemars(
+        description = "Lower time bound of the line timestamp, in the host local time: YYYY-MM-DD HH:MM:SS. A line without a timestamp does not match."
+    )]
+    #[serde(default)]
+    since: String,
+    #[schemars(
+        description = "Upper time bound of the line timestamp, in the host local time: YYYY-MM-DD HH:MM:SS."
+    )]
+    #[serde(default)]
+    until: String,
+    #[schemars(
+        description = "The .NET custom format of the timestamp at the start of a line. The default is yyyy-MM-dd HH:mm:ss."
+    )]
+    #[serde(default)]
+    timestamp_format: String,
 }
 
 fn default_star() -> String {
@@ -984,7 +1014,7 @@ impl WinrigServer {
 
     #[tool(
         name = "read_file",
-        description = "Read the contents of a file as numbered lines, with a maximum of 500 lines for each call. The range mode reads start_line through end_line. The tail mode reads the last N lines."
+        description = "Read the contents of a file as numbered lines, with a maximum of 500 lines for each call. The range mode reads start_line through end_line. The tail mode reads the last N lines. In the tail mode, exclude drops the lines that contain a literal text."
     )]
     async fn read_file(
         &self,
@@ -998,6 +1028,7 @@ impl WinrigServer {
             params.end_line,
             params.tail,
             &params.encoding,
+            &params.exclude,
         ) {
             Ok(command) => command,
             Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
@@ -1009,7 +1040,7 @@ impl WinrigServer {
 
     #[tool(
         name = "search_file_content",
-        description = "Search for literal text inside files, in the manner of grep. Pass a file path to search one file. Pass a directory to search it recursively."
+        description = "Search for literal text inside files, in the manner of grep. Pass a file path to search one file. Pass a directory to search it recursively. The tool streams the file. Set from_end to return the last matches, and count_only to return the number of matches for each file. Set since, until and timestamp_format to filter the lines by the timestamp at the start. The from_end and time filters read each file to its end. Use since to narrow the range."
     )]
     async fn search_file_content(
         &self,
@@ -1017,18 +1048,30 @@ impl WinrigServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let identity = self.identity(&ctx)?;
+        let options = ps::SearchOptions {
+            from_end: params.from_end,
+            count_only: params.count_only,
+            since: &params.since,
+            until: &params.until,
+            timestamp_format: &params.timestamp_format,
+        };
+        let command = match ps::search_file_content(
+            &params.path,
+            &params.pattern,
+            &params.file_filter,
+            params.max_results,
+            params.context_lines,
+            params.modified_after_hours,
+            &options,
+        ) {
+            Ok(command) => command,
+            Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
+        };
         Ok(self
             .run(
                 &identity,
                 &params.session_id,
-                &ps::search_file_content(
-                    &params.path,
-                    &params.pattern,
-                    &params.file_filter,
-                    params.max_results,
-                    params.context_lines,
-                    params.modified_after_hours,
-                ),
+                &command,
                 "search_file_content",
             )
             .await)

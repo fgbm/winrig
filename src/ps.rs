@@ -362,15 +362,28 @@ pub fn find_files(path: &str, pattern: &str, max_depth: i64, include_size: bool)
     )
 }
 
+/// The largest tail window the `exclude` filter grows to, in lines (TR-REL-16).
+///
+/// The window starts at ten times the requested count and grows tenfold until it
+/// holds the count of lines without the literal, the file ends, or the window
+/// reaches this bound. The lines stream through `Get-Content -ReadCount`, so the
+/// host holds one batch and the queue of the requested count, not the window.
+const TAIL_EXCLUDE_MAX_WINDOW: usize = 200_000;
+
+/// The lines in one streamed batch of the `exclude` window.
+const TAIL_EXCLUDE_READ_COUNT: usize = 1000;
+
 /// # Errors
 ///
-/// Returns an error text for an unknown encoding or an invalid range.
+/// Returns an error text for an unknown encoding, an invalid range, an `exclude`
+/// without the tail mode, or a command that does not fit one WinRS command line.
 pub fn read_file(
     path: &str,
     start_line: i64,
     end_line: i64,
     tail: bool,
     encoding: &str,
+    exclude: &str,
 ) -> Result<String, String> {
     let enc_key = encoding.trim().to_lowercase();
     if !VALID_ENCODINGS.contains(&enc_key.as_str()) {
@@ -379,25 +392,57 @@ pub fn read_file(
             VALID_ENCODINGS.join(", ")
         ));
     }
+    if !tail && !exclude.trim().is_empty() {
+        return Err("exclude works only with tail=true".to_owned());
+    }
     let safe = escape(path);
-    if tail {
+    let command = if tail {
         let count = cap(end_line, 1, 500);
-        return Ok(format!(
-            "$lines = @(Get-Content -LiteralPath '{safe}' -Tail {count} -Encoding {enc_key} -ErrorAction Stop); \
-             $n = 1; $lines | ForEach-Object {{ '{{0,6}}|{{1}}' -f ($n++), $_ }}; \
-             Write-Output (\"--- tail: last $($lines.Count) lines ---\")"
+        if exclude.trim().is_empty() {
+            format!(
+                "$lines = @(Get-Content -LiteralPath '{safe}' -Tail {count} -Encoding {enc_key} -ErrorAction Stop); \
+                 $n = 1; $lines | ForEach-Object {{ '{{0,6}}|{{1}}' -f ($n++), $_ }}; \
+                 Write-Output (\"--- tail: last $($lines.Count) lines ---\")"
+            )
+        } else {
+            // The window grows from the end of the file until it holds `count`
+            // lines without the literal, so the host reads only as much as it
+            // needs and never the whole file. The lines stream in batches, and the
+            // queue keeps only the requested count. `IndexOf` is a literal
+            // substring test, not a wildcard pattern (TR-REL-16, Q-22).
+            let safe_exclude = escape(exclude);
+            format!(
+                "$want = {count}; $W = $want * 10; $max = {TAIL_EXCLUDE_MAX_WINDOW}; $lines = @(); $covered = $false; \
+                 while (-not $covered) {{ \
+                 $q = [System.Collections.Generic.Queue[string]]::new(); $read = 0; \
+                 Get-Content -LiteralPath '{safe}' -Tail $W -ReadCount {TAIL_EXCLUDE_READ_COUNT} -Encoding {enc_key} -ErrorAction Stop | ForEach-Object {{ \
+                 foreach ($line in $_) {{ $read++; if ($line.IndexOf('{safe_exclude}', [StringComparison]::OrdinalIgnoreCase) -lt 0) {{ $q.Enqueue($line); if ($q.Count -gt $want) {{ [void]$q.Dequeue() }} }} }} }}; \
+                 $lines = @($q.ToArray()); \
+                 if ($lines.Count -ge $want -or $read -lt $W -or $W -ge $max) {{ $covered = $true }} else {{ $W = $W * 10; if ($W -gt $max) {{ $W = $max }} }} \
+                 }}; \
+                 $n = 1; $lines | ForEach-Object {{ '{{0,6}}|{{1}}' -f ($n++), $_ }}; \
+                 Write-Output (\"--- tail: last $($lines.Count) lines (excluded lines are dropped) ---\")"
+            )
+        }
+    } else {
+        let start = start_line.max(1);
+        if end_line < start {
+            return Err("end_line must be >= start_line".to_owned());
+        }
+        let end = if end_line - start + 1 > 500 {
+            start + 499
+        } else {
+            end_line
+        };
+        read_file_range(&safe, start, end, &enc_key)
+    };
+    if !fits_command_line(&command) {
+        return Err(format!(
+            "the read command does not fit the WinRS command line of \
+             {WINRS_COMMAND_LINE_LIMIT} characters; shorten the path or the exclude pattern"
         ));
     }
-    let start = start_line.max(1);
-    if end_line < start {
-        return Err("end_line must be >= start_line".to_owned());
-    }
-    let end = if end_line - start + 1 > 500 {
-        start + 499
-    } else {
-        end_line
-    };
-    Ok(read_file_range(&safe, start, end, &enc_key))
+    Ok(command)
 }
 
 fn read_file_range(safe: &str, start: i64, end: i64, enc: &str) -> String {
@@ -410,7 +455,262 @@ fn read_file_range(safe: &str, start: i64, end: i64, enc: &str) -> String {
     )
 }
 
-#[must_use]
+/// When the caller gives no format, the search uses this one (TR-REL-16).
+pub const DEFAULT_TIMESTAMP_FORMAT: &str = "yyyy-MM-dd HH:mm:ss";
+
+// Fixed-width .NET custom date and time specifiers. A variable-width specifier
+// (`M`, `d`, `H`, `h`, `m`, `s`, `t` alone, `F`, `g`, `K`, `z`) is refused,
+// because the host takes a timestamp prefix of a fixed length (TR-REL-16).
+const TIMESTAMP_SPECIFIER_LETTERS: [char; 13] = [
+    'd', 'f', 'F', 'g', 'h', 'H', 'K', 'm', 'M', 's', 't', 'y', 'z',
+];
+
+// Time filter block of the search (TR-REL-16). The timestamp prefix is parsed
+// with the invariant culture, so the comparison does not depend on the host
+// locale. A line without a timestamp is outside the range and does not match.
+const TIMESTAMP_WHERE: &str = "| Where-Object { $ln=$_.Line; \
+    if($ln.Length -lt $len){ $false } else { $ts=[DateTime]::MinValue; \
+    [DateTime]::TryParseExact($ln.Substring(0,$len),$fmt,$inv,[Globalization.DateTimeStyles]::None,[ref]$ts) \
+    -and $ts -ge $since -and $ts -le $until } } ";
+
+// The line format of one match in a file, in a directory and with context lines.
+const SEARCH_LINE_FILE: &str = "| ForEach-Object { \"$($_.LineNumber)|$($_.Line)\" }";
+const SEARCH_LINE_DIR: &str = "| ForEach-Object { \"$($_.Path):$($_.LineNumber)|$($_.Line)\" }";
+const SEARCH_LINE_CTX: &str = "| Out-String -Width 300";
+
+/// Extra filters of the log search (TR-REL-16, Q-22).
+pub struct SearchOptions<'a> {
+    /// Return the last matches instead of the first. AC-REL16-1.
+    pub from_end: bool,
+    /// Return only the number of matches for each file. AC-REL16-1.
+    pub count_only: bool,
+    /// Lower time bound of the line timestamp, or empty for no lower bound.
+    pub since: &'a str,
+    /// Upper time bound of the line timestamp, or empty for no upper bound.
+    pub until: &'a str,
+    /// The .NET custom format of the timestamp at the start of a line (Q-22).
+    pub timestamp_format: &'a str,
+}
+
+/// True when a run of one specifier letter renders at a fixed width.
+fn timestamp_spec_is_fixed(letter: char, run: usize) -> bool {
+    match letter {
+        'y' => matches!(run, 2 | 4),
+        'M' | 'd' => matches!(run, 2 | 3),
+        'H' | 'h' | 'm' | 's' => run == 2,
+        'f' => (1..=7).contains(&run),
+        't' => run == 2,
+        _ => false,
+    }
+}
+
+/// # Errors
+///
+/// Refuses an empty format, a single-character standard format, a quoted or
+/// escaped literal, a non-ASCII character, and a specifier that is not a fixed
+/// width (TR-REL-16).
+fn validate_timestamp_format(format: &str) -> Result<(), String> {
+    if format.is_empty() {
+        return Err("timestamp_format is empty".to_owned());
+    }
+    if format.chars().count() == 1 {
+        return Err(format!(
+            "timestamp_format '{format}' is a .NET standard format; use a custom format such as yyyy-MM-dd HH:mm:ss"
+        ));
+    }
+    let chars: Vec<char> = format.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if ['\'', '"', '\\', '%'].contains(&c) {
+            return Err(format!(
+                "timestamp_format holds '{c}'; quoted, escaped and single-specifier forms are not allowed"
+            ));
+        }
+        if !c.is_ascii() {
+            return Err(format!(
+                "timestamp_format holds the non-ASCII character '{c}'; use ASCII digits and separators"
+            ));
+        }
+        if c.is_ascii_alphabetic() {
+            let mut j = i;
+            while j < chars.len() && chars[j] == c {
+                j += 1;
+            }
+            let run = j - i;
+            if TIMESTAMP_SPECIFIER_LETTERS.contains(&c) && !timestamp_spec_is_fixed(c, run) {
+                return Err(format!(
+                    "timestamp_format specifier '{c}' repeated {run} time(s) is not a fixed-width date field; \
+                     use yyyy, yy, MM, MMM, dd, ddd, HH, hh, mm, ss, f..fffffff or tt"
+                ));
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+/// A Gregorian calendar adds a day to February when the divisibility rule holds.
+///
+/// The rule is a multiple of 4, but not of 100 unless it is also a multiple of 400.
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// The length of a calendar period, or 0 when the value is outside 1 to 12.
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// A bound as `YYYY-MM-DDTHH:MM:SS.fffffff` in the host local time (TR-REL-16).
+///
+/// The fractional part is kept at full .NET precision (seven digits) and the
+/// comparison on the host runs at that precision. A date without a time is the
+/// start of the day for `since` and the end of the day for `until`.
+///
+/// # Errors
+///
+/// Refuses a value that is not a real `YYYY-MM-DD [HH:MM[:SS[.fffffff]]]` date in
+/// the host local time.
+fn parse_time_bound(value: &str, is_until: bool) -> Result<String, String> {
+    let text = value.trim();
+    let (date, time) = match text.split_once(['T', ' ']) {
+        Some((date, time)) => (date, time.trim()),
+        None => (text, ""),
+    };
+    let invalid = || {
+        format!(
+            "Invalid timestamp '{value}'. Use YYYY-MM-DD [HH:MM[:SS[.fffffff]]] in the host local time, without a zone"
+        )
+    };
+    let date_parts: Vec<&str> = date.split('-').collect();
+    if date_parts.len() != 3 {
+        return Err(invalid());
+    }
+    let year = fixed_digits(date_parts[0], 4).ok_or_else(&invalid)?;
+    let month = fixed_digits(date_parts[1], 2).ok_or_else(&invalid)?;
+    let day = fixed_digits(date_parts[2], 2).ok_or_else(&invalid)?;
+    if !(1..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || day < 1
+        || day > days_in_month(year, month)
+    {
+        return Err(invalid());
+    }
+    if time.is_empty() {
+        return Ok(if is_until {
+            format!("{year:04}-{month:02}-{day:02}T23:59:59.9999999")
+        } else {
+            format!("{year:04}-{month:02}-{day:02}T00:00:00.0000000")
+        });
+    }
+    let (clock, fraction) = match time.split_once('.') {
+        Some((clock, fraction)) => (clock, Some(fraction)),
+        None => (time, None),
+    };
+    let time_parts: Vec<&str> = clock.split(':').collect();
+    if time_parts.len() < 2 || time_parts.len() > 3 {
+        return Err(invalid());
+    }
+    let hour = fixed_digits(time_parts[0], 2).ok_or_else(&invalid)?;
+    let minute = fixed_digits(time_parts[1], 2).ok_or_else(&invalid)?;
+    let second = if time_parts.len() == 3 {
+        fixed_digits(time_parts[2], 2).ok_or_else(&invalid)?
+    } else {
+        0
+    };
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0..=59).contains(&second) {
+        return Err(invalid());
+    }
+    let fraction = match fraction {
+        None => "0000000".to_owned(),
+        Some(digits) => {
+            if digits.is_empty() || digits.len() > 7 || !digits.bytes().all(|b| b.is_ascii_digit())
+            {
+                return Err(invalid());
+            }
+            format!("{digits:0<7}")
+        }
+    };
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{fraction}"
+    ))
+}
+
+/// The numeric value of `text` when it is exactly `len` ASCII digits.
+fn fixed_digits(text: &str, len: usize) -> Option<i64> {
+    if text.len() == len && text.bytes().all(|b| b.is_ascii_digit()) {
+        text.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// The prelude and the `Where-Object` block of the line time filter (TR-REL-16).
+fn build_time_filter(
+    since: &str,
+    until: &str,
+    format: &str,
+) -> Result<(String, &'static str), String> {
+    let format = if format.trim().is_empty() {
+        DEFAULT_TIMESTAMP_FORMAT
+    } else {
+        format
+    };
+    validate_timestamp_format(format)?;
+    let since_iso = if since.trim().is_empty() {
+        None
+    } else {
+        Some(parse_time_bound(since, false)?)
+    };
+    let until_iso = if until.trim().is_empty() {
+        None
+    } else {
+        Some(parse_time_bound(until, true)?)
+    };
+    if let (Some(since_iso), Some(until_iso)) = (&since_iso, &until_iso) {
+        // Both values are fixed-width ISO, so a string compare is a time compare.
+        if since_iso > until_iso {
+            return Err(format!("since '{since}' is after until '{until}'"));
+        }
+    }
+    let bound = |iso: &Option<String>, empty: &str| match iso {
+        Some(iso) => format!(
+            "[DateTime]::ParseExact('{iso}','yyyy-MM-ddTHH:mm:ss.fffffff',$inv,[Globalization.DateTimeStyles]::None)"
+        ),
+        None => empty.to_owned(),
+    };
+    let since_expr = bound(&since_iso, "[DateTime]::MinValue");
+    let until_expr = bound(&until_iso, "[DateTime]::MaxValue");
+    let prelude = format!(
+        "$inv=[Globalization.CultureInfo]::InvariantCulture; $fmt='{}'; \
+         $len=(Get-Date).ToString($fmt,$inv).Length; $since={since_expr}; $until={until_expr}; ",
+        escape(format)
+    );
+    Ok((prelude, TIMESTAMP_WHERE))
+}
+
+/// Searches the literal text in one file or in a directory (TR-REL-06, TR-REL-16).
+///
+/// The search streams the file: `Select-String` reads line by line and
+/// `Select-Object -First` or `-Last` keeps a bounded number of matches, so the
+/// host does not hold the whole file. The `from_end`, `count_only`, `since`,
+/// `until` and `timestamp_format` options come from [`SearchOptions`]; a line
+/// without a timestamp does not match an active time filter (AC-REL16-1,
+/// AC-REL16-2, Q-22).
+///
+/// # Errors
+///
+/// Refuses an invalid timestamp, an invalid timestamp format, or a command that
+/// does not fit one WinRS command line. Each refusal names the input.
 pub fn search_file_content(
     path: &str,
     pattern: &str,
@@ -418,7 +718,8 @@ pub fn search_file_content(
     max_results: i64,
     context_lines: i64,
     modified_after_hours: i64,
-) -> String {
+    options: &SearchOptions<'_>,
+) -> Result<String, String> {
     let safe_path = escape(path);
     let safe_pattern = escape(pattern);
     let safe_filter = escape(file_filter);
@@ -429,33 +730,93 @@ pub fn search_file_content(
     } else {
         String::new()
     };
-    let time_filter = if modified_after_hours > 0 {
+    let mtime_filter = if modified_after_hours > 0 {
         format!(
             "| Where-Object {{ $_.LastWriteTime -gt (Get-Date).AddHours(-{modified_after_hours}) }} "
         )
     } else {
         String::new()
     };
-    let (fmt_file, fmt_single) = if ctx > 0 {
-        ("| Out-String -Width 300", "| Out-String -Width 300")
+    let time_active = !options.since.trim().is_empty() || !options.until.trim().is_empty();
+    let (prelude, ts_where) = if time_active {
+        build_time_filter(options.since, options.until, options.timestamp_format)?
     } else {
-        (
-            "| ForEach-Object { \"$($_.Path):$($_.LineNumber)|$($_.Line)\" }",
-            "| ForEach-Object { \"$($_.LineNumber)|$($_.Line)\" }",
+        (String::new(), "")
+    };
+    // A time-only filter needs a pattern that matches every line; the time filter
+    // then drops the lines without a timestamp. Without a time filter an empty
+    // pattern cannot work: `Select-String -Pattern ''` rejects an empty string
+    // (TR-REL-16).
+    let empty_pattern = pattern.is_empty();
+    if empty_pattern && !time_active {
+        return Err(
+            "pattern is empty; give a literal text to find, or set since or until for a \
+             time-only search"
+                .to_owned(),
+        );
+    }
+    let pattern_clause = if empty_pattern {
+        "-Pattern '.'".to_owned()
+    } else {
+        format!("-Pattern '{safe_pattern}' -SimpleMatch")
+    };
+    // The file order matters for `from_end` and for the time filter: the matches
+    // must run oldest first, so `app.log.2` (the oldest) is not the last file.
+    let sort_files = if options.from_end || time_active {
+        "| Sort-Object LastWriteTime "
+    } else {
+        ""
+    };
+    let command = if options.count_only {
+        format!(
+            "{prelude}\
+             $t = Get-Item -LiteralPath '{safe_path}' -ErrorAction Stop; \
+             if ($t.PSIsContainer) {{ \
+             $scanned = 0; $matched = 0; \
+             foreach ($file in @(Get-ChildItem -LiteralPath '{safe_path}' -Recurse -File -Filter '{safe_filter}' \
+             -ErrorAction SilentlyContinue {mtime_filter})) {{ $scanned++; \
+             $c = (Select-String -LiteralPath $file.FullName {pattern_clause} \
+             -ErrorAction SilentlyContinue {ts_where}| Measure-Object).Count; \
+             if ($c -gt 0) {{ $matched++; Write-Output ($file.FullName + ': ' + $c + ' matches') }} }}; \
+             Write-Output (\"$scanned files scanned, $matched with matches\") \
+             }} else {{ \
+             $c = (Select-String -LiteralPath '{safe_path}' {pattern_clause} \
+             -ErrorAction Stop {ts_where}| Measure-Object).Count; \
+             Write-Output ('{safe_path}' + ': ' + $c + ' matches') \
+             }}"
+        )
+    } else {
+        let selection = if options.from_end {
+            format!("| Select-Object -Last {result_cap} ")
+        } else {
+            format!("| Select-Object -First {result_cap} ")
+        };
+        let (dir_format, file_format) = if ctx > 0 {
+            (SEARCH_LINE_CTX, SEARCH_LINE_CTX)
+        } else {
+            (SEARCH_LINE_DIR, SEARCH_LINE_FILE)
+        };
+        format!(
+            "{prelude}\
+             $t = Get-Item -LiteralPath '{safe_path}' -ErrorAction Stop; \
+             if ($t.PSIsContainer) {{ \
+             Get-ChildItem -LiteralPath '{safe_path}' -Recurse -File -Filter '{safe_filter}' \
+             -ErrorAction SilentlyContinue {mtime_filter}{sort_files}\
+             | Select-String {pattern_clause}{ctx_arg} -ErrorAction SilentlyContinue {ts_where}\
+             {selection}{dir_format} \
+             }} else {{ \
+             Select-String -LiteralPath '{safe_path}' {pattern_clause}{ctx_arg} -ErrorAction Stop {ts_where}\
+             {selection}{file_format} \
+             }}"
         )
     };
-    format!(
-        "$t = Get-Item -LiteralPath '{safe_path}' -ErrorAction Stop; \
-         if ($t.PSIsContainer) {{ \
-         Get-ChildItem -LiteralPath '{safe_path}' -Recurse -File -Filter '{safe_filter}' \
-         -ErrorAction SilentlyContinue {time_filter}\
-         | Select-String -Pattern '{safe_pattern}' -SimpleMatch{ctx_arg} -ErrorAction SilentlyContinue \
-         | Select-Object -First {result_cap} {fmt_file} \
-         }} else {{ \
-         Select-String -LiteralPath '{safe_path}' -Pattern '{safe_pattern}' -SimpleMatch{ctx_arg} -ErrorAction Stop \
-         | Select-Object -First {result_cap} {fmt_single} \
-         }}"
-    )
+    if !fits_command_line(&command) {
+        return Err(format!(
+            "the search inputs are too long; the command does not fit the WinRS command line of \
+             {WINRS_COMMAND_LINE_LIMIT} characters; shorten the path, the pattern or the directory filter"
+        ));
+    }
+    Ok(command)
 }
 
 #[must_use]
@@ -1395,20 +1756,551 @@ mod tests {
 
     #[test]
     fn read_file_rejects_unknown_encoding() {
-        let error = read_file("C:\\a.txt", 1, 10, false, "koi8").expect_err("bad encoding");
+        let error = read_file("C:\\a.txt", 1, 10, false, "koi8", "").expect_err("bad encoding");
         assert!(error.contains("utf8"));
     }
 
     #[test]
     fn read_file_rejects_reversed_range() {
-        let error = read_file("C:\\a.txt", 10, 5, false, "UTF8").expect_err("reversed");
+        let error = read_file("C:\\a.txt", 10, 5, false, "UTF8", "").expect_err("reversed");
         assert!(error.contains("end_line"));
     }
 
     #[test]
     fn read_file_tail_uses_tail_switch() {
-        let cmd = read_file("C:\\a.log", 1, 50, true, "UTF8").expect("valid");
+        let cmd = read_file("C:\\a.log", 1, 50, true, "UTF8", "").expect("valid");
         assert!(cmd.contains("-Tail 50"));
+    }
+
+    /// TR-REL-16 backward compatibility: an empty `exclude` keeps the plain tail,
+    /// and only a non-empty `exclude` adds the literal filter (Q-22).
+    #[test]
+    fn read_file_tail_without_exclude_keeps_the_plain_tail() {
+        let cmd = read_file("C:\\a.log", 1, 50, true, "UTF8", "").expect("valid");
+        assert!(cmd.contains("-Tail 50"), "{cmd}");
+        assert!(!cmd.contains("IndexOf"), "{cmd}");
+        assert!(!cmd.contains("Select-Object -Last"), "{cmd}");
+    }
+
+    /// TR-REL-16, Q-22: `exclude` is a literal substring (case-insensitive, no
+    /// wildcards), escaped for a single-quoted string. The window grows from the
+    /// end of the file, streams in batches and keeps only the requested count.
+    #[test]
+    fn read_file_tail_exclude_grows_a_window_from_the_end() {
+        let cmd = read_file("C:\\a.log", 1, 50, true, "UTF8", "'quiet'").expect("valid");
+        assert!(
+            cmd.contains("IndexOf('''quiet''', [StringComparison]::OrdinalIgnoreCase) -lt 0"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("-Tail $W"), "the window must use -Tail: {cmd}");
+        assert!(
+            cmd.contains("-ReadCount"),
+            "the window must stream in batches: {cmd}"
+        );
+        assert!(
+            cmd.contains("[System.Collections.Generic.Queue[string]]"),
+            "the window must keep a bounded queue: {cmd}"
+        );
+        assert!(
+            !cmd.contains("@(Get-Content -Tail"),
+            "the window must not materialize the whole window: {cmd}"
+        );
+        assert!(
+            cmd.contains("while (-not $covered)"),
+            "the window must grow in a loop: {cmd}"
+        );
+        assert!(cmd.contains("* 10"), "the window must grow tenfold: {cmd}");
+        assert!(
+            cmd.contains(&TAIL_EXCLUDE_MAX_WINDOW.to_string()),
+            "the window must stop at the bound: {cmd}"
+        );
+        assert!(
+            !cmd.contains("Where-Object"),
+            "the literal filter must not use Where-Object: {cmd}"
+        );
+        assert!(
+            cmd.contains("$want") && !cmd.contains("$N"),
+            "the count variable must not collide with the line counter: {cmd}"
+        );
+    }
+
+    /// TR-REL-16: `exclude` without the tail mode is refused before any host call.
+    #[test]
+    fn read_file_refuses_exclude_without_tail() {
+        let error = read_file("C:\\a.log", 1, 50, false, "UTF8", "quiet").expect_err("no tail");
+        assert!(
+            error.contains("exclude works only with tail=true"),
+            "{error}"
+        );
+    }
+
+    fn default_options() -> SearchOptions<'static> {
+        SearchOptions {
+            from_end: false,
+            count_only: false,
+            since: "",
+            until: "",
+            timestamp_format: "",
+        }
+    }
+
+    /// TR-REL-16 backward compatibility: the default search keeps the first
+    /// matches and adds no time filter.
+    #[test]
+    fn search_file_content_default_uses_first_and_no_time_filter() {
+        let cmd = search_file_content(
+            "C:\\app.log",
+            "ERROR",
+            "*.log",
+            50,
+            0,
+            0,
+            &default_options(),
+        )
+        .expect("valid");
+        assert!(cmd.contains("Select-Object -First 50"), "{cmd}");
+        assert!(!cmd.contains("Select-Object -Last"), "{cmd}");
+        assert!(!cmd.contains("TryParseExact"), "{cmd}");
+        assert!(!cmd.contains("Measure-Object"), "{cmd}");
+    }
+
+    /// AC-REL16-1: `from_end` takes the last matches. The file streams through
+    /// `Select-String` and `Select-Object -Last`, so the host keeps a bounded set.
+    #[test]
+    fn search_file_content_from_end_takes_the_last_matches() {
+        let options = SearchOptions {
+            from_end: true,
+            ..default_options()
+        };
+        let cmd = search_file_content("C:\\app.log", "ERROR", "*.log", 50, 0, 0, &options)
+            .expect("valid");
+        assert!(
+            cmd.contains("Select-String -Pattern 'ERROR' -SimpleMatch"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("Select-Object -Last 50"), "{cmd}");
+        assert!(!cmd.contains("Select-Object -First"), "{cmd}");
+        assert!(!cmd.contains("-Raw"), "{cmd}");
+    }
+
+    /// AC-REL16-1: `count_only` returns the number of matches for each file. It
+    /// counts through `Measure-Object`, which streams and does not build an array.
+    #[test]
+    fn search_file_content_count_only_counts_each_file() {
+        let options = SearchOptions {
+            count_only: true,
+            ..default_options()
+        };
+        let cmd = search_file_content("C:\\app.log", "ERROR", "*.log", 50, 0, 0, &options)
+            .expect("valid");
+        assert!(cmd.contains("Measure-Object).Count"), "{cmd}");
+        assert!(cmd.contains("matches"), "{cmd}");
+        assert!(!cmd.contains("Select-Object -First"), "{cmd}");
+        assert!(!cmd.contains("Select-Object -Last"), "{cmd}");
+    }
+
+    /// AC-REL16-2: `since`, `until` and `timestamp_format` filter the lines by the
+    /// timestamp at the start of the line, with the invariant culture (Q-22). A
+    /// line without a timestamp is outside the range.
+    #[test]
+    fn search_file_content_time_filter_parses_the_line_prefix() {
+        let options = SearchOptions {
+            from_end: false,
+            count_only: false,
+            since: "2026-01-01 09:30:00",
+            until: "2026-01-01 11:00:00",
+            timestamp_format: "yyyy-MM-dd HH:mm:ss",
+        };
+        let cmd = search_file_content("C:\\app.log", "ERROR", "*.log", 50, 0, 0, &options)
+            .expect("valid");
+        assert!(cmd.contains("$fmt='yyyy-MM-dd HH:mm:ss'"), "{cmd}");
+        assert!(
+            cmd.contains("$len=(Get-Date).ToString($fmt,$inv).Length"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains("[Globalization.CultureInfo]::InvariantCulture"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains("ParseExact('2026-01-01T09:30:00.0000000','yyyy-MM-ddTHH:mm:ss.fffffff'"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains("ParseExact('2026-01-01T11:00:00.0000000','yyyy-MM-ddTHH:mm:ss.fffffff'"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains("TryParseExact($ln.Substring(0,$len),$fmt,$inv"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("if($ln.Length -lt $len){ $false }"), "{cmd}");
+        assert!(
+            cmd.contains("-and $ts -ge $since -and $ts -le $until"),
+            "{cmd}"
+        );
+    }
+
+    /// Q-22: a bound without a format uses the default line format, and a missing
+    /// bound becomes the smallest or the largest date.
+    #[test]
+    fn search_file_content_time_filter_defaults_the_format_and_the_missing_bound() {
+        let options = SearchOptions {
+            since: "2026-01-01 09:30:00",
+            ..default_options()
+        };
+        let cmd = search_file_content("C:\\app.log", "ERROR", "*.log", 50, 0, 0, &options)
+            .expect("valid");
+        assert!(cmd.contains("$fmt='yyyy-MM-dd HH:mm:ss'"), "{cmd}");
+        assert!(cmd.contains("$since=[DateTime]::ParseExact"), "{cmd}");
+        assert!(cmd.contains("$until=[DateTime]::MaxValue"), "{cmd}");
+    }
+
+    /// TR-REL-16 backward compatibility: without a bound the format is not used
+    /// and not validated, so the default call is unchanged.
+    #[test]
+    fn search_file_content_ignores_the_format_without_a_bound() {
+        let options = SearchOptions {
+            timestamp_format: "not a format",
+            ..default_options()
+        };
+        assert!(
+            search_file_content("C:\\app.log", "ERROR", "*.log", 50, 0, 0, &options).is_ok(),
+            "the format must be ignored without a bound"
+        );
+    }
+
+    /// TR-REL-16: an invalid bound is refused before any host call, with the
+    /// accepted shape in the message.
+    #[test]
+    fn search_file_content_rejects_an_invalid_time_bound() {
+        let options = SearchOptions {
+            since: "yesterday",
+            ..default_options()
+        };
+        let error = search_file_content("C:\\app.log", "ERROR", "*.log", 50, 0, 0, &options)
+            .expect_err("bad timestamp");
+        assert!(error.contains("Invalid timestamp"), "{error}");
+        assert!(error.contains("YYYY-MM-DD"), "{error}");
+    }
+
+    /// TR-REL-16: a bound outside the calendar is refused, not left to the host.
+    #[test]
+    fn search_file_content_rejects_an_out_of_range_bound() {
+        let options = SearchOptions {
+            since: "2026-13-01 00:00:00",
+            ..default_options()
+        };
+        let error = search_file_content("C:\\app.log", "ERROR", "*.log", 50, 0, 0, &options)
+            .expect_err("bad month");
+        assert!(error.contains("Invalid timestamp"), "{error}");
+    }
+
+    /// TR-REL-16: a variable-width specifier is refused, because the host takes a
+    /// timestamp prefix of a fixed length.
+    #[test]
+    fn search_file_content_rejects_a_variable_width_format() {
+        let options = SearchOptions {
+            since: "2026-01-01 00:00:00",
+            timestamp_format: "M/d/yyyy H:mm:ss",
+            ..default_options()
+        };
+        let error = search_file_content("C:\\app.log", "ERROR", "*.log", 50, 0, 0, &options)
+            .expect_err("variable width");
+        assert!(error.contains("not a fixed-width date field"), "{error}");
+    }
+
+    /// TR-REL-16: with `from_end` or a time filter the directory search orders the
+    /// files by their last write time, so `app.log.2` (the oldest) is not last.
+    #[test]
+    fn search_file_content_sorts_the_directory_files_for_from_end() {
+        let options = SearchOptions {
+            from_end: true,
+            ..default_options()
+        };
+        let cmd =
+            search_file_content("C:\\logs", "ERROR", "*.log", 50, 0, 0, &options).expect("valid");
+        let sort_at = cmd.find("Sort-Object LastWriteTime").expect("sort");
+        let search_at = cmd.find("Select-String").expect("search");
+        assert!(
+            sort_at < search_at,
+            "the sort must run before Select-String: {cmd}"
+        );
+    }
+
+    /// TR-REL-16 backward compatibility: the default search keeps the directory
+    /// enumeration order.
+    #[test]
+    fn search_file_content_default_keeps_the_file_order() {
+        let cmd = search_file_content("C:\\logs", "ERROR", "*.log", 50, 0, 0, &default_options())
+            .expect("valid");
+        assert!(!cmd.contains("Sort-Object"), "{cmd}");
+    }
+
+    /// TR-REL-16: a time bound with an empty pattern matches every line. Without a
+    /// time bound an empty pattern is refused, because `Select-String -Pattern ''`
+    /// rejects an empty string on the host.
+    #[test]
+    fn search_file_content_time_only_matches_every_line() {
+        let options = SearchOptions {
+            since: "2026-01-01 00:00:00",
+            ..default_options()
+        };
+        let cmd =
+            search_file_content("C:\\app.log", "", "*.log", 50, 0, 0, &options).expect("valid");
+        assert!(cmd.contains("Select-String -Pattern '.'"), "{cmd}");
+        assert!(
+            !cmd.contains("-SimpleMatch"),
+            "the time-only filter must not use SimpleMatch: {cmd}"
+        );
+
+        let error = search_file_content("C:\\app.log", "", "*.log", 50, 0, 0, &default_options())
+            .expect_err("an empty pattern without a time bound");
+        assert!(error.contains("pattern is empty"), "{error}");
+    }
+
+    /// TR-REL-16: a date that does not exist is refused, not left to the host.
+    #[test]
+    fn search_file_content_rejects_an_impossible_date() {
+        let options = SearchOptions {
+            since: "2026-02-31",
+            ..default_options()
+        };
+        let error = search_file_content("C:\\app.log", "ERROR", "*.log", 50, 0, 0, &options)
+            .expect_err("31 February");
+        assert!(error.contains("Invalid timestamp"), "{error}");
+    }
+
+    /// TR-REL-16: `since` after `until` is refused before any host call.
+    #[test]
+    fn search_file_content_rejects_since_after_until() {
+        let options = SearchOptions {
+            since: "2026-01-02 00:00:00",
+            until: "2026-01-01 00:00:00",
+            ..default_options()
+        };
+        let error = search_file_content("C:\\app.log", "ERROR", "*.log", 50, 0, 0, &options)
+            .expect_err("reversed range");
+        assert!(error.contains("is after until"), "{error}");
+    }
+
+    /// TR-REL-16: a date-only `until` is the end of that day; a date-only `since`
+    /// is the start of the day. Fractional seconds are kept at full precision.
+    #[test]
+    fn search_file_content_normalizes_date_only_and_fraction_bounds() {
+        let options = SearchOptions {
+            since: "2026-01-01",
+            until: "2026-01-01",
+            ..default_options()
+        };
+        let cmd = search_file_content("C:\\app.log", "ERROR", "*.log", 50, 0, 0, &options)
+            .expect("valid");
+        assert!(
+            cmd.contains("ParseExact('2026-01-01T00:00:00.0000000'"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains("ParseExact('2026-01-01T23:59:59.9999999'"),
+            "{cmd}"
+        );
+
+        let fraction = SearchOptions {
+            since: "2026-01-01 09:30:00.5",
+            ..default_options()
+        };
+        let cmd = search_file_content("C:\\app.log", "ERROR", "*.log", 50, 0, 0, &fraction)
+            .expect("valid");
+        assert!(
+            cmd.contains("ParseExact('2026-01-01T09:30:00.5000000'"),
+            "{cmd}"
+        );
+    }
+
+    /// TR-REL-16: `MMM` and `ddd` are fixed three-character fields in the
+    /// invariant culture; `MMMM` and `dddd` are variable and refused.
+    #[test]
+    fn search_file_content_accepts_month_and_day_names() {
+        for format in ["dd MMM yyyy HH:mm:ss", "ddd yyyy-MM-dd HH:mm:ss"] {
+            let options = SearchOptions {
+                since: "2026-01-01 00:00:00",
+                timestamp_format: format,
+                ..default_options()
+            };
+            assert!(
+                search_file_content("C:\\app.log", "ERROR", "*.log", 50, 0, 0, &options).is_ok(),
+                "{format} must be accepted"
+            );
+        }
+        for format in ["MMMM yyyy", "dddd yyyy"] {
+            let options = SearchOptions {
+                since: "2026-01-01 00:00:00",
+                timestamp_format: format,
+                ..default_options()
+            };
+            let error = search_file_content("C:\\app.log", "ERROR", "*.log", 50, 0, 0, &options)
+                .expect_err("variable width");
+            assert!(
+                error.contains("not a fixed-width date field"),
+                "{format}: {error}"
+            );
+        }
+    }
+
+    /// TR-REL-16: a one-character format is a .NET standard format, not a custom
+    /// one, and is refused.
+    #[test]
+    fn search_file_content_rejects_a_standard_format() {
+        for format in ["f", "D"] {
+            let options = SearchOptions {
+                since: "2026-01-01 00:00:00",
+                timestamp_format: format,
+                ..default_options()
+            };
+            let error = search_file_content("C:\\app.log", "ERROR", "*.log", 50, 0, 0, &options)
+                .expect_err("standard format");
+            assert!(error.contains("standard format"), "{format}: {error}");
+        }
+    }
+
+    /// TR-REL-16: `count_only` over a directory prints a summary line after the
+    /// per-file counts.
+    #[test]
+    fn search_file_content_count_only_prints_a_directory_summary() {
+        let options = SearchOptions {
+            count_only: true,
+            ..default_options()
+        };
+        let cmd =
+            search_file_content("C:\\logs", "ERROR", "*.log", 50, 0, 0, &options).expect("valid");
+        assert!(
+            cmd.contains("\"$scanned files scanned, $matched with matches\""),
+            "{cmd}"
+        );
+        assert!(
+            !cmd.contains("($scanned + "),
+            "the summary must not add an integer and a string: {cmd}"
+        );
+    }
+
+    /// A PowerShell command fails when a number sits on the left of a string
+    /// addition: the right operand converts to `Int32` (TR-REL-16).
+    #[test]
+    fn no_generator_adds_a_number_to_a_string() {
+        for command in every_generator_command("x") {
+            for left in [
+                "$scanned + ",
+                "$matched + ",
+                "$read + ",
+                "$kept + ",
+                "$diff + ",
+            ] {
+                assert!(
+                    !command.contains(left),
+                    "an integer sits on the left of a string addition: {command}"
+                );
+            }
+        }
+    }
+
+    /// Worst case for the WinRS command line: a pattern whose every character is a
+    /// single quote, so the escape doubles it and the pattern appears in both
+    /// branches. A large pattern still fits one command line (TR-REL-16).
+    #[test]
+    fn search_file_content_fits_the_winrs_line_for_the_worst_case() {
+        let pattern = "'".repeat(300);
+        let cmd = search_file_content(
+            "C:\\app.log",
+            &pattern,
+            "*.log",
+            100,
+            0,
+            0,
+            &default_options(),
+        )
+        .expect("the worst case must fit one command line");
+        assert!(
+            fits_command_line(&cmd),
+            "chars: {}",
+            command_line_chars(&cmd)
+        );
+        assert!(command_line_chars(&cmd) < WINRS_COMMAND_LINE_LIMIT);
+    }
+
+    /// TR-REL-16: an input too long for one command line is refused before any
+    /// host call, and the refusal names the limit.
+    #[test]
+    fn search_file_content_refuses_inputs_above_the_command_line() {
+        let pattern = "'".repeat(5000);
+        let error = search_file_content(
+            "C:\\app.log",
+            &pattern,
+            "*.log",
+            100,
+            0,
+            0,
+            &default_options(),
+        )
+        .expect_err("too long");
+        assert!(
+            error.contains(&WINRS_COMMAND_LINE_LIMIT.to_string()),
+            "{error}"
+        );
+    }
+
+    /// TR-REL-06: the row cap keeps one answer readable even for a large request.
+    #[test]
+    fn search_and_read_cap_the_rows() {
+        let cmd = search_file_content(
+            "C:\\app.log",
+            "ERROR",
+            "*.log",
+            9999,
+            0,
+            0,
+            &default_options(),
+        )
+        .expect("valid");
+        assert!(cmd.contains("Select-Object -First 100"), "{cmd}");
+        let tail = read_file("C:\\a.log", 1, 9999, true, "UTF8", "").expect("valid");
+        assert!(tail.contains("-Tail 500"), "{tail}");
+    }
+
+    /// TR-REL-16: a path too long for one command line is refused before any host
+    /// call, and the refusal names the limit.
+    #[test]
+    fn read_file_refuses_a_path_above_the_command_line() {
+        let path = format!("C:\\{}", "'".repeat(6000));
+        let error = read_file(&path, 1, 10, false, "UTF8", "").expect_err("too long");
+        assert!(
+            error.contains(&WINRS_COMMAND_LINE_LIMIT.to_string()),
+            "{error}"
+        );
+    }
+
+    /// Worst case for the WinRS command line: an `exclude` whose every character
+    /// is a single quote, so the escape doubles it. A large exclude still fits one
+    /// command line (TR-REL-16).
+    #[test]
+    fn read_file_tail_exclude_fits_the_winrs_line_for_the_worst_case() {
+        let exclude = "'".repeat(300);
+        let cmd = read_file("C:\\a.log", 1, 100, true, "UTF8", &exclude).expect("fits");
+        assert!(
+            fits_command_line(&cmd),
+            "chars: {}",
+            command_line_chars(&cmd)
+        );
+    }
+
+    /// TR-REL-16: an `exclude` too long for one command line is refused before any
+    /// host call, and the refusal names the limit.
+    #[test]
+    fn read_file_tail_exclude_refuses_an_input_above_the_command_line() {
+        let exclude = "'".repeat(5000);
+        let error = read_file("C:\\a.log", 1, 100, true, "UTF8", &exclude).expect_err("too long");
+        assert!(
+            error.contains(&WINRS_COMMAND_LINE_LIMIT.to_string()),
+            "{error}"
+        );
     }
 
     #[test]
@@ -3075,8 +3967,56 @@ mod tests {
         vec![
             list_directory(text),
             find_files(text, text, 5, true),
-            read_file(text, 1, 10, false, "UTF8").expect("valid"),
-            search_file_content(text, text, text, 10, 0, 0),
+            read_file(text, 1, 10, false, "UTF8", "").expect("valid"),
+            read_file(text, 1, 10, true, "UTF8", text).expect("valid"),
+            search_file_content(
+                text,
+                text,
+                text,
+                10,
+                0,
+                0,
+                &SearchOptions {
+                    from_end: false,
+                    count_only: false,
+                    since: "",
+                    until: "",
+                    timestamp_format: "",
+                },
+            )
+            .expect("valid"),
+            search_file_content(
+                text,
+                text,
+                text,
+                10,
+                0,
+                0,
+                &SearchOptions {
+                    from_end: true,
+                    count_only: false,
+                    since: "2026-01-01 00:00:00",
+                    until: "2026-01-02 00:00:00",
+                    timestamp_format: "yyyy-MM-dd HH:mm:ss",
+                },
+            )
+            .expect("valid"),
+            search_file_content(
+                text,
+                text,
+                text,
+                10,
+                0,
+                0,
+                &SearchOptions {
+                    from_end: false,
+                    count_only: true,
+                    since: "2026-01-01 00:00:00",
+                    until: "",
+                    timestamp_format: "yyyy-MM-dd HH:mm:ss",
+                },
+            )
+            .expect("valid"),
             file_info(text),
             compare_files(text, text, 5),
             get_event_log(text, "error", 24, text, 10).expect("valid"),

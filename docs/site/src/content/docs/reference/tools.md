@@ -21,8 +21,8 @@ The binary declares 41 tools, plus `write_file` when the operator enables it. Th
 |------|-------------|
 | `list_directory` | List the files and directories at a path |
 | `find_files` | Find files recursively by a pattern |
-| `read_file` | Read the content of a file with line numbers |
-| `search_file_content` | Search text in a file or a directory, like grep |
+| `read_file` | Read the content of a file with line numbers. The tail mode can drop the lines that contain a literal text |
+| `search_file_content` | Search text in a file or a directory, like grep. The tool can return the last matches, count the matches, and filter the lines by the timestamp at the start |
 | `file_info` | The metadata of a file or a directory in JSON |
 | `compare_files` | A line-by-line diff of two files |
 

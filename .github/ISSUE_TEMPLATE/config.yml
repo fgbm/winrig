@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
-  - name: Уязвимость
+  - name: A vulnerability
     url: https://github.com/fgbm/winrig/security/advisories/new
-    about: Не открывайте публичный issue для сообщения об уязвимости — используйте приватный канал advisory. См. SECURITY.md.
-  - name: Вопрос или обсуждение решения
+    about: Do not open a public issue to report a vulnerability — use the private advisory channel. See SECURITY.md.
+  - name: A question or a discussion of a decision
     url: https://github.com/fgbm/winrig/discussions
-    about: Спросите об использовании, развёртывании или решении до того, как заводить issue.
+    about: Ask about usage, deployment or a decision before you open an issue.

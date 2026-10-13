@@ -106,7 +106,7 @@ pub fn identity_from_parts(parts: &Parts) -> Result<RequestIdentity, ErrorData> 
         if parts.headers.contains_key("x-ad-user") || parts.headers.contains_key("x-ad-password") {
             tracing::warn!(
                 target: "winrig::auth",
-                "X-AD-* headers ignored: the request is authenticated by a profile token"
+                "X-AD-* headers ignored: the profile token authenticated the request"
             );
         }
         return Ok(RequestIdentity {

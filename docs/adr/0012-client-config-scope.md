@@ -1,31 +1,31 @@
-# ADR-0012 — Уровень записи конфига клиента: global или project
+# ADR-0012 — The write scope of the client configuration: global or project
 
-- Статус: принято
-- Дата: 2026-09-21
-- Связано: ADR-0009, DR-4
+- Status: accepted
+- Date: 2026-09-21
+- Related: ADR-0009, DR-4
 
-## Контекст
+## Context
 
-`setup --write-config <client>` всегда писал определение сервера в глобальный (пользовательский) конфиг клиента: `~/.config/opencode/opencode.json`, `~/.claude.json`, `~/.codex/config.toml`, `~/.cursor/mcp.json`. Для проекта, которому нужен свой `winrig` на своём профиле, это неверно: запись действует на все проекты машины, а несколько учётных записей в одном глобальном файле клиента конфликтуют по имени `winrig`. Клиенты при этом поддерживают проектный уровень: opencode — `<project>/opencode.json`, Claude Code — `<project>/.mcp.json`, Codex — `<project>/.codex/config.toml`, Cursor — `<project>/.cursor/mcp.json`.
+`setup --write-config <client>` always wrote the server definition into the global (user) client configuration: `~/.config/opencode/opencode.json`, `~/.claude.json`, `~/.codex/config.toml`, `~/.cursor/mcp.json`. This is wrong for a project that needs its own `winrig` on its own profile. The record acts on all projects of the computer, and several accounts in one global client file conflict by the name `winrig`. The clients support a project level: opencode uses `<project>/opencode.json`, Claude Code uses `<project>/.mcp.json`, Codex uses `<project>/.codex/config.toml` and Cursor uses `<project>/.cursor/mcp.json`.
 
-Уровень — новое измерение записи, и по умолчанию он не выводится из существующих аргументов. Молчаливый выбор глобального уровня повторял бы прежнее поведение, но противоречил бы ожиданию «моя запись — только в этом проекте». Поэтому уровень задаётся явно, а при отсутствии аргумента спрашивается у оператора.
+The scope is a new dimension of the write, and the code does not derive it from the existing arguments by default. A silent choice of the global scope would repeat the previous behavior. It would contradict the expectation "my record is only in this project". Thus the operator sets the scope explicitly, and without the argument `setup` asks the operator.
 
-## Решение
+## Decision
 
-1. **Флаг `--scope global|project`.** Значение по умолчанию отсутствует: без флага уровень не угадывается.
-2. **Вопрос при отсутствии флага.** Если `--write-config` задан без `--scope` и stdin — терминал, `setup` спрашивает `(g)lobal or (p)roject` и принимает `g`/`global`/`p`/`project` без учёта регистра.
-3. **Fail-closed без терминала.** Если stdin не терминал (скрипт, CI, конвейер), тот же случай — отказ с сообщением, называющим `--scope global|project`. Автоматический выбор (даже глобальный) запрещён: молчаливая запись не туда дороже явного отказа.
-4. **`--scope` без `--write-config` отвергается.** Записывать нечего; это ошибка использования, а не игнорируемый флаг.
-5. **Корень проекта.** Project-уровень пишется в ближайший каталог-предок текущего каталога, содержащий `.git` (каталог или файл воркtree); если такого нет — в текущий каталог. Так запуск из подкаталога монорепозитория попадает в корень репозитория.
-6. **Проектные пути.** opencode — `<root>/opencode.json`, Claude Code — `<root>/.mcp.json`, Codex — `<root>/.codex/config.toml`, Cursor — `<root>/.cursor/mcp.json`. Глобальные пути не меняются.
-7. **Токен opencode на project-уровне** выносится в приватный state-каталог профиля (`WINRIG_STATE_DIR`, файл `0600`), а конфиг ссылается на абсолютный путь `{file:...}`: файл токена не должен лежать в дереве репозитория. Глобальный opencode сохраняет прежнее расположение токена рядом с глобальным конфигом.
-8. **Предупреждение об инлайн-токене.** Claude Code, Codex и Cursor пишут токен значением; на project-уровне файл обычно коммитится, поэтому после записи `setup` печатает предупреждение, что конфиг может попасть в систему контроля версий. Файл по-прежнему делается `0600` на Unix. Opencode предупреждения не требует.
-9. **Проверка до создания профиля.** Уровень разрешается (флаг, вопрос или отказ) до `profile::create`: отказ не оставляет после себя созданного профиля.
+1. **The flag `--scope global|project`.** There is no default value: without the flag the code does not guess the scope.
+2. **A question without the flag.** If the operator sets `--write-config` without `--scope`, and stdin is a terminal, `setup` asks `(g)lobal or (p)roject`. The code accepts `g`, `global`, `p` or `project` without attention to the letter case.
+3. **Fail-closed without a terminal.** If stdin is not a terminal (a script, CI or a pipeline), the same case is a refusal. The message names `--scope global|project`. An automatic choice (even global) is forbidden: a silent write into the wrong place costs more than an explicit refusal.
+4. **`setup` rejects `--scope` without `--write-config`.** There is nothing to write; this is a use error, not an ignored flag.
+5. **The project root.** The project level writes into the nearest parent directory of the current directory that contains `.git`. The `.git` entry is a directory or a file of a worktree. If there is no such directory, the write goes into the current directory. Thus a start from a subdirectory of a monorepo arrives in the root of the repository.
+6. **The project paths.** opencode uses `<root>/opencode.json`, Claude Code uses `<root>/.mcp.json`, Codex uses `<root>/.codex/config.toml` and Cursor uses `<root>/.cursor/mcp.json`. The global paths do not change.
+7. **The opencode profile token at the project level** goes into the private state directory of the profile (`WINRIG_STATE_DIR`, file `0600`). The configuration refers to the absolute path `{file:...}`. The profile token file must not lie in the repository tree. The global opencode keeps the previous position of the profile token next to the global configuration.
+8. **A warning about the inline profile token.** Claude Code, Codex and Cursor write the profile token as a value. At the project level the file usually goes into a commit. Thus after the write `setup` prints a warning that the configuration can go into the version control system. The code still makes the file `0600` on Unix. Opencode does not need the warning.
+9. **A check before the creation of the profile.** The code resolves the scope (flag, question or refusal) before `profile::create`: a refusal leaves no created profile behind.
 
-## Последствия
+## Consequences
 
-- ADR-0009 §7 дополнен: у `--write-config` есть уровень, а не только клиент.
-- README получил таблицу проектных путей, поведение промпта и неинтерактивный отказ.
-- Покрытие: `client_config::tests` (корень проекта, проектные пути, токен opencode в state-каталоге), `app::tests` (разрешение уровня), `tests/cli_setup.rs` (project-запись, отказы без флага и без `--write-config`, предупреждение).
-- Клиенты, у которых проектный конфиг коммитится, остаются местом для инлайн-токена; это принятый компромисс, названный предупреждением.
-- Вне среза: схема opencode V2 (`mcp.servers`), «local»-scope Claude Code по пути проекта, переменная окружения для уровня.
+- ADR-0009 §7 gains a note: `--write-config` has a scope, not only a client.
+- The README received a table of the project paths, the behavior of the prompt and the non-interactive refusal.
+- Coverage: `client_config::tests` covers the project root, the project paths and the opencode profile token in the state directory. `app::tests` covers the resolution of the scope. `tests/cli_setup.rs` covers a project write, the refusals without the flag and without `--write-config`, and the warning.
+- Clients whose project configuration goes into a commit stay a place for the inline profile token. This is an accepted compromise, and the warning names it.
+- Outside the slice: the opencode V2 schema (`mcp.servers`), the "local" scope of Claude Code on the project path, and an environment variable for the scope.

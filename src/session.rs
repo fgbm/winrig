@@ -1,13 +1,12 @@
-//! Пул WinRM-сессий, кэш паролей, блокировка отказов и аудит.
+//! WinRM session pool, password cache, failure lockout and audit.
 //!
-//! Порт `agent/session_manager.py`. Модуль знает о транспорте только через
-//! трейт [`WinRmTransport`], поэтому автотесты работают на фиктивном
-//! транспорте, записывающем переданные команды, и сети не касаются (ADR-0003,
-//! AGENTS.md §4).
+//! Port of `agent/session_manager.py`. The module knows the transport only through the
+//! [`WinRmTransport`] trait, so the tests run on a fake transport that records the commands
+//! it gets and do not touch the network (ADR-0003, AGENTS.md §4).
 //!
-//! Идентичность передаётся явно в каждый вызов: кэши ключуются по имени
-//! пользователя, сессии — по паре (пользователь, `session_id`), поэтому
-//! пользователь не видит объекты другого (DR-3).
+//! The identity is passed explicitly to each call: the caches are keyed by user name and
+//! the sessions by the pair (user, `session_id`), so a user does not see another's objects
+//! (DR-3).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -20,36 +19,32 @@ use crate::executor::{
     SEPARATOR, escape_log_field, neutralize_separator, redact, sanitize_log_value, truncate,
 };
 
-/// Порт WinRM по умолчанию для HTTP.
 pub const DEFAULT_HTTP_PORT: u16 = 5985;
-/// Порт WinRM по умолчанию для HTTPS.
 pub const DEFAULT_HTTPS_PORT: u16 = 5986;
 
-/// Преамбула, включающая UTF-8 вывод PowerShell.
+/// Forces UTF-8 in redirected PowerShell output.
 ///
-/// `winrm-rs` задаёт `WINRS_CODEPAGE=65001` на уровне cmd-шелла, но
-/// `powershell.exe` для перенаправленного вывода использует собственную
-/// `[Console]::OutputEncoding`. На локализованном Windows она не вмещает
-/// системный язык, и PowerShell заменяет неотображаемые символы на `?` ещё до
-/// отправки байтов, поэтому никакое декодирование на этой стороне их не вернёт.
-/// Обёртка в try/catch нужна для хоста без консоли (порт `UTF8_PREAMBLE` из
-/// Python-версии).
+/// `winrm-rs` sets `WINRS_CODEPAGE=65001` at the cmd shell level, but `powershell.exe`
+/// uses its own `[Console]::OutputEncoding` for redirected output. On a localized Windows
+/// it does not hold the system language, and PowerShell replaces unrepresentable
+/// characters with `?` before it sends the bytes, so no decoding on this side can bring
+/// them back. The try/catch wrapper is for a host without a console (port of
+/// `UTF8_PREAMBLE` from the Python version).
 pub const UTF8_PREAMBLE: &str = "try { [Console]::OutputEncoding = [Text.Encoding]::UTF8; \
      $OutputEncoding = [Text.Encoding]::UTF8 } catch { }; ";
 
-/// Идентичность вызывающего пользователя (DR-2).
+/// Caller identity for one request (DR-2).
 #[derive(Debug, Clone)]
 pub struct UserIdentity {
-    /// Имя учётной записи AD.
     pub username: String,
-    /// Пароль из заголовка `X-AD-Password` или из профиля, если он был передан.
+    /// Supplied in the `X-AD-Password` header or decrypted from the profile.
     pub password: Option<SecretString>,
-    /// Откуда пришёл пароль: заголовок или профиль (ADR-0009).
+    /// Where the password came from: the header or the profile (ADR-0009).
     pub origin: IdentityOrigin,
 }
 
 impl UserIdentity {
-    /// Идентичность без пароля: пароль берётся из кэша или запрашивается.
+    /// Identity without a password: the password comes from the cache or is requested.
     #[must_use]
     pub fn new(username: impl Into<String>) -> Self {
         Self {
@@ -59,7 +54,7 @@ impl UserIdentity {
         }
     }
 
-    /// Идентичность с паролем из заголовка.
+    /// Header-origin identity that carries a password.
     #[must_use]
     pub fn with_password(username: impl Into<String>, password: impl Into<String>) -> Self {
         Self {
@@ -69,7 +64,7 @@ impl UserIdentity {
         }
     }
 
-    /// Идентичность с паролем из профиля.
+    /// Profile-origin identity that carries a decrypted password.
     #[must_use]
     pub fn from_profile(username: impl Into<String>, password: SecretString) -> Self {
         Self {
@@ -80,67 +75,57 @@ impl UserIdentity {
     }
 }
 
-/// Результат удалённой команды.
+/// Result of a remote command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteOutput {
-    /// Стандартный вывод.
     pub stdout: Vec<u8>,
-    /// Стандартный поток ошибок.
     pub stderr: Vec<u8>,
-    /// Код возврата; `-1`, если сервер его не сообщил.
+    /// Return code; `-1` if the server did not report one.
     pub exit_code: i32,
 }
 
-/// Ошибка транспорта WinRM.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TransportError {
-    /// Сервер отверг учётные данные.
+    /// Credentials were rejected by the server.
     #[error("authentication failed: {0}")]
     AuthFailed(String),
-    /// Учётные данные приняты, но сам запрос отвергнут хостом (TR-SEC-10).
+    /// The credentials were accepted, but the host rejected the request itself (TR-SEC-10).
     #[error("request rejected: {0}")]
     Rejected(String),
-    /// Любая другая ошибка транспорта.
     #[error("transport error: {0}")]
     Other(String),
 }
 
 impl TransportError {
-    /// Истина, если это отказ в учётных данных (для сброса кэша пароля).
+    /// True if this is a credential failure (for the password cache reset).
     ///
-    /// [`Self::Rejected`] сюда не входит: там пароль уже принят, и сбрасывать
-    /// кэш или двигать счётчик блокировки не за что (TR-SEC-10).
+    /// [`Self::Rejected`] is not one: there the password was already accepted, so there is
+    /// nothing to reset the cache for or to move the lockout counter for (TR-SEC-10).
     #[must_use]
     pub fn is_auth_failure(&self) -> bool {
         matches!(self, Self::AuthFailed(_))
     }
 }
 
-/// Параметры одного подключения к Windows-хосту.
+/// Parameters of one connection to a Windows host.
 #[derive(Debug, Clone)]
 pub struct SessionTarget {
-    /// Хост.
     pub host: String,
-    /// Порт WinRM.
     pub port: u16,
-    /// Использовать HTTPS.
     pub use_tls: bool,
-    /// Проверять TLS-сертификат.
     pub verify_cert: bool,
-    /// Учётная запись.
     pub username: String,
-    /// Пароль (обнуляется при освобождении).
+    /// Zeroized on drop.
     pub password: SecretString,
 }
 
-/// Шов транспорта: реальный WinRM или фиктивный записывающий.
+/// Seam between the real transport and the fake recording one.
 #[async_trait::async_trait]
 pub trait WinRmTransport: Send + Sync {
-    /// Выполнить PowerShell-скрипт на хосте.
     ///
     /// # Errors
     ///
-    /// [`TransportError`], если подключение или аутентификация не удались.
+    /// [`TransportError`] if the connection or the authentication fails.
     async fn run_powershell(
         &self,
         target: &SessionTarget,
@@ -148,16 +133,16 @@ pub trait WinRmTransport: Send + Sync {
     ) -> Result<RemoteOutput, TransportError>;
 }
 
-/// Разбирает учётную запись на имя пользователя и домен для NTLM.
+/// Splits `DOMAIN\user` for NTLM, matching `spnego`.
 ///
-/// `winrm-rs` не разбирает `DOMAIN\user` сам: он подставляет `username` в
-/// NTLMv2-хеш целиком (`UPPER(username) + domain`), поэтому при пустом домене
-/// `contoso\alice` уходит как `CONTOSO\ALICE` и AD отвергает вход.
+/// `winrm-rs` does not split `DOMAIN\user` itself: it puts `username` into the NTLMv2 hash
+/// whole (`UPPER(username) + domain`), so with an empty domain `contoso\alice` goes as
+/// `CONTOSO\ALICE` and AD rejects the logon.
 ///
-/// Разбор повторяет `spnego` (движок `requests-ntlm` под `pywinrm`, на котором
-/// работала Python-версия): имя делится по первому `\\`; UPN (`user@realm`) и
-/// голое имя остаются целиком именем пользователя с пустым доменом, а регистр
-/// домена не меняется — сервер пересчитывает хеш по тому, что прислал клиент.
+/// The split matches `spnego` (the `requests-ntlm` engine under `pywinrm`, on which the
+/// Python version ran): the name is split at the first `\`; a UPN (`user@realm`) and a
+/// bare name stay whole as the user name with an empty domain, and the domain case is
+/// unchanged, because the server recomputes the hash from what the client sent.
 #[must_use]
 pub fn split_account(account: &str) -> (String, String) {
     match account.split_once('\\') {
@@ -166,11 +151,11 @@ pub fn split_account(account: &str) -> (String, String) {
     }
 }
 
-/// Реальный транспорт поверх `winrm-rs`.
+/// Real transport over `winrm-rs`.
 #[derive(Debug, Default, Clone)]
 pub struct WinrmTransportImpl;
 
-/// Собирает учётные данные `winrm-rs`, разбирая `DOMAIN\user`.
+/// `winrm-rs` credentials with `DOMAIN\user` split.
 fn credentials_for(target: &SessionTarget) -> winrm_rs::WinrmCredentials {
     let (username, domain) = split_account(&target.username);
     winrm_rs::WinrmCredentials {
@@ -209,7 +194,7 @@ impl WinRmTransport for WinrmTransportImpl {
     }
 }
 
-/// Подсказка для пустого 500: слушатель отверг нешифрованное сообщение.
+/// Hint for an empty 500: the listener rejected an unencrypted message.
 const UNENCRYPTED_HINT: &str = "the host returned HTTP 500 with an empty body. \
      The credentials were accepted, so this is not a password problem: WinRM answers \
      an unencrypted message this way when AllowUnencrypted is false. Connect over \
@@ -222,12 +207,12 @@ fn map_error(error: winrm_rs::WinrmError) -> TransportError {
     }
 }
 
-/// Отделяет настоящий отказ учётных данных от отвергнутого запроса.
+/// Separates a real credential failure from a rejected request.
 ///
-/// `winrm-rs` складывает в `AuthFailed` и отказ NTLM, и любой неуспешный
-/// HTTP-статус (`auth/ntlm.rs`, `transport.rs`). Второе приходит уже после
-/// принятого NTLM, поэтому отказом пароля не является и не должно ни сбрасывать
-/// кэш, ни двигать счётчик блокировки (TR-SEC-10).
+/// `winrm-rs` puts both an NTLM rejection and any failed HTTP status into `AuthFailed`
+/// (`auth/ntlm.rs`, `transport.rs`). The second arrives after NTLM was accepted, so it is
+/// not a password failure and must neither reset the cache nor move the lockout counter
+/// (TR-SEC-10).
 fn classify_auth_failure(message: String) -> TransportError {
     if !message.starts_with("HTTP ") {
         return TransportError::AuthFailed(message);
@@ -238,8 +223,8 @@ fn classify_auth_failure(message: String) -> TransportError {
     TransportError::Rejected(message)
 }
 
-/// Истина для `HTTP 500 ...:` с пустым телом — подписи отказа в нешифрованном
-/// сообщении. Ошибка WS-Man пришла бы SOAP-fault'ом и с телом.
+/// True for `HTTP 500 ...:` with an empty body — the signature of a refusal of an
+/// unencrypted message. A WS-Man error would arrive as a SOAP fault with a body.
 fn is_empty_internal_error(message: &str) -> bool {
     message.starts_with("HTTP 500")
         && message
@@ -247,22 +232,20 @@ fn is_empty_internal_error(message: &str) -> bool {
             .is_some_and(|(_, body)| body.trim().is_empty())
 }
 
-/// Настройки реестра, собранные из `AppConfig`.
+/// Registry settings collected from `AppConfig`.
 #[derive(Debug, Clone)]
 pub struct RegistryConfig {
-    /// Время жизни пароля в покое; 0 — без истечения.
+    /// Idle lifetime of the password; `0` means no expiry.
     pub password_idle_ttl: Duration,
-    /// Порог отказов AD до блокировки.
+    /// Number of AD failures before the lockout.
     pub lockout_max_attempts: u32,
-    /// Окно блокировки.
     pub lockout_window: Duration,
-    /// Порог редактирования в ответе агенту.
+    /// Redaction threshold in the reply to the agent.
     pub secret_redact_min_length: usize,
-    /// Предел вывода в аудите.
+    /// Output cap in the audit.
     pub audit_max_output_chars: usize,
-    /// Писать ли тело команды и вывода в аудит.
+    /// Whether to write the command and output body into the audit.
     pub audit_log_body: bool,
-    /// Порт по умолчанию.
     pub default_port: u16,
 }
 
@@ -280,41 +263,41 @@ impl Default for RegistryConfig {
     }
 }
 
-/// Кэшированный пароль с временем последнего использования.
+/// Password with the time it was last used.
 #[derive(Debug, Clone)]
 struct CachedPassword {
     value: SecretString,
     last_used: Instant,
 }
 
-/// Состояние отказов AD для текущего пароля.
+/// Counters of AD failures for the current password.
 #[derive(Debug, Clone)]
 struct FailureState {
-    /// SHA-256 отклонённого пароля; сам пароль не хранится (DR-4).
+    /// SHA-256 of the rejected password; the password itself is not stored (DR-4).
     password_hash: [u8; 32],
     count: u32,
     first_failure: Instant,
 }
 
 impl FailureState {
-    /// Секунды до истечения окна, отсчитываемого от первого отказа.
+    /// Seconds until the window expires, counted from the first failure.
     fn window_remaining(&self, window: Duration, now: Instant) -> i64 {
         let elapsed = now.saturating_duration_since(self.first_failure);
         window.as_secs() as i64 - elapsed.as_secs() as i64
     }
 }
 
-/// Откуда пришёл пароль: определяет, распространяется ли на него правило
-/// двух блокировок (ADR-0009, AC-PRF-56).
+/// Where the password came from: it decides whether the two-lockout rule applies to it
+/// (ADR-0009, AC-PRF-56).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityOrigin {
-    /// Пароль предъявлен заголовком; клиент может сменить его вручную.
+    /// The password was presented in a header; the client can change it by hand.
     Headers,
-    /// Пароль расшифрован из профиля; смена требует `setup`.
+    /// The password was decrypted from the profile; changing it needs `setup`.
     Profile,
 }
 
-/// Открытая сессия пользователя.
+/// State kept for one open connection.
 #[derive(Debug, Clone)]
 struct Session {
     target: SessionTarget,
@@ -323,21 +306,20 @@ struct Session {
     command_count: u64,
 }
 
-/// Реестр сессий и кэшей, изолированных по пользователю (DR-3).
+/// Per-user isolation of the caches and the registry (DR-3).
 pub struct SessionRegistry {
     transport: Arc<dyn WinRmTransport>,
     config: RegistryConfig,
     passwords: Mutex<HashMap<String, CachedPassword>>,
     failures: Mutex<HashMap<String, FailureState>>,
-    /// Число срабатываний порога отказов с последнего успешного `connect`.
+    /// Number of times the failure threshold was reached since the last successful `connect`.
     lockout_streak: Mutex<HashMap<String, u32>>,
-    /// Пользователи, чей профиль отвергнут дважды: отказ до перезапуска.
+    /// Users whose profile was rejected twice and stay blocked until a restart.
     profile_refused: Mutex<std::collections::HashSet<String>>,
     sessions: Mutex<HashMap<(String, String), Session>>,
 }
 
 impl SessionRegistry {
-    /// Создаёт реестр с заданным транспортом и настройками.
     #[must_use]
     pub fn new(transport: Arc<dyn WinRmTransport>, config: RegistryConfig) -> Self {
         Self {
@@ -351,7 +333,7 @@ impl SessionRegistry {
         }
     }
 
-    /// Кладёт пароль в кэш пользователя, сбрасывая сессии при смене пароля.
+    /// Puts the password into the user's cache, dropping the sessions when the password changes.
     pub fn cache_password(&self, username: &str, password: &str) {
         let now = Instant::now();
         let changed = {
@@ -373,7 +355,7 @@ impl SessionRegistry {
         }
     }
 
-    /// Есть ли у пользователя неизрасходованный пароль; обновляет время жизни.
+    /// Whether the user has an unexpired password; refreshes the lifetime.
     #[must_use]
     pub fn has_cached_password(&self, username: &str) -> bool {
         let now = Instant::now();
@@ -399,14 +381,14 @@ impl SessionRegistry {
         present
     }
 
-    /// Убирает пароль и сессии пользователя, чтобы следующий `connect` снова спросил.
+    /// Removes the user's password and sessions, so the next `connect` asks again.
     pub fn invalidate_password(&self, username: &str) {
         lock(&self.passwords).remove(username);
         self.drop_sessions(username);
     }
 
-    /// Истина, если профиль пользователя отвергнут дважды и не предъявляется
-    /// до перезапуска (AC-PRF-56). В stdio это сигнал завершить процесс.
+    /// True if the user's profile was rejected twice and is not presented until a restart
+    /// (AC-PRF-56). In stdio this is the signal to end the process.
     #[must_use]
     pub fn is_profile_refused(&self, username: &str) -> bool {
         lock(&self.profile_refused).contains(username)
@@ -421,10 +403,9 @@ impl SessionRegistry {
         lock(&self.sessions).retain(|(user, _), _| user != username);
     }
 
-    /// Открывает сессию: проверяет блокировку, выполняет пробную команду.
+    /// Opens a session: checks the lockout, then runs a probe command.
     ///
-    /// Возвращает ответ инструмента: при успехе — сведения о хосте, при
-    /// отказе — поле `error`.
+    /// Returns the tool reply: host details on success, an `error` field on refusal.
     pub async fn connect(
         &self,
         identity: &UserIdentity,
@@ -436,8 +417,7 @@ impl SessionRegistry {
         let username = identity.username.clone();
         self.sync_header_password(identity);
 
-        // AC-PRF-56: профиль, отвергнутый дважды, не предъявляется снова до
-        // перезапуска процесса.
+        // AC-PRF-56: a profile rejected twice is not presented again until the process restarts.
         if identity.origin == IdentityOrigin::Profile
             && lock(&self.profile_refused).contains(&username)
         {
@@ -448,10 +428,9 @@ impl SessionRegistry {
             });
         }
 
-        // TR-SEC-13: пароль приходит в том же запросе. Кэш по одному имени
-        // сессию не открывает: имя из `X-AD-User` любой держатель общего
-        // секрета может назвать чужим (ADR-0015 §3). Профиль несёт пароль
-        // всегда, поэтому для него ветка не меняется.
+        // TR-SEC-13: the password arrives in the same request. A cache keyed by name alone does
+        // not open a session: any holder of the shared secret can claim another's `X-AD-User`
+        // (ADR-0015 §3). The profile always carries the password, so its branch is unchanged.
         let Some(password) = identity.password.clone() else {
             self.audit_refusal(
                 &username,
@@ -513,8 +492,8 @@ impl SessionRegistry {
                 let raw = String::from_utf8_lossy(&output.stdout).trim().to_owned();
                 let parts: Vec<&str> = raw.split('|').collect();
                 let secret = [password.expose_secret().to_owned()];
-                // DR-4: поля, пришедшие от хоста, тоже могут содержать секрет,
-                // поэтому редактируются перед аудитом и ответом.
+                // DR-4: fields from the host can contain the secret too, so they are redacted
+                // before the audit and the reply.
                 let audit_field = |value: &str| redact(value, &secret, 1);
                 let reply_field =
                     |value: &str| redact(value, &secret, self.config.secret_redact_min_length);
@@ -576,8 +555,8 @@ impl SessionRegistry {
             }
             Ok(output) => {
                 let stderr = strip_clixml(&String::from_utf8_lossy(&output.stderr));
-                // DR-4: текст ошибки хоста может содержать пароль. Аудит
-                // редактируется безусловно, ответ агенту — по порогу.
+                // DR-4: the host error text can contain the password. The audit is redacted
+                // unconditionally, the reply to the agent by the threshold.
                 let secret = [password.expose_secret().to_owned()];
                 let audit_stderr = redact(&stderr, &secret, 1);
                 let reply_stderr = redact(&stderr, &secret, self.config.secret_redact_min_length);
@@ -603,8 +582,8 @@ impl SessionRegistry {
                 if error.is_auth_failure() {
                     self.record_auth_failure(&username, &password);
                     self.invalidate_password(&username);
-                    // AC-PRF-56: второй набор порога отказов для профиля
-                    // переводит его в отказ до перезапуска процесса.
+                    // AC-PRF-56: a second run of the failure threshold for a profile turns it
+                    // into a refusal until the process restarts.
                     if identity.origin == IdentityOrigin::Profile
                         && self.bump_lockout_streak(&username)
                     {
@@ -661,7 +640,6 @@ impl SessionRegistry {
         }
     }
 
-    /// Закрывает сессию пользователя.
     #[must_use]
     pub fn disconnect(&self, username: &str, session_id: &str) -> Value {
         let removed = lock(&self.sessions).remove(&(username.to_owned(), session_id.to_owned()));
@@ -682,7 +660,6 @@ impl SessionRegistry {
         }
     }
 
-    /// Перечисляет сессии пользователя.
     #[must_use]
     pub fn list_sessions(&self, username: &str) -> Value {
         let sessions = lock(&self.sessions);
@@ -703,7 +680,7 @@ impl SessionRegistry {
         json!({ "sessions": items, "count": items.len() })
     }
 
-    /// Выполняет PowerShell-команду в открытой сессии с редактированием и аудитом.
+    /// Runs a PowerShell command in an open session with redaction and audit.
     pub async fn run_ps(
         &self,
         username: &str,
@@ -725,9 +702,9 @@ impl SessionRegistry {
             (session.target.clone(), session.command_count)
         };
 
-        // DR-4: пароль самой сессии редактируется всегда, даже если инструмент
-        // не передал его отдельно. Иначе `set_registry` с секретом в значении
-        // попал бы в аудит открытым текстом.
+        // DR-4: the session password is always redacted, even if the tool did not pass it
+        // separately. Otherwise `set_registry` with a secret in a value would reach the audit
+        // in clear text.
         let mut effective_secrets: Vec<String> = redactions.to_vec();
         let session_password = target.password.expose_secret().to_owned();
         if !effective_secrets
@@ -747,8 +724,8 @@ impl SessionRegistry {
             format!(" [{tool_name}]")
         };
 
-        // Преамбула добавляется только к исполнению; аудит хранит команду,
-        // которую запросил инструмент.
+        // The preamble is added to the execution only; the audit keeps the command the tool
+        // requested.
         match self
             .transport
             .run_powershell(&target, &format!("{UTF8_PREAMBLE}{command}"))
@@ -822,7 +799,6 @@ impl SessionRegistry {
         }
     }
 
-    /// Имя пользователя, которому принадлежит неизрасходованный пароль.
     fn cached_password(&self, username: &str) -> Option<SecretString> {
         let now = Instant::now();
         let mut expired = false;
@@ -916,8 +892,8 @@ impl SessionRegistry {
         lock(&self.failures).remove(username);
     }
 
-    /// Учитывает достижение порога отказов; `true` — если это уже второй раз
-    /// подряд (AC-PRF-56). Счётчик обнуляется успешным `connect` (AC-PRF-57).
+    /// Accounts for the failure threshold being reached; `true` if this is already the second
+    /// time in a row (AC-PRF-56). A successful `connect` clears the count (AC-PRF-57).
     fn bump_lockout_streak(&self, username: &str) -> bool {
         let reached = {
             let failures = lock(&self.failures);
@@ -938,7 +914,7 @@ impl SessionRegistry {
         lock(&self.lockout_streak).remove(username);
     }
 
-    /// Сдвигает окно блокировки в прошлое — только для тестов истечения окна.
+    /// Moves the lockout window into the past — only for window-expiry tests.
     #[cfg(test)]
     fn force_lockout_window_elapsed(&self, username: &str) {
         let backdate = self.config.lockout_window + Duration::from_secs(1);
@@ -950,11 +926,11 @@ impl SessionRegistry {
         }
     }
 
-    /// Пишет в аудит отказ политики, случившийся до обращения к хосту
-    /// (TR-OBS-03, ADR-0015 §14).
+    /// Writes a policy refusal that happened before the host call into the audit (TR-OBS-03,
+    /// ADR-0015 §14).
     ///
-    /// Причина называет хост или путь, но не секрет: пароль и токены в отказы
-    /// политики не попадают. Поля экранируются, как и в остальных записях.
+    /// The reason names the host or the path, never a secret: passwords and tokens do not
+    /// reach policy refusals. Fields are escaped like in the other records.
     pub fn audit_refusal(&self, username: &str, tool: &str, code: &str, reason: &str) {
         self.audit(
             "POLICY REFUSED",
@@ -987,11 +963,10 @@ impl SessionRegistry {
     }
 }
 
-/// Строит тело записи аудита для одной команды (TR-SEC-09, DR-4).
+/// Pure, so it can be tested without the global tracing subsystem (TR-SEC-09, DR-4).
 ///
-/// Чистая функция: редактирует команду и вывод безусловно (`min_length=1`),
-/// усекает и оформляет. Вынесена из `run_ps`, чтобы проверяться без глобальной
-/// подсистемы трассировки.
+/// Redacts the command and the output unconditionally (`min_length=1`), truncates and
+/// formats them.
 fn command_audit_body(
     command: &str,
     stdout: &str,
@@ -1016,7 +991,7 @@ fn command_audit_body(
     body
 }
 
-/// Метка источника пароля для аудита (ADR-0009).
+/// Label of the password source for the audit (ADR-0009).
 fn origin_label(origin: IdentityOrigin) -> &'static str {
     match origin {
         IdentityOrigin::Headers => "headers",
@@ -1031,11 +1006,11 @@ fn password_hash(password: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Захватывает мьютекс, восстанавливаясь после отравления.
+/// Takes the mutex, recovering after poisoning.
 ///
-/// Паника в потоке с захваченным мьютексом не должна превращать следующие
-/// запросы в панику: состояние реестра — это кэши и счётчики, а не инвариант,
-/// который нельзя восстановить. Аудит и логирование должны продолжать работать.
+/// A panic in a thread that holds the mutex must not turn later requests into panics: the
+/// registry state is caches and counters, not an invariant that cannot be restored. The
+/// audit and the logging must keep working.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -1043,7 +1018,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 fn strip_clixml(stderr: &str) -> String {
-    // PowerShell упаковывает прогресс в CLIXML; вырезаем блок `<Objs>...</Objs>`.
+    // PowerShell packs progress into CLIXML; cut out the `<Objs>...</Objs>` block.
     let trimmed = stderr.trim();
     if let Some(start) = trimmed.find("#< CLIXML")
         && let Some(end) = trimmed[start..].find("</Objs>")
@@ -1073,8 +1048,8 @@ fn timestamp() -> String {
 }
 
 fn format_time(time: SystemTime) -> String {
-    // Без внешнего крэйта дат: выводим секунды эпохи, что стабильно и
-    // достаточно для метаданных сессии.
+    // No external date crate: emit epoch seconds, which is stable and enough for session
+    // metadata.
     match time.duration_since(UNIX_EPOCH) {
         Ok(duration) => format!("{}", duration.as_secs()),
         Err(_) => "0".to_owned(),
@@ -1086,16 +1061,16 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
-    /// Буфер, в который тестовый подписчик `tracing` пишет журнал и аудит.
+    /// Buffer the test `tracing` subscriber writes the log and the audit into.
     #[derive(Clone, Default)]
     struct Captured(Arc<StdMutex<Vec<u8>>>);
 
     thread_local! {
-        /// Буфер перехвата текущего потока; `None` — события выбрасываются.
+        /// Capture buffer of the current thread; `None` drops the events.
         static SINK: std::cell::RefCell<Option<Captured>> = const { std::cell::RefCell::new(None) };
     }
 
-    /// Писатель глобального подписчика: складывает событие в буфер потока.
+    /// Writer of the global subscriber: stores the event in the thread buffer.
     struct ThreadSink;
 
     impl std::io::Write for ThreadSink {
@@ -1113,13 +1088,13 @@ mod tests {
         }
     }
 
-    /// Перехват событий `tracing` текущего потока, включая аудит.
+    /// Intercepts `tracing` events of the current thread, the audit included.
     ///
-    /// Подписчик один на весь тестовый бинарь и ставится глобально: временные
-    /// подписчики на поток гоняются с параллельными тестами за общий кэш
-    /// интереса callsite и теряют события. Глобальный подписчик интересуется
-    /// всем всегда, а разводит события по тестам буфер потока. `tokio::test`
-    /// исполняет тест на том же потоке, поэтому асинхронные тесты тоже видны.
+    /// One subscriber serves the whole test binary and is installed globally: per-thread
+    /// temporary subscribers race with parallel tests over the shared callsite-interest
+    /// cache and lose events. A global subscriber is always interested in everything, and
+    /// the thread buffer splits the events by test. `tokio::test` runs the test on the same
+    /// thread, so asynchronous tests are visible too.
     struct Capture {
         captured: Captured,
     }
@@ -1151,7 +1126,7 @@ mod tests {
         Capture { captured }
     }
 
-    /// Фиктивный транспорт: записывает команды и отдаёт заранее заданные ответы.
+    /// Records the commands it gets and returns preset answers.
     struct FakeTransport {
         calls: StdMutex<Vec<(String, String)>>,
         credentials: StdMutex<Vec<(String, String)>>,
@@ -1219,9 +1194,9 @@ mod tests {
         SessionRegistry::new(transport, RegistryConfig::default())
     }
 
-    /// `DOMAIN\user` разбирается на домен и имя: без этого NTLM подставляет
-    /// строку с обратным слэшем в хеш и AD отвергает вход. Разбор совпадает с
-    /// `spnego`: UPN и голое имя не делятся, регистр не меняется.
+    /// `DOMAIN\user` splits into domain and name: without this NTLM puts the string with the
+    /// backslash into the hash and AD rejects the logon. The split matches `spnego`: a UPN
+    /// and a bare name are not split, the case is unchanged.
     #[test]
     fn split_account_handles_all_forms() {
         assert_eq!(
@@ -1232,20 +1207,20 @@ mod tests {
             split_account("CONTOSO\\Alice"),
             ("Alice".to_owned(), "CONTOSO".to_owned())
         );
-        // UPN: spnego не делит его, поэтому домен остаётся пустым.
+        // UPN: spnego does not split it, so the domain stays empty.
         assert_eq!(
             split_account("alice@contoso.local"),
             ("alice@contoso.local".to_owned(), String::new())
         );
         assert_eq!(split_account("alice"), ("alice".to_owned(), String::new()));
-        // Деление по первому слэшу, остаток остаётся именем.
+        // Split at the first backslash; the rest stays the name.
         assert_eq!(
             split_account("dom\\nested\\user"),
             ("nested\\user".to_owned(), "dom".to_owned())
         );
     }
 
-    /// `credentials_for` передаёт в `winrm-rs` чистое имя без домена.
+    /// `credentials_for` passes a clean name without a domain to `winrm-rs`.
     #[test]
     fn credentials_for_splits_domain() {
         let target = SessionTarget {
@@ -1293,9 +1268,9 @@ mod tests {
         );
     }
 
-    /// AC-SEC13-1: на пути по заголовкам закэшированный пароль по одному
-    /// имени не открывает сессию. Иначе держатель общего секрета, назвавшись
-    /// чужим `X-AD-User`, подключился бы чужим паролем (TR-SEC-13).
+    /// AC-SEC13-1: on the header path a password cached under one name does not open a
+    /// session. Otherwise a holder of the shared secret, naming another's `X-AD-User`,
+    /// would connect with that password (TR-SEC-13).
     #[tokio::test]
     async fn header_connect_without_password_ignores_the_cached_one() {
         let transport = Arc::new(FakeTransport::returning(output("HOST1||||", "", 0)));
@@ -1316,7 +1291,7 @@ mod tests {
             "the refused connect reached the transport"
         );
         assert_eq!(registry.list_sessions("alice")["count"], 1);
-        // Пароля не было, поэтому и отказа учётных данных не было.
+        // There was no password, so there was no credential failure either.
         assert!(registry.check_lockout("alice").is_none());
         assert!(!lock(&registry.failures).contains_key("alice"));
     }
@@ -1333,9 +1308,9 @@ mod tests {
         assert!(!registry.has_cached_password("alice"));
     }
 
-    /// TR-SEC-10: `winrm-rs` кладёт в `AuthFailed` любой неуспешный
-    /// HTTP-статус, а не только отказ учётных данных. Пустой 500 приходит уже
-    /// ПОСЛЕ принятого NTLM, поэтому отказом пароля он не является.
+    /// TR-SEC-10: `winrm-rs` puts any failed HTTP status into `AuthFailed`, not only a
+    /// credential failure. An empty 500 arrives after NTLM was accepted, so it is not a
+    /// password failure.
     #[test]
     fn empty_500_is_not_an_auth_failure() {
         let rejected = map_error(winrm_rs::WinrmError::AuthFailed(
@@ -1354,8 +1329,8 @@ mod tests {
         );
     }
 
-    /// TR-SEC-10: прочие HTTP-статусы тоже не отказ пароля, но и подсказку про
-    /// шифрование к ним не приписываем.
+    /// TR-SEC-10: other HTTP statuses are not a password failure either, but the encryption
+    /// hint is not attached to them.
     #[test]
     fn other_http_status_is_rejected_without_the_hint() {
         let rejected = map_error(winrm_rs::WinrmError::AuthFailed(
@@ -1370,7 +1345,7 @@ mod tests {
         );
     }
 
-    /// TR-SEC-10: настоящий отказ учётных данных распознаётся по-прежнему.
+    /// TR-SEC-10: a real credential failure is still recognized.
     #[test]
     fn ntlm_rejection_stays_an_auth_failure() {
         let error = map_error(winrm_rs::WinrmError::AuthFailed(
@@ -1379,8 +1354,8 @@ mod tests {
         assert!(error.is_auth_failure());
     }
 
-    /// TR-SEC-10: отвергнутый запрос не трогает кэш пароля — иначе неверно
-    /// настроенный слушатель заставляет вводить пароль заново.
+    /// TR-SEC-10: a rejected request does not touch the password cache — otherwise a
+    /// misconfigured listener forces the password to be entered again.
     #[tokio::test]
     async fn rejected_request_keeps_cached_password() {
         let transport = Arc::new(FakeTransport::failing(TransportError::Rejected(
@@ -1396,8 +1371,8 @@ mod tests {
         assert!(registry.has_cached_password("alice"));
     }
 
-    /// TR-SEC-10: сколько бы раз слушатель ни отверг запрос, профиль не уходит
-    /// в отказ и блокировка не включается (ср. AC-PRF-56).
+    /// TR-SEC-10: however many times the listener rejects the request, the profile is not
+    /// refused and the lockout does not engage (compare AC-PRF-56).
     #[tokio::test]
     async fn rejected_request_never_refuses_profile() {
         let transport = Arc::new(FakeTransport::failing(TransportError::Rejected(
@@ -1424,7 +1399,7 @@ mod tests {
             !registry.is_profile_refused("alice"),
             "профиль не должен быть отвергнут"
         );
-        // Транспорт вызван все шесть раз: блокировка ни разу не вмешалась.
+        // The transport was called all six times: the lockout never stepped in.
         assert_eq!(transport.calls().len(), 6);
     }
 
@@ -1454,8 +1429,8 @@ mod tests {
         assert_eq!(transport.calls().len(), calls_before);
     }
 
-    /// AC-SEC13-2: `connect` без пароля отвечает «нужен пароль» раньше, чем
-    /// раскрывает чужую блокировку (ADR-0015).
+    /// AC-SEC13-2: `connect` without a password answers "password required" before it
+    /// reveals another user's lockout (ADR-0015).
     #[tokio::test]
     async fn connect_without_password_does_not_reveal_lockout() {
         let transport = Arc::new(FakeTransport::failing(TransportError::AuthFailed(
@@ -1526,8 +1501,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_ps_redacts_session_password_without_explicit_redactions() {
-        // Боевой путь: сервер передаёт пустой список, но пароль самой сессии
-        // обязан редактироваться из ответа и аудита (DR-4).
+        // Production path: the server passes an empty list, but the session password must
+        // still be redacted from the reply and the audit (DR-4).
         let transport = Arc::new(FakeTransport::returning(output(
             "HOST1|Windows|10.0|2026-01-01 00:00:00",
             "",
@@ -1547,8 +1522,8 @@ mod tests {
         assert!(reply["stdout"].as_str().unwrap().contains("***"));
     }
 
-    /// AC-PRF-14: пароль из профиля редактируется на боевом пути `run_ps` так
-    /// же, как пароль из заголовка.
+    /// AC-PRF-14: a profile password is redacted on the production `run_ps` path just like
+    /// a header password.
     #[tokio::test]
     async fn run_ps_redacts_profile_password() {
         let transport = Arc::new(FakeTransport::returning(output(
@@ -1576,9 +1551,9 @@ mod tests {
 
     #[test]
     fn command_audit_body_redacts_below_reply_threshold() {
-        // DR-4: аудит редактируется безусловно (min_length=1), даже если
-        // секрет короче WINRIG_SECRET_REDACT_MIN_LENGTH (этот порог — только для
-        // ответа агенту, ADR-0005 §2). Проверяем чистую функцию детерминированно.
+        // DR-4: the audit is redacted unconditionally (min_length=1), even if the secret is
+        // shorter than WINRIG_SECRET_REDACT_MIN_LENGTH (that threshold is only for the reply
+        // to the agent, ADR-0005 §2). The pure function is checked deterministically.
         let secrets = ["abc".to_owned()];
         let body = command_audit_body("echo abc", "value=abc done", "err abc here", &secrets, 2000);
         assert!(!body.contains("abc"), "secret leaked into audit: {body}");
@@ -1605,9 +1580,9 @@ mod tests {
         let registry = registry(transport);
         let alice = UserIdentity::with_password("alice", "a");
         let bob = UserIdentity::with_password("bob", "b");
-        // Алиса подключается по HTTPS (session_id "host1:5986"), Боб — по HTTP
-        // (session_id "host1"). Идентификаторы не совпадают, и Боб не должен
-        // получить доступ к сессии Алисы.
+        // Alice connects over HTTPS (session_id "host1:5986"), Bob over HTTP
+        // (session_id "host1"). The identifiers differ, and Bob must not reach Alice's
+        // session.
         let _ = registry
             .connect(&alice, "host1", Some(5986), Some(true), true)
             .await;
@@ -1635,7 +1610,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_failure_stderr_is_redacted() {
-        // DR-4: пароль, попавший в текст ошибки хоста, не должен утечь в ответ.
+        // DR-4: a password that lands in the host error text must not leak into the reply.
         let transport = Arc::new(FakeTransport::returning(output(
             "",
             "Access denied for password supersecret",
@@ -1651,7 +1626,7 @@ mod tests {
 
     #[tokio::test]
     async fn lockout_window_expiry_allows_same_password_again() {
-        // AC-SEC01-4: по истечении окна тот же пароль снова доходит до транспорта.
+        // AC-SEC01-4: after the window expires the same password reaches the transport again.
         let transport = Arc::new(FakeTransport::failing(TransportError::AuthFailed(
             "nope".to_owned(),
         )));
@@ -1667,14 +1642,14 @@ mod tests {
             let identity = UserIdentity::with_password("alice", "wrong");
             let _ = registry.connect(&identity, "host1", None, None, true).await;
         }
-        // Четвёртая попытка заблокирована без транспорта.
+        // The fourth attempt is blocked without the transport.
         let before = transport.calls().len();
         let identity = UserIdentity::with_password("alice", "wrong");
         let locked = registry.connect(&identity, "host1", None, None, true).await;
         assert_eq!(locked["locked_out"], true);
         assert_eq!(transport.calls().len(), before);
 
-        // Окно истекло: та же попытка снова уходит в транспорт.
+        // The window expired: the same attempt reaches the transport again.
         registry.force_lockout_window_elapsed("alice");
         let identity = UserIdentity::with_password("alice", "wrong");
         let after = registry.connect(&identity, "host1", None, None, true).await;
@@ -1689,8 +1664,8 @@ mod tests {
             let registry = registry(transport.clone());
             let identity = UserIdentity::with_password("alice", "s3cret");
             let _ = registry.connect(&identity, "host1", None, None, true).await;
-            // Пробная команда connect прошла; теперь команда инструмента
-            // завершается ненулевым кодом без вывода.
+            // The probe command of connect passed; now the tool command exits with a
+            // non-zero code and no output.
             transport.set_result(Ok(output("", "", 1)));
             let reply = registry
                 .run_ps("alice", "host1", "Get-Service nope", "", &[])
@@ -1699,8 +1674,8 @@ mod tests {
         });
     }
 
-    /// AC-PRF-05/13: пароль из профиля доходит до транспорта под тем же
-    /// пользователем, что и заголовок.
+    /// AC-PRF-05/13: a profile password reaches the transport under the same user as a
+    /// header password.
     #[tokio::test]
     async fn profile_identity_reaches_transport() {
         let transport = Arc::new(FakeTransport::returning(output(
@@ -1718,14 +1693,14 @@ mod tests {
         );
     }
 
-    /// AC-PRF-05: источник идентичности в аудите различает профиль и заголовок.
+    /// AC-PRF-05: the identity source in the audit distinguishes the profile and the header.
     #[test]
     fn origin_label_distinguishes_sources() {
         assert_eq!(origin_label(IdentityOrigin::Profile), "profile");
         assert_eq!(origin_label(IdentityOrigin::Headers), "headers");
     }
 
-    /// AC-PRF-13: блокировка работает и для пароля из профиля.
+    /// AC-PRF-13: the lockout also covers a password that came from the profile.
     #[tokio::test]
     async fn lockout_applies_to_profile_password() {
         let transport = Arc::new(FakeTransport::failing(TransportError::AuthFailed(
@@ -1750,8 +1725,8 @@ mod tests {
         assert_eq!(transport.calls().len(), before);
     }
 
-    /// AC-PRF-56: второй набор порога отказов для профиля переводит его в
-    /// отказ, транспорт больше не вызывается.
+    /// AC-PRF-56: a second run of the failure threshold for a profile turns it into a
+    /// refusal, and the transport is no longer called.
     #[tokio::test]
     async fn profile_password_rejected_twice_is_refused() {
         let transport = Arc::new(FakeTransport::failing(TransportError::AuthFailed(
@@ -1769,7 +1744,7 @@ mod tests {
             let identity = UserIdentity::from_profile("alice", SecretString::from("wrong"));
             let _ = registry.connect(&identity, "host1", None, None, true).await;
         }
-        // Окно истекло: вторая тройка отказов.
+        // The window expired: a second round of three failures.
         registry.force_lockout_window_elapsed("alice");
         for _ in 0..3 {
             let identity = UserIdentity::from_profile("alice", SecretString::from("wrong"));
@@ -1784,11 +1759,11 @@ mod tests {
         let refused = registry.connect(&identity, "host1", None, None, true).await;
         assert_eq!(refused["auth_failed"], true);
         assert_eq!(transport.calls().len(), before);
-        // Ровно шесть вызовов транспорта за две тройки отказов.
+        // Exactly six transport calls for two rounds of three failures.
         assert_eq!(before, 6);
     }
 
-    /// AC-PRF-56: пароль из заголовка не переводит профиль в отказ.
+    /// AC-PRF-56: the profile is not refused when the password came from a header.
     #[tokio::test]
     async fn header_password_does_not_refuse_profile() {
         let transport = Arc::new(FakeTransport::failing(TransportError::AuthFailed(
@@ -1814,7 +1789,7 @@ mod tests {
         assert!(!registry.is_profile_refused("alice"));
     }
 
-    /// AC-PRF-57: успешный connect сбрасывает счёт подряд идущих блокировок.
+    /// AC-PRF-57: a successful connect clears the count of back-to-back lockouts.
     #[tokio::test]
     async fn successful_connect_resets_lockout_streak() {
         let transport = Arc::new(FakeTransport::failing(TransportError::AuthFailed(
@@ -1837,12 +1812,12 @@ mod tests {
         let identity = UserIdentity::with_password("alice", "right");
         let ok = registry.connect(&identity, "host1", None, None, true).await;
         assert_eq!(ok["status"], "connected");
-        // Счёт подряд идущих блокировок пуст: следующая блокировка снова первая.
+        // The streak is empty: the next lockout is the first again.
         assert!(lock(&registry.lockout_streak).get("alice").is_none());
     }
 
-    /// AC-OBS03-1: отказ политики пишется в аудит отдельной записью с
-    /// пользователем, инструментом, кодом и причиной (TR-OBS-03).
+    /// AC-OBS03-1: a policy refusal is written to the audit as its own record with the user,
+    /// the tool, the code and the reason (TR-OBS-03).
     #[test]
     fn policy_refusal_is_audited() {
         let registry = registry(Arc::new(FakeTransport::returning(output("", "", 0))));
@@ -1858,12 +1833,12 @@ mod tests {
         assert!(text.contains("domain\\alice"), "{text}");
         assert!(text.contains("connect"), "{text}");
         assert!(text.contains("HOST_NOT_ALLOWED"), "{text}");
-        // TR-SEC-09: причина не подделывает структуру записи.
+        // TR-SEC-09: the reason does not forge the record structure.
         assert!(!text.contains("\nforged: line"), "{text}");
     }
 
-    /// AC-OBS03-1: `connect` без пароля попадает в аудит как отказ политики,
-    /// а не как отказ учётных данных.
+    /// AC-OBS03-1: a `connect` without a password lands in the audit as a policy refusal,
+    /// not as a credential failure.
     #[tokio::test]
     async fn connect_without_password_is_audited() {
         let registry = registry(Arc::new(FakeTransport::returning(output("", "", 0))));

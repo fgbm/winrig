@@ -1,15 +1,14 @@
-//! CLI `winrig`: подкоманды serve, stdio, setup, list, rotate, forget (ADR-0009).
+//! CLI `winrig`: the subcommands serve, stdio, setup, list, rotate, forget (ADR-0009).
 //!
-//! Разбор аргументов отделён от выполнения, чтобы точки входа было удобно
-//! тестировать. `setup` вводит пароль без эха, генерирует токен и печатает его
-//! ровно один раз вместе с определением MCP-сервера; по флагу записывает это
-//! определение в конфиг выбранного клиента, не трогая другие записи.
+//! Argument parsing is separate from execution so the entry points are easy to
+//! test. `setup` reads the password without echo, generates a token, and prints
+//! it exactly once with the MCP server definition; with the flag it writes that
+//! definition into the selected client's config and leaves other entries alone.
 
 use clap::{Parser, Subcommand};
 
 use crate::client_config::{Client, Scope, ServerDefinition};
 
-/// Аргументы командной строки.
 #[derive(Debug, Parser)]
 #[command(
     name = "winrig",
@@ -17,20 +16,17 @@ use crate::client_config::{Client, Scope, ServerDefinition};
     version
 )]
 pub struct Cli {
-    /// Подкоманда; без неё сервер запускается в режиме HTTP.
+    /// Subcommand; without it the server runs in HTTP mode.
     #[command(subcommand)]
     pub command: Option<Command>,
 }
 
-/// Секрет, переданный аргументом CLI.
-///
-/// `Debug` редактирует значение: аргументы попадают в сообщения об ошибках,
-/// журналы и `ps`, и секрет не должен утекать ни туда, ни туда (DR-4).
+/// `Debug` redacts the value: arguments reach error messages, logs, and `ps`,
+/// and the secret must not leak into any of them (DR-4).
 #[derive(Clone)]
 pub struct SecretArg(String);
 
 impl SecretArg {
-    /// Значение секрета.
     #[must_use]
     pub fn expose(&self) -> &str {
         &self.0
@@ -51,7 +47,6 @@ impl std::str::FromStr for SecretArg {
     }
 }
 
-/// Подкоманды `winrig`.
 // User-facing text lives in explicit attributes, so doc comments never reach `--help`.
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -141,10 +136,8 @@ pub enum Command {
     },
 }
 
-/// Строит определение MCP-сервера для печати и записи.
-///
-/// Каталоги профилей и состояния передаются клиенту, чтобы сервер нашёл профиль
-/// даже при нестандартном расположении (ADR-0009).
+/// The profile and state directories are passed to the client so the server
+/// finds the profile even at a non-standard location (ADR-0009).
 #[must_use]
 pub fn server_definition(
     binary: std::path::PathBuf,
@@ -166,26 +159,22 @@ pub fn server_definition(
     }
 }
 
-/// Разбирает клиента записи конфига.
-///
 /// # Errors
 ///
-/// Текст ошибки с перечнем допустимых имён.
+/// An error text that lists the accepted names.
 pub fn parse_client(value: &str) -> Result<Client, String> {
     Client::parse(value).ok_or_else(|| {
         format!("unknown client {value:?}; expected one of opencode, claude-code, codex, cursor")
     })
 }
 
-/// Разбирает `--allowed-hosts` в значение `WINRIG_ALLOWED_HOSTS` (TR-PRF-17).
-///
-/// Грамматика та же, что у переменной (`policy::parse_allowed_hosts`). Флаг,
-/// заданный без единого хоста, — ошибка: без флага сервер и так разрешает
-/// только loopback.
+/// The grammar matches the variable's (`policy::parse_allowed_hosts`); the
+/// result feeds `WINRIG_ALLOWED_HOSTS` (TR-PRF-17). A flag given with no host
+/// is an error: without the flag the server allows only loopback anyway.
 ///
 /// # Errors
 ///
-/// Текст ошибки, называющий флаг и ожидаемую форму.
+/// An error text that names the flag and the expected form.
 pub fn parse_allowed_hosts(value: &str) -> Result<String, String> {
     let refuse = |detail: String| {
         format!(
@@ -201,11 +190,11 @@ pub fn parse_allowed_hosts(value: &str) -> Result<String, String> {
     Ok(entries.join(","))
 }
 
-/// Разбирает уровень записи конфига из флага `--scope` (ADR-0012).
+/// Config-write level from the `--scope` flag (ADR-0012).
 ///
 /// # Errors
 ///
-/// Текст ошибки с перечнем допустимых значений.
+/// An error text that lists the accepted values.
 pub fn parse_scope(value: &str) -> Result<Scope, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "global" | "g" => Ok(Scope::Global),
@@ -220,7 +209,7 @@ pub fn parse_scope(value: &str) -> Result<Scope, String> {
 mod tests {
     use super::*;
 
-    /// AC-PRF-68: список приводится к той форме, которую читает сервер.
+    /// AC-PRF-68: the list is normalized to the form the server reads.
     #[test]
     fn allowed_hosts_are_normalized() {
         assert_eq!(
@@ -231,7 +220,7 @@ mod tests {
         assert_eq!(parse_allowed_hosts("a,,b").as_deref(), Ok("a,b"));
     }
 
-    /// AC-PRF-68: неверный список отвергается с именем флага и формой.
+    /// AC-PRF-68: a malformed list is refused with the flag name and the form.
     #[test]
     fn malformed_allowed_hosts_name_the_flag() {
         for raw in ["", " , ", "*.corp.example", "host one", "host\\x", "."] {

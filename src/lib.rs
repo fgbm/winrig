@@ -1,8 +1,8 @@
-//! `winrig` — MCP-сервер удалённого администрирования Windows по WinRM/NTLM.
+//! `winrig` is an MCP server for remote administration of Windows hosts over WinRM/NTLM.
 //!
-//! Границы модулей зафиксированы в ADR-0003: конфигурация, политика и
-//! исполнение отделены от транспорта и тестируются без Windows-хоста.
-//! Профиль учётной записи и CLI-настройка введены ADR-0009.
+//! ADR-0003 fixes the module boundaries: configuration, policy and execution stay
+//! separate from the transport and are tested without a Windows host. ADR-0009
+//! introduced the account profile and the CLI setup.
 
 pub mod app;
 pub mod auth;

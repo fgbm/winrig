@@ -6,6 +6,19 @@ A release goes out under the tag `vX.Y.Z`; the tag starts `.github/workflows/rel
 
 ## Unreleased
 
+### Added
+
+- The bilingual documentation site on GitHub Pages.
+- The Russian README (`README.ru.md`).
+- The style guides and the Vale check.
+- The comment check.
+
+### Changed
+
+- The repository text is English by ASD-STE100 (ADR-0016).
+- The tool descriptions, the parameter descriptions and the CLI help are rewritten in STE.
+- The confirmation form describes its field in English.
+
 ## [0.2.0] - 2026-09-22
 
 Safe defaults and protected host roots (ADR-0015, slice W22). The release breaks compatibility: before an update read the "Changed" section.

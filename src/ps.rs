@@ -1326,6 +1326,22 @@ pub fn list_processes(name_filter: &str, sort_by: &str, top: i64) -> String {
     )
 }
 
+/// The name, the executable path and the start time of one process (TR-SEC-17).
+///
+/// The command line is never fetched, so it can carry no secret to the prompt or
+/// the audit (DR-4). A missing process gives an honest object, not an empty one.
+#[must_use]
+pub fn process_details(pid: i64) -> String {
+    format!(
+        "$c = Get-CimInstance Win32_Process -Property Name,ExecutablePath,CreationDate \
+         -Filter \"ProcessId={pid}\" -ErrorAction SilentlyContinue; \
+         if ($c) {{ [PSCustomObject]@{{ Name=$c.Name; \
+         ExecutablePath=if($c.ExecutablePath){{$c.ExecutablePath}}else{{'N/A'}}; \
+         Started=if($c.CreationDate){{$c.CreationDate.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ',[Globalization.CultureInfo]::InvariantCulture)}}else{{'N/A'}} }} \
+         | ConvertTo-Json -Compress }} else {{ 'process not found' }}"
+    )
+}
+
 #[must_use]
 pub fn get_system_info() -> String {
     "$os = Get-CimInstance Win32_OperatingSystem; \
@@ -4333,7 +4349,7 @@ mod tests {
         // The service tools refuse a name outside the allowed charset, so they are
         // covered with a valid name; the charset guard is tested on its own.
         let service = "Spooler";
-        vec![
+        let mut commands = vec![
             list_directory(text),
             find_files(text, text, 5, true),
             read_file(text, 1, 10, false, "UTF8", "").expect("valid"),
@@ -4398,8 +4414,16 @@ mod tests {
             stop_service_verified(service, false, 15, "Manual").expect("valid"),
             stop_service_verified(service, true, 15, "Manual").expect("valid"),
             list_processes(text, "memory", 10),
+            process_details(1),
             get_registry(text, text, false, 1),
             get_registry(text, text, true, 2),
+            registry_value_presence(text, text),
+            get_system_info(),
+            get_disk_space(),
+            get_network_config(),
+            get_certificates("LocalMachine", 30).expect("valid"),
+            get_local_users(),
+            get_security_context(),
             get_environment_variables(text, "machine").expect("valid"),
             test_network(text, 443),
             get_tcp_connections("established", 1, 0, text, false).expect("valid"),
@@ -4423,7 +4447,11 @@ mod tests {
             write_scan(text),
             delete_file_scan(text),
             delete_directory_scan(text, 10),
-        ]
+        ];
+        // write_plan returns every command of a whole plan, so the plan is
+        // flattened into the list.
+        commands.extend(write_plan(text, text, text, "utf8", 1_000_000).expect("valid"));
+        commands
     }
 
     /// Injection: free text that enters a PowerShell single-quoted string must

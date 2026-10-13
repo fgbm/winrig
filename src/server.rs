@@ -350,14 +350,7 @@ impl WinrigServer {
         session_id: &str,
         pid: i64,
     ) -> serde_json::Value {
-        let command = format!(
-            "$c = Get-CimInstance Win32_Process -Property Name,ExecutablePath,CreationDate \
-             -Filter \"ProcessId={pid}\" -ErrorAction SilentlyContinue; \
-             if ($c) {{ [PSCustomObject]@{{ Name=$c.Name; \
-             ExecutablePath=if($c.ExecutablePath){{$c.ExecutablePath}}else{{'N/A'}}; \
-             Started=if($c.CreationDate){{$c.CreationDate.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ',[Globalization.CultureInfo]::InvariantCulture)}}else{{'N/A'}} }} \
-             | ConvertTo-Json -Compress }} else {{ 'process not found' }}"
-        );
+        let command = ps::process_details(pid);
         let reply = self
             .run_value(identity, session_id, &command, "list_processes")
             .await;

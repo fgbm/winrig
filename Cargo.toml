@@ -57,15 +57,15 @@ subtle = "2"
 http = "1.5.0"
 schemars = "1"
 tokio-util = "0.7.19"
-# CLI: подкоманды и ввод пароля без эха.
+# CLI: subcommands and password input without echo.
 clap = { version = "4.6", features = ["derive"] }
 rpassword = "7.5"
-# Профиль: аутентифицированное шифрование пароля ключом из токена (ADR-0009).
+# Profile: authenticated encryption of the password with a key from the token (ADR-0009).
 chacha20poly1305 = "0.11"
 zeroize = "1.9"
 rand = "0.10"
-# Кроссплатформенные каталоги конфигурации и состояния (ADR-0009).
-# `directories` отвергнут cargo-deny: тянет MPL-2.0 `option-ext`.
+# Cross-platform configuration and state directories (ADR-0009).
+# `directories` is rejected by cargo-deny: it pulls in MPL-2.0 `option-ext`.
 platform-dirs = "0.3"
 hkdf = "0.13"
 
@@ -75,8 +75,8 @@ unsafe_code = "forbid"
 [lints.clippy]
 all = "warn"
 
-# Один статический бинарь без контейнера: агрессивная оптимизация размера
-# уместна, память и так мала.
+# One static binary with no container: aggressive size optimization is
+# appropriate, since the memory is small anyway.
 [profile.release]
 opt-level = 3
 lto = "fat"
@@ -85,8 +85,9 @@ strip = "symbols"
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
-# Только для тестов: пара транспортов в памяти (`tokio::io::duplex`) и роль
-# клиента MCP, чтобы прогнать вызов инструмента и канал подтверждения (DR-5).
-# Резолвер edition 2024 не подмешивает эти фичи в release-сборку бинаря.
+# Tests only: a pair of in-memory transports (`tokio::io::duplex`) and the
+# MCP client role, to run a tool call and the confirmation channel (DR-5).
+# The edition 2024 resolver does not add these features to the release build of
+# the binary.
 tokio = { version = "1", features = ["io-util"] }
 rmcp = { version = "3.4.0", features = ["client"] }

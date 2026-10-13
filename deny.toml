@@ -1,6 +1,6 @@
-# cargo-deny: лицензии и источники зависимостей.
-# Список лицензий собран из `cargo metadata` текущего Cargo.lock; ослаблять
-# его без записи в ADR не следует.
+# cargo-deny: licenses and dependency sources.
+# The license list is collected from `cargo metadata` of the current Cargo.lock;
+# do not relax it without a record in an ADR.
 
 [licenses]
 version = 2
@@ -17,8 +17,8 @@ allow = [
     "BSL-1.0",
     "MIT-0",
 ]
-# Лицензии в lock-файле выражены разными формами записи (`MIT/Apache-2.0`,
-# `MIT OR Apache-2.0`); доверяем SPDX-выражению целиком.
+# The licenses in the lock file use different notations (`MIT/Apache-2.0`,
+# `MIT OR Apache-2.0`); we trust the whole SPDX expression.
 confidence-threshold = 0.9
 
 [bans]

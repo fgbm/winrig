@@ -1,0 +1,19 @@
+# STE rule: one word for one concept, no phrasal verbs, project terms.
+extends: substitution
+message: "Use '%s' instead of '%s'."
+level: error
+ignorecase: true
+swap:
+  utilize: use
+  in order to: to
+  set up: configure
+  carry out: do
+  find out: learn
+  whitelist: allowlist
+  blacklist: denylist
+  config: configuration
+  folder: directory
+  allow-list: allowlist
+  audit trail: audit log
+  remote server: host
+  mutating: modifying

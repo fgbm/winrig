@@ -1,0 +1,7 @@
+# Project rule: use "must" for a requirement.
+extends: existence
+message: "Use 'must' for a requirement, or tell the reason for a recommendation. Do not use '%s'."
+level: warning
+ignorecase: true
+tokens:
+  - should

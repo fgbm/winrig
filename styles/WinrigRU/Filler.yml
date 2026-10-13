@@ -1,0 +1,8 @@
+# Правило: без слов-паразитов.
+extends: existence
+message: "Уберите «%s»."
+level: error
+ignorecase: true
+nonword: true
+tokens:
+  - '(?:^|[^\p{L}])(?:просто|легко|очевидно|пожалуйста)(?:[^\p{L}]|$)'

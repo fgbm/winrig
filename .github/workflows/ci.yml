@@ -10,6 +10,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  VALE_VERSION: 3.24.0
 
 jobs:
   quality:
@@ -69,3 +70,17 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  # The style job lints the Markdown that is already English. The translation
+  # commits extend the path list.
+  vale:
+    name: Style (Vale)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Vale
+        run: |
+          curl -sfL "https://github.com/errata-ai/vale/releases/download/v${VALE_VERSION}/vale_${VALE_VERSION}_Linux_64-bit.tar.gz" | tar xz -C "$RUNNER_TEMP" vale
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Check text
+        run: vale --minAlertLevel=error docs/style docs/adr/0016-documentation-language-and-style.md

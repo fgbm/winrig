@@ -1,212 +1,212 @@
-# docs/REQUIREMENTS.md — требования и критерии приёмки
+# docs/REQUIREMENTS.md — requirements and acceptance criteria
 
-Артефакт переносит в репозиторий `winrig` требования и критерии приёмки Python-версии. Идентификаторы `TR-*` и `AC-*` — стабильные.
+This artifact moves the requirements and the acceptance criteria of the Python version into the `winrig` repository. The identifiers `TR-*` and `AC-*` are stable.
 
 ## 1. Goal
 
-Сервер выполняет операции предсказуемо и безопасно: не создаёт риска блокировки доменных учёток, не раскрывает секреты, не позволяет обойти защиту разрушительных операций, не деградирует под одним долгим запросом.
+The server does its operations in a predictable and safe way. It does not create a lockout risk for domain accounts. It does not expose secrets. It does not permit a bypass of the protection of destructive operations. One long request does not degrade the server.
 
-## 2. Требования
+## 2. Requirements
 
-| ID | Требование |
+| ID | Requirement |
 |---|---|
-| TR-SEC-01 | Заведомо отклонённый пароль не предъявляется повторно в окне блокировки; отказ без обращения к AD |
-| TR-SEC-02 | Секрет и его производные формы не попадают в логи, аудит и конфигурацию. Аудит — безусловно и при любой длине (DR-4); порог `WINRIG_SECRET_REDACT_MIN_LENGTH` ограничивает только правку ответа агенту |
-| TR-SEC-03 | Редактирование не искажает вывод при коротком/пустом секрете |
-| TR-SEC-04 | Рекурсивное удаление отказывает для корней, системных каталогов и точек повторной обработки в любой форме записи пути, включая вложенные точки и момент удаления. Системные каталоги защищаются и по фактическому расположению на хосте: удаление файла и каталога отвергает путь внутри корней из переменных `SystemRoot`, `ProgramFiles`, `ProgramFiles(x86)`, `ProgramData` и родителя `PUBLIC`; путь с 8.3-именем отвергается, административный шар `\\host\C$` проверяется как `C:` (ADR-0015) |
-| TR-SEC-05 | Множество разрешённых хостов настраивается; недопустимый порт отвергается. Умолчание — TR-SEC-14 |
-| TR-SEC-06 | Понижение проверки TLS управляется конфигурацией и по умолчанию запрещено: `verify_cert=false` принимается только при явном `WINRIG_ALLOW_INSECURE_TLS=true` (ADR-0015) |
-| TR-SEC-07 | Идентичность — по текущему запросу; кэши изолированы по пользователю; имя учётной записи канонизируется по регистру |
-| TR-SEC-08 | Заголовки произвольного HTTP-запроса, включая авторизационные, редактируются в аудите. Требование относится к непортированному `invoke_http_request` и пока не имеет покрытия; см. ROADMAP |
-| TR-SEC-09 | Поля аудита и текст подтверждения не позволяют подделать свою структуру |
-| TR-SEC-10 | Отвергнутый хостом запрос отделён от отказа учётных данных: он не сбрасывает кэш пароля и не двигает счётчик блокировки. Пустой `HTTP 500` объясняется как отказ в нешифрованном сообщении |
-| TR-REL-01 | Один запрос не блокирует обслуживание остальных |
-| TR-REL-02 | Снимок производительности работает при любой локали |
-| TR-REL-03 | Неизвестный уровень журнала событий отвергается, а не расширяет выборку |
-| TR-REL-04 | Фильтр по источнику не теряет события из-за лимита до фильтра |
-| TR-REL-05 | Отсутствие текста события не приводит к ошибке |
-| TR-REL-06 | Литеральные пути со служебными символами не трактуются как шаблон |
-| TR-REL-07 | Невалидная конфигурация даёт понятный отказ при старте |
-| TR-REL-08 | Запрос подтверждения не висит бесконечно: истечение таймаута — отказ (fail-closed) |
-| TR-SEC-11 | `WINRIG_CONFIRM_FALLBACK=proceed` выполняет модифицирующую операцию без подтверждения только когда клиент не объявил elicitation; отказ пользователя, отмена, таймаут и ошибка транспорта не обходятся никогда, а аудит помечает операцию как прошедшую без подтверждения. Не реализовано — срез W16 |
-| TR-SEC-12 | Значение внутри PowerShell-строки в одинарных кавычках удваивает каждый из пяти символов, которые PowerShell считает одинарной кавычкой: `'` U+0027, `‘` U+2018, `’` U+2019, `‚` U+201A, `‛` U+201B. Требование касается генераторов `src/ps.rs` и скриптов, собираемых в `src/server.rs` (ADR-0015) |
-| TR-SEC-13 | На пути по заголовкам `connect` открывает сессию только паролем из `X-AD-Password` того же запроса; закэшированный пароль по имени сессию не открывает. Отказ не обращается к транспорту и не двигает счётчик блокировки. Путь профиля не меняется (ADR-0015) |
-| TR-SEC-14 | Пустой `WINRIG_ALLOWED_HOSTS` разрешает только loopback-литералы: `localhost`, `127.0.0.0/8`, `::1`; DNS не разрешается. Отдельный элемент `*` разрешает любой хост. Хост, который не является именем, IP-адресом или IPv6 в скобках, отвергается при любом списке. Неверный элемент списка отказывает старту (ADR-0015) |
-| TR-FS-01 | `write_file` выключен по умолчанию (`WINRIG_ALLOW_FILE_WRITE`) и в выключенном виде не объявляется агенту. |
-| TR-FS-02 | Запись по защищённому пути отвергается до обращения к хосту, тем же списком, что охраняет удаление. |
-| TR-FS-03 | Перезапись существующего файла только при явном `overwrite`. |
-| TR-FS-04 | Содержимое сверх `WINRIG_MAX_WRITE_BYTES` отвергается внятным отказом до обращения к хосту. |
-| TR-FS-05 | Запись идёт кусками не больше 2000 байт (предел командной строки WinRS) во временный файл, и цель заменяется переименованием: отказ на середине не оставляет обрезанный файл на месте целевого. |
-| TR-FS-06 | Запись отвергает путь, который хост разрешает внутрь защищённого корня из своих системных переменных (как в TR-SEC-04), в любом из двух разрешений: .NET для кусков и PowerShell для замены цели. Скан, который не выполнился, не разобран или вернул пустой `SystemRoot`, — отказ (ADR-0015) |
-| TR-EXE-01 | `run_command` выключен по умолчанию (`WINRIG_ALLOW_COMMAND_EXEC`) и в выключенном виде не объявляется агенту. Не реализовано — срез W16 |
-| TR-EXE-02 | Команда вне непустого `WINRIG_ALLOWED_COMMANDS` отвергается до обращения к хосту. Список защищает от случайной команды, но не от намерения: вместе с `write_file` он обходится запуском положенного скрипта (ADR-0013 §18). Не реализовано — срез W16 |
-| TR-EXE-03 | Выполнение требует подтверждения. Отсутствие канала подтверждения — отказ, если оператор не выбрал `WINRIG_CONFIRM_FALLBACK=proceed`. Не реализовано — срез W16 |
-| TR-EXE-04 | В подтверждении показан полный текст команды, без усечения. Не реализовано — срез W16 |
-| TR-REL-09 | Канал подтверждения и вызов инструментов проверяются исполняемым тестом через MCP, а не чтением кода: согласие выполняет операцию, отказ и отсутствие канала — нет. Покрыта одна площадка `require_confirmation!` из десяти; макрос един, поэтому остальные держатся на нём, а не на отдельной проверке |
-| TR-OBS-01 | Аудит содержит инициатора, хост, действие, результат, длительность; секретов нет. Длительность пока не записывается — вынесено в ROADMAP |
-| TR-OBS-02 | Редактирование и защита путей покрыты автотестами |
-| TR-OBS-03 | Отказ политики до обращения к хосту — хост, порт, TLS, отсутствие `X-AD-Password`, защищённый или отвергнутый путь записи и удаления — пишется в аудит записью `POLICY REFUSED` с пользователем, инструментом, кодом и причиной, без секретов (ADR-0015) |
-| TR-PRF-01 | `setup` запрашивает имя AD (канонизируется как в `identity`) и пароль без эха, генерирует случайный токен и печатает его ровно один раз |
-| TR-PRF-02 | На диске в каталоге профилей лежит только аутентифицированный шифртекст; ключ выводится из токена и на сервере не хранится |
-| TR-PRF-03 | Старт требует хотя бы один секрет; совпадение `WINRIG_AUTH_TOKEN` с токеном профиля отказывает старту |
-| TR-PRF-04 | Один файл профиля на профиль, выбор по имени; при единственном профиле имя необязательно, при нескольких без имени — отказ |
-| TR-PRF-05 | stdio-режим берёт идентичность из профиля и токен из `WINRIG_TOKEN`; stdout содержит только JSON-RPC |
-| TR-PRF-06 | HTTP-режим принимает токен профиля (идентичность профиля, `X-AD-*` игнорируются) либо `WINRIG_AUTH_TOKEN` (требует `X-AD-User`) |
-| TR-PRF-07 | Проверка токена после первой расшифровки не дороже константного сравнения |
-| TR-PRF-08 | Процесс держит lock-файл в каталоге состояния профиля; второй процесс с тем же профилем отказывает |
-| TR-PRF-09 | Журналы без `WINRIG_LOG_DIR` идут в каталог состояния ОС в подкаталог профиля |
-| TR-PRF-10 | Кэш, TTL, блокировка и редакция секретов работают для пароля из профиля как для заголовка; вторая блокировка подряд переводит профиль в отказ |
-| TR-PRF-11 | `serve` принимает токены аргументами `--token`/`--auth-token`, перекрывающими окружение; секрет не попадает в диагностику |
-| TR-PRF-12 | Учётная запись `DOMAIN\user` делится на имя и домен до NTLM; UPN и голое имя не делятся, регистр не меняется |
-| TR-PRF-13 | `setup --write-config` требует уровень `--scope global|project`: без флага уровень спрашивается в терминале, в неинтерактивном запуске запись отказывает; project-уровень пишется в корень проекта |
-| TR-PRF-14 | `setup --write-config` не создаёт вторую запись на тот же профиль: существующая обновляется на месте с сохранением ключа; ключ задаётся явно через `--server-name` |
-| TR-PRF-15 | `WINRIG_STATE_DIR` в записи клиента — корень каталога состояния: каталог профиля собирается ровно один раз, и токен лежит в нём же |
-| TR-PRF-16 | Учётная запись без `\` и без `@` не создаёт профиль молча: отказ называет ожидаемую форму `DOMAIN\user` |
-| TR-PRF-17 | `setup` принимает `--allowed-hosts` с грамматикой `WINRIG_ALLOWED_HOSTS` и пишет переменную в запись каждого клиента; повторный `setup` без флага её убирает; неверный список отвергается с именем флага (ADR-0015) |
-| TR-AD-01 | AD-инструмент выполняется только на хосте с ролью контроллера домена; на рядовом хосте — отказ, называющий причину, а не ошибка каталога. Не реализовано — срез W19 |
-| TR-AD-02 | Значение из аргумента не может изменить структуру LDAP-фильтра: экранирование по RFC 4515 предшествует экранированию PowerShell. Не реализовано — срез W19 |
-| TR-AD-03 | Число возвращаемых объектов ограничено сверху; достижение потолка названо в ответе, а не молча обрезано. Не реализовано — срез W19 |
-| TR-AD-04 | Разбор не зависит от локали хоста: время форматируется кодом, роль и состояние учётной записи читаются числом и битами, состояние репликации берётся классами `System.DirectoryServices.ActiveDirectory`, а не разбором вывода `repadmin`/`dcdiag`. Не реализовано — срез W19 |
-| TR-AD-05 | Инструменты первой волны только читают: ни один из них не меняет каталог. Не реализовано — срез W19 |
-| TR-AD-06 | Запись в каталог выключена по умолчанию (`WINRIG_ALLOW_AD_WRITE`); в выключенном виде инструменты записи не объявляются агенту. Не реализовано — срез W20 |
-| TR-AD-07 | Каждая запись требует подтверждения (DR-5); в тексте подтверждения стоит DN объекта, а не `sAMAccountName`. Не реализовано — срез W20 |
-| TR-AD-08 | Модификация адресует ровно один объект, названный явно; изменение по фильтру или по результату поиска не поддерживается. Не реализовано — срез W20 |
-| TR-AD-09 | Защищённые объекты отвергаются до обращения к хосту: `krbtgt`, встроенный `Administrator`, Domain/Enterprise/Schema Admins и прочие объекты с `adminCount=1`, контейнер Domain Controllers, сам объект домена. Не реализовано — срез W20 |
-| TR-AD-10 | Запись в `ntSecurityDescriptor`, `sIDHistory`, `msDS-AllowedToActOnBehalfOfOtherIdentity`, `servicePrincipalName`, в `unicodePwd` минуя инструмент пароля и в `member`/`memberOf` минуя инструмент членства запрещена безусловно и никаким списком не открывается. Не реализовано — срез W21 |
-| TR-AD-11 | Запись атрибута вне непустого `WINRIG_AD_WRITABLE_ATTRIBUTES` отвергается до обращения к хосту. Пустой список означает «любой атрибут, кроме запрещённых TR-AD-10» и прямо назван как отказ оператора от остальных гарантий. Не реализовано — срез W21 |
-| TR-AD-12 | Пароль из аргумента редактируется в ответе и безусловно в аудите (DR-4). Остаточная экспозиция названа в документации: пароль попадает в журналы самого контроллера домена, и winrig на это не влияет. Не реализовано — срез W20 |
-| TR-AD-13 | Смена пароля и создание учётной записи требуют защищённого канала до контроллера домена; нешифрованное соединение — отказ. Не реализовано — срез W20 |
-| TR-AD-14 | Создание учётной записи требует явно указанного OU и создаёт учётку отключённой, пока пароль не установлен. Не реализовано — срез W20 |
-| TR-AD-15 | Аудит записи фиксирует DN, имя атрибута, прежнее и новое значение. Не реализовано — срез W20 |
-| TR-AD-16 | Инструменты обслуживания только читают; изменение топологии (захват роли FSMO, чистка метаданных, принудительная репликация) и удаление объектов каталога в продукт не входят (ADR-0014 §12, §23) |
+| TR-SEC-01 | The server does not present a rejected password again in the lockout window. The refusal makes no call to AD |
+| TR-SEC-02 | A secret and its derived forms do not go into the logs, the audit log or the configuration. The audit log always redacts them, at any length (DR-4). The value `WINRIG_SECRET_REDACT_MIN_LENGTH` limits only the redaction of the reply to the agent |
+| TR-SEC-03 | Redaction does not change the output when the secret is short or empty |
+| TR-SEC-04 | A recursive delete refuses a volume root, a system directory and a reparse point in any form of the path, including nested points. It refuses the point at the moment of the delete too. The server protects system directories also by their real location on the host. A delete of a file or a directory rejects a path inside the host roots. The roots come from the variables `SystemRoot`, `ProgramFiles`, `ProgramFiles(x86)`, `ProgramData` and the parent of `PUBLIC`. The server rejects a path with an 8.3 name. It checks the administrative share `\\host\C$` as `C:` (ADR-0015) |
+| TR-SEC-05 | The operator configures the host allowlist. The server refuses an invalid port. The default is TR-SEC-14 |
+| TR-SEC-06 | The configuration controls the downgrade of the TLS check. The downgrade is off by default. The server accepts `verify_cert=false` only with an explicit `WINRIG_ALLOW_INSECURE_TLS=true` (ADR-0015) |
+| TR-SEC-07 | The server takes the identity from the current request. It isolates the caches by user. It folds the case of the account name |
+| TR-SEC-08 | The audit log redacts the headers of an arbitrary HTTP request, including the authorization header. The requirement applies to the unported `invoke_http_request` and has no coverage yet. See ROADMAP |
+| TR-SEC-09 | The audit fields and the confirmation text do not let a value forge their structure |
+| TR-SEC-10 | The server keeps a host refusal apart from a credential failure. The rejected request does not clear the password cache and does not move the lockout counter. The server explains an empty `HTTP 500` as a refusal of an unencrypted message |
+| TR-REL-01 | One request does not block the service of the other requests |
+| TR-REL-02 | The performance snapshot works with any locale |
+| TR-REL-03 | The server rejects an unknown event log level. It does not extend the selection |
+| TR-REL-04 | A filter by source does not lose events because of the limit before the filter |
+| TR-REL-05 | A missing event text does not cause an error |
+| TR-REL-06 | The server does not treat a literal path with special characters as a pattern |
+| TR-REL-07 | An invalid configuration gives a clear refusal at startup |
+| TR-REL-08 | A confirmation request does not wait without limit. A timeout is a refusal (fail-closed) |
+| TR-SEC-11 | `WINRIG_CONFIRM_FALLBACK=proceed` does a modifying operation without confirmation only when the client did not declare elicitation. A user refusal, a cancel, a timeout and a transport error are never bypassed. The audit log marks the operation as done without confirmation. Not implemented — slice W16 |
+| TR-SEC-12 | A value inside a PowerShell single-quoted string doubles each of the five characters that PowerShell counts as a single quote. These characters are `'` U+0027, `‘` U+2018, `’` U+2019, `‚` U+201A and `‛` U+201B. The requirement applies to the generators `src/ps.rs` and to the scripts that `src/server.rs` builds (ADR-0015) |
+| TR-SEC-13 | On the header path, `connect` opens a session only with the password from `X-AD-Password` of the same request. A cached password does not open a session by name. The refusal does not touch the transport and does not move the lockout counter. The profile path does not change (ADR-0015) |
+| TR-SEC-14 | An empty `WINRIG_ALLOWED_HOSTS` permits only the loopback literals `localhost`, `127.0.0.0/8` and `::1`. The server does not resolve DNS. A single element `*` permits any host. The server rejects a host that is not a name, an IP address or an IPv6 address in brackets, with any list. An invalid element of the list refuses startup (ADR-0015) |
+| TR-FS-01 | `write_file` is off by default (`WINRIG_ALLOW_FILE_WRITE`). The server does not declare the tool to the agent while it is off |
+| TR-FS-02 | The server refuses a write to a protected path before a call to the host. It uses the same list that guards a delete |
+| TR-FS-03 | An overwrite of an existing file needs an explicit `overwrite` |
+| TR-FS-04 | The server refuses content above `WINRIG_MAX_WRITE_BYTES` with a clear refusal before a call to the host |
+| TR-FS-05 | The write goes in chunks of 2000 bytes or less (the WinRS command line limit) into a temporary file. A rename replaces the target. A refusal in the middle leaves no truncated file in place of the target |
+| TR-FS-06 | A write refuses a path that the host resolves into a protected root from its system variables (as in TR-SEC-04). The refusal covers both resolutions: .NET for the chunks and PowerShell for the replacement of the target. A scan that did not run, did not parse or returned an empty `SystemRoot` is a refusal (ADR-0015) |
+| TR-EXE-01 | `run_command` is off by default (`WINRIG_ALLOW_COMMAND_EXEC`). The server does not declare the tool to the agent while it is off. Not implemented — slice W16 |
+| TR-EXE-02 | The server refuses a command outside a non-empty `WINRIG_ALLOWED_COMMANDS` before a call to the host. The list protects against an accidental command, but not against intent. A caller bypasses it: it writes a script with `write_file` and runs it (ADR-0013 §18). Not implemented — slice W16 |
+| TR-EXE-03 | Execution needs confirmation. A missing confirmation channel is a refusal, unless the operator chose `WINRIG_CONFIRM_FALLBACK=proceed`. Not implemented — slice W16 |
+| TR-EXE-04 | The confirmation shows the full text of the command, without truncation. Not implemented — slice W16 |
+| TR-REL-09 | A test that runs through MCP checks the confirmation channel and the tool call, not a code reading. A yes does the operation. A refusal and a missing channel do not. One of the ten call sites of `require_confirmation!` has coverage. The macro is the same, so the other sites depend on it and not on a separate check |
+| TR-OBS-01 | The audit log holds the initiator, the host, the action, the result and the duration. It holds no secrets. The server does not record the duration yet. The item is in ROADMAP |
+| TR-OBS-02 | Automated tests cover redaction and path protection |
+| TR-OBS-03 | The audit log records a policy refusal before a call to the host with the entry `POLICY REFUSED`. The refusal covers the host, the port, TLS, a missing `X-AD-Password`, and a protected or rejected path of a write and a delete. The entry holds the user, the tool, the code and the reason, without secrets (ADR-0015) |
+| TR-PRF-01 | `setup` asks for the AD name (the server canonicalizes it as in `identity`) and for the password without echo. It generates a random profile token and prints it exactly one time |
+| TR-PRF-02 | Only authenticated ciphertext lies on the disk in the profile directory. The key comes from the profile token and the server does not store it |
+| TR-PRF-03 | Startup needs at least one secret. A match of `WINRIG_AUTH_TOKEN` with the profile token refuses startup |
+| TR-PRF-04 | One profile file exists for each profile. The operator selects it by name. With a single profile the name is optional. With several profiles and no name the server refuses |
+| TR-PRF-05 | The stdio mode takes the identity from the profile and the profile token from `WINRIG_TOKEN`. stdout holds only JSON-RPC |
+| TR-PRF-06 | The HTTP mode accepts a profile token (the identity of the profile; the server ignores `X-AD-*`) or `WINRIG_AUTH_TOKEN` (which needs `X-AD-User`) |
+| TR-PRF-07 | A profile token check after the first decryption costs no more than a constant comparison |
+| TR-PRF-08 | The process holds a lock file in the state directory of the profile. A second process with the same profile refuses |
+| TR-PRF-09 | Without `WINRIG_LOG_DIR` the logs go into the state directory of the OS, in a subdirectory of the profile |
+| TR-PRF-10 | The cache, the TTL, the lockout and the redaction of secrets work for a profile password as for a header. A second lockout in a row puts the profile into a refusal |
+| TR-PRF-11 | `serve` accepts tokens with the arguments `--token`/`--auth-token`, which override the environment. A secret does not go into diagnostics |
+| TR-PRF-12 | The server splits the account `DOMAIN\user` into a name and a domain before NTLM. It does not split a UPN or a bare name. It does not change the case |
+| TR-PRF-13 | `setup --write-config` needs the level `--scope global|project`. Without the flag the tool asks for the level in the terminal. In a non-interactive run the write refuses. The project level writes to the root of the project |
+| TR-PRF-14 | `setup --write-config` does not create a second entry for the same profile. It updates the existing entry in place and keeps the key. The operator sets the key explicitly with `--server-name` |
+| TR-PRF-15 | `WINRIG_STATE_DIR` in the client entry is the root of the state directory. `setup` builds the profile directory exactly one time. The profile token lies in that directory |
+| TR-PRF-16 | An account without `\` and without `@` does not create a profile in silence. The refusal names the expected form `DOMAIN\user` |
+| TR-PRF-17 | `setup` accepts `--allowed-hosts` with the grammar of `WINRIG_ALLOWED_HOSTS`. It writes the variable into the entry of each client. A second `setup` without the flag removes it. The server rejects an invalid list with the name of the flag (ADR-0015) |
+| TR-AD-01 | An AD tool runs only on a host with the domain controller role. On a host that is a domain member the tool refuses and names the reason, instead of a directory error. Not implemented — slice W19 |
+| TR-AD-02 | A value from an argument cannot change the structure of the LDAP filter. The escape of RFC 4515 comes before the escape of PowerShell. Not implemented — slice W19 |
+| TR-AD-03 | A top limit bounds the number of returned objects. The answer names the reached ceiling. The tool does not cut the list in silence. Not implemented — slice W19 |
+| TR-AD-04 | The parse does not depend on the locale of the host. The code formats the time. The tool reads the role and the state of the account as a number and as bits. The replication state comes from the classes `System.DirectoryServices.ActiveDirectory`, not from a parse of the output of `repadmin`/`dcdiag`. Not implemented — slice W19 |
+| TR-AD-05 | The tools of the first wave only read. None of them changes the directory. Not implemented — slice W19 |
+| TR-AD-06 | A write to the directory is off by default (`WINRIG_ALLOW_AD_WRITE`). The server does not declare the modifying tools to the agent while they are off. Not implemented — slice W20 |
+| TR-AD-07 | Each write needs confirmation (DR-5). The confirmation text holds the DN of the object, not the `sAMAccountName`. Not implemented — slice W20 |
+| TR-AD-08 | A modification addresses exactly one object, named explicitly. The server does not support a change by a filter or by a search result. Not implemented — slice W20 |
+| TR-AD-09 | The server rejects protected objects before a call to the host. The list holds `krbtgt`, the built-in `Administrator`, Domain/Enterprise/Schema Admins and other objects with `adminCount=1`. It holds the Domain Controllers container and the domain object itself. Not implemented — slice W20 |
+| TR-AD-10 | A write to `ntSecurityDescriptor`, `sIDHistory`, `msDS-AllowedToActOnBehalfOfOtherIdentity` or `servicePrincipalName` is forbidden without a condition. A write to `unicodePwd` that bypasses the password tool is forbidden without a condition. A write to `member`/`memberOf` that bypasses the membership tool is forbidden without a condition. No list opens them. Not implemented — slice W21 |
+| TR-AD-11 | The server refuses a write of an attribute outside a non-empty `WINRIG_AD_WRITABLE_ATTRIBUTES` before a call to the host. An empty list means any attribute except those forbidden by TR-AD-10. The documentation names the empty list as a refusal by the operator of the other guarantees. Not implemented — slice W21 |
+| TR-AD-12 | The server redacts a password from an argument in the reply and always in the audit log (DR-4). The documentation names the remaining exposure: the password goes into the logs of the domain controller itself. winrig does not control that. Not implemented — slice W20 |
+| TR-AD-13 | A password change and an account creation need a secure channel to the domain controller. An unencrypted connection is a refusal. Not implemented — slice W20 |
+| TR-AD-14 | An account creation needs an explicit OU and makes the account disabled until the operator sets a password. Not implemented — slice W20 |
+| TR-AD-15 | The audit log of a write records the DN, the name of the attribute, the old value and the new value. Not implemented — slice W20 |
+| TR-AD-16 | The maintenance tools only read. The product excludes a change of the topology: an FSMO role seizure, a metadata cleanup, a forced replication. It excludes a delete of directory objects (ADR-0014 §12, §23) |
 
-## 3. Критерии приёмки
+## 3. Acceptance criteria
 
-| ID | Given/When | Then | Покрытие в winrig |
+| ID | Given/When | Then | Coverage in winrig |
 |---|---|---|---|
-| AC-SEC01-1 | 3 отказа, 4-й `connect` тем же паролем в окне | отказ, ноль попыток транспорта, отдельная запись аудита | `session::tests::lockout_blocks_fourth_attempt_without_transport` |
-| AC-SEC01-2 | после 3 отказов другой пароль | попытка доходит до транспорта | `session::tests::different_password_bypasses_lockout` |
-| AC-SEC01-3 | A заблокирован, B с корректным паролем | B подключается, A остаётся заблокирован | `session::tests::sessions_are_isolated_per_user` + ключ по пользователю |
-| AC-SEC01-4 | окно истекло | тот же пароль снова доходит до транспорта | `session::tests::lockout_window_expiry_allows_same_password_again` |
-| AC-SEC01-5 | тот же пользователь в другом регистре после 3 отказов | остаётся заблокирован | `identity::tests::canonical_username_folds_case` |
-| AC-SEC02-1 | секрет в команде | отсутствует в ответе агенту во всех формах; в аудите — безусловно | `session::tests::run_ps_redacts_secret_from_reply_and_audit`, `session::tests::run_ps_redacts_session_password_without_explicit_redactions`, `session::tests::command_audit_body_redacts_below_reply_threshold`, `session::tests::connect_failure_stderr_is_redacted` |
-| AC-SEC03-1 | секрет < 4 символов | вывод не искажён | `executor::tests::secret_below_threshold_preserves_output` |
-| AC-SEC03-2 | пустой секрет | редактирование no-op | `executor::tests::empty_secret_and_empty_list_are_noops` |
-| AC-SEC04-1 | `C:/Windows`, `c:\windows\`, `\\?\C:\`, `F:\`, корень UNC | решение политики — отказ (что инструмент его вызывает, доказано чтением кода, не тестом) | `policy::tests::protected_*`, `policy::tests::delete_scan_refuses_host_resolved_protected_path` |
-| AC-SEC04-2 | ReparsePoint (junction/symlink) в корне | отказ до удаления | `policy::tests::delete_scan_refuses_reparse_point` |
-| AC-SEC04-3 | ReparsePoint внутри поддерева | отказ до удаления и повторная проверка в команде удаления | `policy::tests::delete_scan_refuses_nested_reparse_point`, генератор `delete_directory` |
-| AC-SEC04-4 | путь без расширения разрешился в каталог (`delete_file`) | отказ | `policy::tests::file_delete_refuses_directory_and_protected_path` |
-| AC-SEC05-1 | allowlist пуст | разрешены только loopback-литералы; удалённый хост и имя, лишь разрешающееся в loopback, отвергаются до сети | `policy::tests::empty_allowlist_admits_only_loopback_literals`, `tests/tool_calls.rs::default_allowlist_refuses_remote_host_before_network` |
-| AC-SEC05-5 | хост `evil.com/.corp.example`, `evil.com?.corp.example`, `x.corp.example@evil.com`, `evil.com:5985`, не-ASCII имя при любом списке, включая `*` | отказ до сети, причина — «не имя и не IP» | `policy::tests::malformed_host_is_refused_by_any_allowlist` |
-| AC-SEC05-6 | `WINRIG_ALLOWED_HOSTS` или `--allowed-hosts` с элементом `*.corp.example` | старт отказывает с именем переменной, `setup` — с именем флага; грамматика одна | `policy::tests::allowed_hosts_grammar`, `config::tests::invalid_allowed_hosts_entry_refuses_startup`, `cli::tests::malformed_allowed_hosts_name_the_flag` |
-| AC-SEC05-4 | в allowlist есть `*` | разрешён любой хост; `*.domain` шаблоном не является; явный список не подмешивает loopback | `policy::tests::star_admits_any_host`, `policy::tests::explicit_list_does_not_add_loopback` |
-| AC-SEC05-2 | хост вне allowlist | отказ до сети | `policy::tests::decision_wrappers` |
-| AC-SEC05-3 | порт вне 1..65535 | отказ до сети, сессия не создана | `policy::tests::validate_port_range_and_passthrough` |
-| AC-SEC06-1 | конфигурация по умолчанию + `verify_cert=false` | отказ до сети с именем `WINRIG_ALLOW_INSECURE_TLS` | `config::tests::defaults_preserved`, `tests/tool_calls.rs::default_config_refuses_disabled_certificate_check` |
-| AC-SEC06-2 | `WINRIG_ALLOW_INSECURE_TLS=false` + `verify_cert=false` | отказ до сети | `policy::tests::tls_decisions` |
-| AC-SEC07-1 | сессия A, запрос `X-AD-User: B` | видны только объекты B | `session::tests::sessions_are_isolated_per_user` |
-| AC-SEC07-2 | запрос без `X-AD-User` на пути общего секрета | 401, инструменты не выполняются | `tests/http_gate.rs::request_with_token_but_without_user_is_rejected`, `tests/http_gate.rs::request_without_token_is_rejected` |
-| AC-SEC08-1 | `Authorization` в аудите | в аудите отсутствует | **Не проверяемо**: инструмент `invoke_http_request` не портирован (TR-SEC-08) |
-| AC-SEC09-1 | перевод строки в `X-AD-User` | аудит не подделан | `auth::tests::crlf_username_is_unsafe`; `executor::tests::escape_log_field_*` |
-| AC-SEC09-2 | перевод строки в аргументе подтверждения | диалог не подделан | `executor::tests::sanitize_prompt_value_*` |
-| AC-SEC12-1 | аргумент с любой из пяти форм одинарной кавычки | каждая форма удвоена во всех генераторах и в скриптах `server.rs`, дошедших до хоста | `ps::tests::escape_doubles_every_single_quote_form`, `ps::tests::every_generator_escapes_single_quoted_free_text`, `tests/tool_calls.rs::inline_scripts_escape_every_single_quote_form` |
-| AC-SEC13-1 | `connect` по заголовкам без `X-AD-Password`, пароль этого имени в кэше | отказ с именем заголовка, транспорт не вызван, счётчик блокировки не сдвинут, чужая сессия цела | `session::tests::header_connect_without_password_ignores_the_cached_one`, `session::tests::connect_without_password_is_refused` |
-| AC-SEC04-5 | хост разрешил путь удаления внутрь корня из своих переменных (система на `D:`) | отказ `PATH_PROTECTED`, причина называет корень | `policy::tests::delete_scans_refuse_paths_inside_host_roots`, `policy::tests::host_roots_cover_the_actual_system_location` |
-| AC-SEC04-6 | путь записи или удаления с 8.3-именем, запрошенный или разрешённый хостом | отказ `PATH_PROTECTED`, причина называет короткое имя; имена вроде `backup~old` проходят | `policy::tests::short_names_are_refused_for_write_and_delete` |
-| AC-SEC04-7 | `\\localhost\C$\Windows\...`, `\\host\ADMIN$\...`, `PRINT$`, `SYSVOL`, `NETLOGON` | шар тома защищён как `C:\Windows\...` и по корням хоста; `ADMIN$`, `PRINT$`, `SYSVOL` и `NETLOGON` защищены целиком | `policy::tests::admin_share_is_checked_as_its_local_path` |
-| AC-SEC13-2 | `connect` без пароля под именем заблокированного пользователя | ответ «нужен `X-AD-Password`», блокировка не раскрыта | `session::tests::connect_without_password_does_not_reveal_lockout` |
-| AC-SEC10-1 | `AuthFailed("HTTP 500 Internal Server Error: ")` | не отказ учётных данных; текст называет 5986 и `AllowUnencrypted` | `session::tests::empty_500_is_not_an_auth_failure` |
-| AC-SEC10-2 | `AuthFailed("HTTP 503 ...: busy")` | не отказ учётных данных; статус сохранён, подсказка не приписана | `session::tests::other_http_status_is_rejected_without_the_hint` |
-| AC-SEC10-3 | `AuthFailed("NTLM authentication rejected ...")` | остаётся отказом учётных данных | `session::tests::ntlm_rejection_stays_an_auth_failure` |
-| AC-SEC10-4 | шесть отвергнутых запросов профилем | кэш пароля цел, профиль не отвергнут, блокировка не включилась | `session::tests::rejected_request_keeps_cached_password`, `session::tests::rejected_request_never_refuses_profile` |
-| AC-FS-01 | конфигурация по умолчанию | `write_file` не объявлен и маршрута не имеет; с `WINRIG_ALLOW_FILE_WRITE=true` появляется. На проводе 37 против 38 | `config::tests::defaults_are_applied`, `config::tests::file_write_is_switched_by_the_operator`, `server::tests::write_file_is_absent_until_the_operator_enables_it`, `server::tests::disabled_write_file_has_no_route`, `tests/stdio_mode.rs::write_file_appears_only_when_enabled` |
-| AC-FS-02 | путь `C:\Windows\System32\config` | решение политики — отказ до сети, код `PATH_PROTECTED`, причина называет запись (вызов из инструмента доказан чтением кода) | `policy::tests::write_is_refused_on_protected_paths`, `policy::tests::write_refusal_names_writing`, `server::tests::policy_refuses_protected_write_before_transport` |
-| AC-FS-03 | существующий файл без `overwrite` | отказ с кодом `FILE_EXISTS`, запись не начата; создание нового и явная перезапись проходят | `policy::tests::overwrite_is_required_only_for_an_existing_file` |
-| AC-FS-06 | тело файла в команде | в аудит и ответ уходит отредактированным: редактируется аргумент `FromBase64String`, то есть ровно то, что в команде и лежит | `server::tests::base64_payload_is_extracted_for_redaction` |
-| AC-FS-04 | содержимое больше `WINRIG_MAX_WRITE_BYTES` | отказ до сети, назван фактический размер и предел; счёт в байтах, не в символах | `ps::tests::plan_refuses_content_above_the_limit`, `ps::tests::plan_counts_bytes_not_characters`, `config::tests::max_write_bytes_must_hold_at_least_one_chunk` |
-| AC-FS-05 | содержимое 5000 байт | три куска по 2000 плюс одна замена; первый кусок создаёт, прочие дописывают; кусок помещается в командную строку WinRS; цель заменяется переименованием при любой кодировке, а не пишется на месте; уборка достаёт оба временных файла; имя временного файла не повторяется между вызовами | `ps::tests::plan_splits_content_and_ends_with_one_commit`, `ps::tests::first_chunk_creates_and_the_rest_append`, `ps::tests::a_full_chunk_fits_the_winrs_command_line`, `ps::tests::commit_renames_for_utf8_and_converts_otherwise`, `ps::tests::commit_never_writes_the_target_in_place`, `ps::tests::abort_removes_the_temporary_file_quietly`, `ps::tests::abort_removes_the_staged_file_too`, `server::tests::temporary_suffix_differs_between_calls` |
-| AC-FS-07 | путь записи в любом из двух разрешений лежит внутри корня хоста; скан без корней или с пустым `SystemRoot` | отказ `PATH_PROTECTED` или отказ скана до подтверждения; обычный путь переходит к правилу перезаписи; корни читаются из переменных окружения, а не из локализованных имён | `policy::tests::write_scan_checks_both_resolutions_and_then_overwrite`, `policy::tests::write_scan_parses_and_fails_closed`, `policy::tests::host_roots_parse_and_require_system_root`, `ps::tests::scans_read_protected_roots_from_the_environment`, `ps::tests::write_scan_resolves_the_path_both_ways` |
-| AC-REL03-1 | неизвестный `level` | ошибка со списком, команда не отправлена | `ps::tests::get_event_log_rejects_unknown_level` |
-| AC-REL04-1 | источник задан | фильтр до лимита | `ps::tests::get_event_log_source_filter_does_not_precap` |
-| AC-REL05-1 | событие с пустым сообщением | инструмент не падает | PS-команда `get_event_log` ветвится по `$_.Message` (живой хост — «не проверяемо», Q-08) |
-| AC-REL06-1 | путь с `[` `]` | адресуется литерально | `-LiteralPath` во всех генераторах `ps.rs`; `ps::tests::registry_generators_use_literal_path` |
-| AC-REL07-1 | `WINRIG_LOG_LEVEL=BOGUS` | код ≠ 0, названа переменная, без traceback | `config::tests::invalid_log_level_names_variable`; код 2 проверен прогоном бинаря, автотеста нет |
-| AC-REL07-2 | нецелая целочисленная переменная | код ≠ 0, названа переменная | `config::tests::invalid_integer_names_variable` |
-| AC-REL07-3 | все переменные корректны | старт успешен | `config::tests::defaults_preserved`, `tests/http_gate.rs` (initialize проходит `/mcp`) |
-| AC-REL07-4 | `WINRIG_LOG_LEVEL=WARNING` | журнал не глушится: директива `warn` | `config::tests::log_level_filter_directives_match_env_filter_levels` |
-| AC-REL07-5 | задано старое имя переменной (`MCPO_PORT`, `LOG_DIR`, …) | код 2, сообщение перечисляет `старое -> новое` | `config::tests::renamed_variables_are_rejected_with_the_new_name`, `config::tests::several_renamed_variables_are_listed_together`, `tests/cli_setup.rs::legacy_env_name_refuses_startup` |
-| AC-REL08-1 | подтверждение не приходит | отказ по таймауту, операция не выполнена | `tests/tool_calls.rs::timeout_refuses_and_does_not_execute` |
-| AC-REL09-1 | клиент подтверждает модифицирующий вызов | операция выполняется, транспорт получил команду | `tests/tool_calls.rs::confirmed_modification_executes` |
-| AC-REL09-2 | клиент отклоняет подтверждение | операция не выполняется, ответ `cancelled`, транспорт команды не получил | `tests/tool_calls.rs::declined_modification_does_not_execute` |
-| AC-REL09-3 | клиент не объявил elicitation | отказ, операция не выполнена (fail-closed, DR-5) | `tests/tool_calls.rs::client_without_elicitation_is_refused` |
-| AC-REL09-4 | read-only инструмент через MCP | вызов проходит без подтверждения и доходит до транспорта | `tests/tool_calls.rs::read_only_tool_needs_no_confirmation` |
-| AC-OBS01-2 | `WINRIG_AUDIT_LOG_BODY=0` | только метаданные | `config::tests::audit_defaults_and_reads` + `session.rs` |
-| AC-OBS03-1 | отказ политики по хосту, пути записи или отсутствию пароля | запись `POLICY REFUSED` с инструментом и кодом; причина не подделывает структуру записи | `session::tests::policy_refusal_is_audited`, `session::tests::connect_without_password_is_audited`, `tests/tool_calls.rs::policy_refusals_are_audited` |
-| AC-OBS02-1 | свободный текст в генераторе | кавычка удвоена, сырой ввод не проходит | `ps::tests::every_generator_escapes_single_quoted_free_text`; `ps::tests::compare_files_does_not_interpolate_paths_in_double_quotes` |
-| AC-OBS02-2 | список инструментов | ровно 37 уникальных имён | `server::tests::tool_router_lists_registered_tools`, `tests/stdio_mode.rs::stdio_serves_mcp_over_clean_stdout` |
+| AC-SEC01-1 | 3 refusals, a fourth `connect` with the same password in the window | a refusal, zero transport attempts, a separate audit entry | `session::tests::lockout_blocks_fourth_attempt_without_transport` |
+| AC-SEC01-2 | after 3 refusals a different password | the attempt reaches the transport | `session::tests::different_password_bypasses_lockout` |
+| AC-SEC01-3 | A has a lockout, B has a correct password | B connects, A stays locked | `session::tests::sessions_are_isolated_per_user` + a key by user |
+| AC-SEC01-4 | the window has expired | the same password reaches the transport again | `session::tests::lockout_window_expiry_allows_same_password_again` |
+| AC-SEC01-5 | the same user in a different case after 3 refusals | the user stays locked | `identity::tests::canonical_username_folds_case` |
+| AC-SEC02-1 | a secret in a command | absent from the reply to the agent in all forms. Always absent from the audit log | `session::tests::run_ps_redacts_secret_from_reply_and_audit`, `session::tests::run_ps_redacts_session_password_without_explicit_redactions`, `session::tests::command_audit_body_redacts_below_reply_threshold`, `session::tests::connect_failure_stderr_is_redacted` |
+| AC-SEC03-1 | a secret of fewer than 4 characters | the output is not changed | `executor::tests::secret_below_threshold_preserves_output` |
+| AC-SEC03-2 | an empty secret | the redaction is a no-op | `executor::tests::empty_secret_and_empty_list_are_noops` |
+| AC-SEC04-1 | `C:/Windows`, `c:\windows\`, `\\?\C:\`, `F:\`, a UNC root | the policy decision is a refusal. A code reading proves that the tool calls it, not a test | `policy::tests::protected_*`, `policy::tests::delete_scan_refuses_host_resolved_protected_path` |
+| AC-SEC04-2 | a ReparsePoint (junction/symlink) in the root | a refusal before the delete | `policy::tests::delete_scan_refuses_reparse_point` |
+| AC-SEC04-3 | a ReparsePoint inside the subtree | a refusal before the delete and a second check in the delete command | `policy::tests::delete_scan_refuses_nested_reparse_point`, the generator `delete_directory` |
+| AC-SEC04-4 | a path without an extension resolved into a directory (`delete_file`) | a refusal | `policy::tests::file_delete_refuses_directory_and_protected_path` |
+| AC-SEC05-1 | the allowlist is empty | the server permits only the loopback literals. It rejects a remote host and a name that only resolves into loopback before the network | `policy::tests::empty_allowlist_admits_only_loopback_literals`, `tests/tool_calls.rs::default_allowlist_refuses_remote_host_before_network` |
+| AC-SEC05-5 | a host `evil.com/.corp.example`, `evil.com?.corp.example`, `x.corp.example@evil.com`, `evil.com:5985`, or a non-ASCII name with any list, including `*` | a refusal before the network. The reason states that the value is not a name and not an IP | `policy::tests::malformed_host_is_refused_by_any_allowlist` |
+| AC-SEC05-6 | `WINRIG_ALLOWED_HOSTS` or `--allowed-hosts` with the element `*.corp.example` | startup refuses with the name of the variable. `setup` refuses with the name of the flag. The grammar is the same | `policy::tests::allowed_hosts_grammar`, `config::tests::invalid_allowed_hosts_entry_refuses_startup`, `cli::tests::malformed_allowed_hosts_name_the_flag` |
+| AC-SEC05-4 | the allowlist holds `*` | the server permits any host. `*.domain` is not a pattern. An explicit list does not add loopback | `policy::tests::star_admits_any_host`, `policy::tests::explicit_list_does_not_add_loopback` |
+| AC-SEC05-2 | a host outside the allowlist | a refusal before the network | `policy::tests::decision_wrappers` |
+| AC-SEC05-3 | a port outside 1..65535 | a refusal before the network, no session created | `policy::tests::validate_port_range_and_passthrough` |
+| AC-SEC06-1 | the default configuration + `verify_cert=false` | a refusal before the network with the name `WINRIG_ALLOW_INSECURE_TLS` | `config::tests::defaults_preserved`, `tests/tool_calls.rs::default_config_refuses_disabled_certificate_check` |
+| AC-SEC06-2 | `WINRIG_ALLOW_INSECURE_TLS=false` + `verify_cert=false` | a refusal before the network | `policy::tests::tls_decisions` |
+| AC-SEC07-1 | session A, a request `X-AD-User: B` | only the objects of B are visible | `session::tests::sessions_are_isolated_per_user` |
+| AC-SEC07-2 | a request without `X-AD-User` on the shared secret path | 401, the tools do not run | `tests/http_gate.rs::request_with_token_but_without_user_is_rejected`, `tests/http_gate.rs::request_without_token_is_rejected` |
+| AC-SEC08-1 | `Authorization` in the audit log | absent from the audit log | **Not verifiable**: the tool `invoke_http_request` is not ported (TR-SEC-08) |
+| AC-SEC09-1 | a line break in `X-AD-User` | the audit log is not forged | `auth::tests::crlf_username_is_unsafe`; `executor::tests::escape_log_field_*` |
+| AC-SEC09-2 | a line break in a confirmation argument | the dialog is not forged | `executor::tests::sanitize_prompt_value_*` |
+| AC-SEC12-1 | an argument with any of the five forms of a single quote | all generators double each form, and so do the `server.rs` scripts that reach the host | `ps::tests::escape_doubles_every_single_quote_form`, `ps::tests::every_generator_escapes_single_quoted_free_text`, `tests/tool_calls.rs::inline_scripts_escape_every_single_quote_form` |
+| AC-SEC13-1 | `connect` on the header path without `X-AD-Password`, with the password of that name in the cache | a refusal with the name of the header. The transport is not called. The lockout counter stays. The session of another user is intact | `session::tests::header_connect_without_password_ignores_the_cached_one`, `session::tests::connect_without_password_is_refused` |
+| AC-SEC04-5 | the host resolved a delete path into a root from its variables (the system is on `D:`) | a refusal `PATH_PROTECTED`, the reason names the root | `policy::tests::delete_scans_refuse_paths_inside_host_roots`, `policy::tests::host_roots_cover_the_actual_system_location` |
+| AC-SEC04-6 | a write or delete path with an 8.3 name, requested or resolved by the host | a refusal `PATH_PROTECTED`, the reason names the short name. Names like `backup~old` pass | `policy::tests::short_names_are_refused_for_write_and_delete` |
+| AC-SEC04-7 | `\\localhost\C$\Windows\...`, `\\host\ADMIN$\...`, `PRINT$`, `SYSVOL`, `NETLOGON` | the server protects the volume share as `C:\Windows\...` and by the host roots. It protects `ADMIN$`, `PRINT$`, `SYSVOL` and `NETLOGON` in full | `policy::tests::admin_share_is_checked_as_its_local_path` |
+| AC-SEC13-2 | `connect` without a password under the name of a locked user | the answer states that `X-AD-Password` is necessary. The lockout is not exposed | `session::tests::connect_without_password_does_not_reveal_lockout` |
+| AC-SEC10-1 | `AuthFailed("HTTP 500 Internal Server Error: ")` | not a credential failure. The text names 5986 and `AllowUnencrypted` | `session::tests::empty_500_is_not_an_auth_failure` |
+| AC-SEC10-2 | `AuthFailed("HTTP 503 ...: busy")` | not a credential failure. The status stays. The text does not add the hint | `session::tests::other_http_status_is_rejected_without_the_hint` |
+| AC-SEC10-3 | `AuthFailed("NTLM authentication rejected ...")` | it stays a credential failure | `session::tests::ntlm_rejection_stays_an_auth_failure` |
+| AC-SEC10-4 | six requests on the profile path that the host rejected | the password cache is intact. The profile is not refused. The lockout did not start | `session::tests::rejected_request_keeps_cached_password`, `session::tests::rejected_request_never_refuses_profile` |
+| AC-FS-01 | the default configuration | `write_file` is not declared and has no route. With `WINRIG_ALLOW_FILE_WRITE=true` it appears. On the wire, 37 against 38 | `config::tests::defaults_are_applied`, `config::tests::file_write_is_switched_by_the_operator`, `server::tests::write_file_is_absent_until_the_operator_enables_it`, `server::tests::disabled_write_file_has_no_route`, `tests/stdio_mode.rs::write_file_appears_only_when_enabled` |
+| AC-FS-02 | the path `C:\Windows\System32\config` | the policy decision is a refusal before the network, with the code `PATH_PROTECTED`. The reason names a write. A code reading proves the call from the tool | `policy::tests::write_is_refused_on_protected_paths`, `policy::tests::write_refusal_names_writing`, `server::tests::policy_refuses_protected_write_before_transport` |
+| AC-FS-03 | an existing file without `overwrite` | a refusal with the code `FILE_EXISTS`, the write did not start. A creation of a new file and an explicit overwrite pass | `policy::tests::overwrite_is_required_only_for_an_existing_file` |
+| AC-FS-06 | the file body in the command | the audit log and the reply receive it redacted. The server redacts the argument `FromBase64String`, which is exactly what lies in the command | `server::tests::base64_payload_is_extracted_for_redaction` |
+| AC-FS-04 | content larger than `WINRIG_MAX_WRITE_BYTES` | a refusal before the network, with the real size and the limit. The count is in bytes, not in characters | `ps::tests::plan_refuses_content_above_the_limit`, `ps::tests::plan_counts_bytes_not_characters`, `config::tests::max_write_bytes_must_hold_at_least_one_chunk` |
+| AC-FS-05 | content of 5000 bytes | three chunks of 2000 plus one replacement. The first chunk creates and the others append. A chunk fits the WinRS command line. A rename replaces the target with any encoding, and the tool does not write it in place. The cleanup removes both temporary files. The name of the temporary file does not repeat between calls | `ps::tests::plan_splits_content_and_ends_with_one_commit`, `ps::tests::first_chunk_creates_and_the_rest_append`, `ps::tests::a_full_chunk_fits_the_winrs_command_line`, `ps::tests::commit_renames_for_utf8_and_converts_otherwise`, `ps::tests::commit_never_writes_the_target_in_place`, `ps::tests::abort_removes_the_temporary_file_quietly`, `ps::tests::abort_removes_the_staged_file_too`, `server::tests::temporary_suffix_differs_between_calls` |
+| AC-FS-07 | a write path in either of the two resolutions lies inside a host root. Or a scan without roots, or with an empty `SystemRoot` | a refusal `PATH_PROTECTED` or a refusal of the scan before confirmation. A normal path goes to the overwrite rule. The roots come from the environment variables, not from localized names | `policy::tests::write_scan_checks_both_resolutions_and_then_overwrite`, `policy::tests::write_scan_parses_and_fails_closed`, `policy::tests::host_roots_parse_and_require_system_root`, `ps::tests::scans_read_protected_roots_from_the_environment`, `ps::tests::write_scan_resolves_the_path_both_ways` |
+| AC-REL03-1 | an unknown `level` | an error with the list, the command is not sent | `ps::tests::get_event_log_rejects_unknown_level` |
+| AC-REL04-1 | a source is present | the filter comes before the limit | `ps::tests::get_event_log_source_filter_does_not_precap` |
+| AC-REL05-1 | an event with an empty message | the tool does not fail | the PS command `get_event_log` branches on `$_.Message` (a live host is not verifiable, Q-08) |
+| AC-REL06-1 | a path with `[` `]` | the tool addresses it literally | `-LiteralPath` in all the generators of `ps.rs`; `ps::tests::registry_generators_use_literal_path` |
+| AC-REL07-1 | `WINRIG_LOG_LEVEL=BOGUS` | a code ≠ 0, the message names the variable, no traceback | `config::tests::invalid_log_level_names_variable`; a run of the binary checked code 2, no automated test |
+| AC-REL07-2 | a non-integer value for an integer variable | a code ≠ 0, the message names the variable | `config::tests::invalid_integer_names_variable` |
+| AC-REL07-3 | all variables are correct | startup succeeds | `config::tests::defaults_preserved`, `tests/http_gate.rs` (initialize passes `/mcp`) |
+| AC-REL07-4 | `WINRIG_LOG_LEVEL=WARNING` | the log is not silenced: the directive `warn` | `config::tests::log_level_filter_directives_match_env_filter_levels` |
+| AC-REL07-5 | an old variable name is present (`MCPO_PORT`, `LOG_DIR`, …) | a code 2, the message lists `old -> new` | `config::tests::renamed_variables_are_rejected_with_the_new_name`, `config::tests::several_renamed_variables_are_listed_together`, `tests/cli_setup.rs::legacy_env_name_refuses_startup` |
+| AC-REL08-1 | the confirmation does not come | a refusal by a timeout, the operation did not run | `tests/tool_calls.rs::timeout_refuses_and_does_not_execute` |
+| AC-REL09-1 | the client confirms a modifying call | the operation runs, the transport received the command | `tests/tool_calls.rs::confirmed_modification_executes` |
+| AC-REL09-2 | the client declines the confirmation | the operation does not run, the answer is `cancelled`, the transport did not receive the command | `tests/tool_calls.rs::declined_modification_does_not_execute` |
+| AC-REL09-3 | the client did not declare elicitation | a refusal, the operation did not run (fail-closed, DR-5) | `tests/tool_calls.rs::client_without_elicitation_is_refused` |
+| AC-REL09-4 | a read-only tool through MCP | the call passes without confirmation and reaches the transport | `tests/tool_calls.rs::read_only_tool_needs_no_confirmation` |
+| AC-OBS01-2 | `WINRIG_AUDIT_LOG_BODY=0` | metadata only | `config::tests::audit_defaults_and_reads` + `session.rs` |
+| AC-OBS03-1 | a policy refusal by the host, the write path or a missing password | the entry `POLICY REFUSED` with the tool and the code. The reason does not forge the structure of the entry | `session::tests::policy_refusal_is_audited`, `session::tests::connect_without_password_is_audited`, `tests/tool_calls.rs::policy_refusals_are_audited` |
+| AC-OBS02-1 | free text in a generator | the generator doubles the quote, raw input does not pass | `ps::tests::every_generator_escapes_single_quoted_free_text`; `ps::tests::compare_files_does_not_interpolate_paths_in_double_quotes` |
+| AC-OBS02-2 | the tool list | exactly 37 unique names | `server::tests::tool_router_lists_registered_tools`, `tests/stdio_mode.rs::stdio_serves_mcp_over_clean_stdout` |
 
-## 3a. Критерии приёмки профиля и CLI (ADR-0009)
+## 3a. Acceptance criteria of the profile and the CLI (ADR-0009)
 
-| ID | Given/When | Then | Покрытие в winrig |
+| ID | Given/When | Then | Coverage in winrig |
 |---|---|---|---|
-| AC-PRF-01 | `setup` получает имя, пользователя и пароль | файл `<name>.json` создан, токен напечатан один раз, пароля в файле нет, права `0600` | `profile::tests::create_writes_only_ciphertext`, `tests/cli_setup.rs::setup_prints_token_once_and_never_the_password` |
-| AC-PRF-02 | верный токен | возвращены каноническое имя и пароль | `profile::tests::load_with_correct_token` |
-| AC-PRF-03 | поиск токена в каталоге | совпадений нет | `profile::tests::token_is_absent_from_disk` |
-| AC-PRF-04 | один профиль, `WINRIG_TOKEN` задан, stdio без имени | `initialize` проходит, журнал указывает профиль | `paths::tests::single_profile_is_default`, `tests/stdio_mode.rs::stdio_serves_mcp_over_clean_stdout` |
-| AC-PRF-05 | stdio, `connect` на фиктивном транспорте | транспорт получил имя и пароль профиля; аудит пишет `identity=profile` | `session::tests::profile_identity_reaches_transport`, `session::tests::origin_label_distinguishes_sources` |
-| AC-PRF-06 | HTTP с токеном профиля без `X-AD-User`; `serve --port/--host` | ответ не 401; флаги перекрывают окружение | `tests/http_gate.rs::profile_token_without_user_reaches_the_service`, `tests/cli_setup.rs::serve_port_flag_overrides_env` |
-| AC-PRF-07 | HTTP с общим секретом, `X-AD-User` и паролем | работает; сессии изолированы | `tests/http_gate.rs::header_path_still_works_with_profile_bound`, `session::tests::sessions_are_isolated_per_user` |
-| AC-PRF-08 | `WINRIG_LOG_DIR` не задан | журналы в каталоге состояния профиля | `paths::tests::state_dir_is_per_profile`, `paths::tests::state_dir_override_wins`, `app::tests::log_dir_prefers_explicit_override` |
-| AC-PRF-09 | `WINRIG_LOG_DIR` задан | журналы в `WINRIG_LOG_DIR` | `app::tests::log_dir_prefers_explicit_override` |
-| AC-PRF-10 | `list` при двух профилях; `list --json` | таблица с заголовками либо JSON, без секретов | `profile::tests::list_exposes_no_secrets`, `profile::tests::profile_files_use_json_extension`, `tests/cli_setup.rs::list_prints_table_with_headers`, `tests/cli_setup.rs::list_json_is_valid_and_secret_free`, `tests/cli_setup.rs::list_json_empty_directory` |
-| AC-PRF-11 | `rotate` | новый токен работает, старый нет, имя сохранено | `profile::tests::rotate_changes_token_only` |
-| AC-PRF-12 | `forget` | файл удалён | `profile::tests::forget_is_idempotent` |
-| AC-PRF-13 | пароль из профиля отвергнут 3 раза | блокировка, без транспорта | `session::tests::lockout_applies_to_profile_password` |
-| AC-PRF-14 | вывод содержит пароль профиля | аудит и ответ без секрета | `session::tests::run_ps_redacts_secret_from_reply_and_audit`, `session::tests::run_ps_redacts_profile_password` |
-| AC-PRF-15 | `setup --write-config <client>` | запись добавлена, другие не тронуты, для opencode ссылка на файл; повторная запись заменяет, а не дублирует | `client_config::tests::opencode_preserves_other_entries`, `client_config::tests::mcp_servers_clients_write_stdio_entry`, `client_config::tests::codex_replaces_only_its_own_section`, `client_config::tests::codex_rewrite_replaces_env_section`, `client_config::tests::mcp_servers_rewrite_replaces_entry`, `client_config::tests::codex_broken_file_is_reported_not_overwritten`, `client_config::tests::unreadable_config_is_reported_not_overwritten`, `client_config::tests::inline_token_config_is_private`, `client_config::tests::definition_carries_directories`, `tests/cli_setup.rs::write_config_preserves_other_entries` |
-| AC-PRF-20 | два профиля без имени | отказ, перечислены имена | `paths::tests::ambiguous_selection_is_rejected`, `app::tests::ambiguous_profile_is_refused` |
-| AC-PRF-21 | любая подкоманда | пароля нет ни в stdout, ни в stderr; токены не выводятся через Debug | `tests/cli_setup.rs::setup_prints_token_once_and_never_the_password`, `tests/stdio_mode.rs::stdio_with_wrong_token_refuses`, `config::tests::debug_redacts_tokens` |
-| AC-PRF-22 | stdio, ошибки и журнал | stdout только JSON-RPC | `tests/stdio_mode.rs::stdio_serves_mcp_over_clean_stdout` |
-| AC-PRF-23 | метаданные шифрования испорчены | пароль не восстановим | `profile::tests::stripped_crypto_metadata_is_unrecoverable` |
-| AC-PRF-24 | повторный `setup` без `--overwrite` | отказ, файл не изменён | `profile::tests::create_twice_without_overwrite_fails`, `tests/cli_setup.rs::setup_twice_without_overwrite_refuses` |
-| AC-PRF-25 | права `0644` на Unix | предупреждение, не отказ | `profile::tests::loose_permissions_warn_but_load` |
-| AC-PRF-26 | `DOMAIN\Alice` | канонизация совпадает с заголовком | `profile::tests::canonical_username_matches_identity` |
-| AC-PRF-27 | имя с символами пути | отказ, файлов вне каталога нет | `paths::tests::invalid_profile_names_are_rejected`, `paths::tests::path_traversal_creates_nothing`, `app::tests::rotate_and_forget_reject_path_names` |
-| AC-PRF-30 | `forget` несуществующего | успех, «удалять нечего» | `profile::tests::forget_is_idempotent` |
-| AC-PRF-31 | ротация | временных файлов не осталось | `profile::tests::rotation_leaves_no_temp_files` |
-| AC-PRF-32 | повторная загрузка | файл не изменён | `profile::tests::repeated_load_keeps_file_unchanged` |
-| AC-PRF-33 | ротация на диске при работе процесса | старый токен продолжает работать, новый — нет | `auth::tests::rotation_on_disk_does_not_affect_bound_profile` |
-| AC-PRF-34 | `forget` на диске при работе процесса | до перезапуска работает | `auth::tests::forgetting_on_disk_does_not_affect_bound_profile` |
-| AC-PRF-40 | неверный токен | отказ, журнал `invalid profile token`, без значения | `profile::tests::wrong_token_is_invalid_token_error`, `app::tests::profile_bind_reason_distinguishes_failures`, `tests/http_gate.rs::wrong_profile_token_is_rejected` |
-| AC-PRF-41 | повреждённый файл | отказ, журнал `profile file corrupt`, клиенту 401/код 2 | `profile::tests::corrupt_file_is_distinct_error`, `auth::tests::corrupt_profile_is_a_distinct_error`, `app::tests::profile_bind_reason_distinguishes_failures`, `tests/cli_setup.rs::corrupt_profile_refuses_stdio` |
-| AC-PRF-42 | stdio без `WINRIG_TOKEN` | код 2, stdout пуст | `app::tests::missing_profile_token_names_variable`, `tests/stdio_mode.rs::stdio_without_token_refuses` |
-| AC-PRF-43 | профиль не найден | код 2, имя и каталог | `paths::tests::missing_profile_is_reported`, `app::tests::missing_profile_is_reported_by_locations` |
-| AC-PRF-44 | каталог профилей нельзя подготовить | отказ с путём | `tests/stdio_mode.rs::unusable_profile_dir_refuses_setup` |
-| AC-PRF-45 | пустое имя или пароль | отказ, файла нет | `profile::tests::empty_input_is_rejected` |
-| AC-PRF-46 | версия формата выше известной | отказ, файл не изменён | `profile::tests::unsupported_version_is_reported` |
-| AC-PRF-47 | ни профиля, ни `WINRIG_AUTH_TOKEN` | код 2, сообщение о двух способах | `tests/cli_setup.rs::serve_without_secret_refuses`, `config::tests::no_secret_is_accepted_by_parser` (парсер не отвергает; решение принимает точка входа) |
-| AC-PRF-48 | `tools/list` | ровно 37 уникальных имён | `server::tests::tool_router_lists_registered_tools`, `tests/stdio_mode.rs::stdio_serves_mcp_over_clean_stdout` |
-| AC-PRF-49 | заголовки без секрета | 401, транспорт не вызван | `tests/http_gate.rs::headers_without_token_are_rejected_even_with_profile` |
-| AC-PRF-50 | `WINRIG_AUTH_TOKEN` равен токену профиля | старт отказывает | `app::tests::auth_token_equal_to_profile_key_is_refused` |
-| AC-PRF-51 | токен профиля и заголовки вместе | идентичность профиля, заголовки игнорируются | `identity::tests::profile_identity_wins_over_headers` |
-| AC-PRF-52 | `WINRIG_AUTH_TOKEN` без `X-AD-User` | 401 | `tests/http_gate.rs::request_with_token_but_without_user_is_rejected` |
-| AC-PRF-53 | серия неверных токенов, затем верный | верный работает; проверка не повторяет KDF | `tests/http_gate.rs::profile_token_stays_valid_after_failures` (поведенчески); отсутствие повторного KDF — свойство кода (HMAC-метка) |
-| AC-PRF-54 | второй процесс с тем же профилем | код 2, совет про HTTP, первый жив | `tests/stdio_mode.rs::second_process_on_same_profile_refuses_then_clears`, `paths::tests::second_process_lock_is_refused` |
-| AC-PRF-55 | процесс завершён, lock снят | новый процесс проходит рукопожатие | `tests/stdio_mode.rs::second_process_on_same_profile_refuses_then_clears` |
-| AC-PRF-56 | вторая блокировка подряд | stdio код 3, HTTP отказ, транспорт не вызван, шесть вызовов всего | `session::tests::profile_password_rejected_twice_is_refused`, `session::tests::header_password_does_not_refuse_profile`, `app::tests::stdio_outcome_maps_refusal_to_code_three`; end-to-end код 3 требует отказа живого AD — не проверяемо без хоста (Q-08) |
-| AC-PRF-57 | успешный `connect` после блокировки | счёт подряд сброшен | `session::tests::successful_connect_resets_lockout_streak` |
-| AC-PRF-59 | учётная запись `contoso\alice` уходит в NTLM | имя `alice`, домен `contoso`, без обратного слэша в имени | `session::tests::split_account_handles_all_forms`, `session::tests::credentials_for_splits_domain` |
-| AC-PRF-58 | `serve --token`/`--auth-token` без переменных окружения; флаг против неверного env | аутентификация проходит; значение из флага побеждает; секрет не виден в выводе | `tests/cli_setup.rs::serve_token_flag_authenticates_profile`, `tests/cli_setup.rs::serve_auth_token_flag_authenticates_header_path`, `tests/cli_setup.rs::serve_token_flag_overrides_env` |
-| AC-PRF-60 | `--write-config` без `--scope`, stdin не терминал | код 2, сообщение называет `--scope`, профиль и конфиг не созданы | `app::tests::resolve_scope_non_interactive_refuses_without_flag`, `tests/cli_setup.rs::write_config_without_scope_refuses_non_interactive` |
-| AC-PRF-61 | `--write-config opencode --scope project` из подкаталога git-репозитория | запись в `<git-root>/opencode.json`; токен — файл `0600` в `WINRIG_STATE_DIR/<profile>`; в дереве проекта токена нет | `client_config::tests::find_project_root_walks_up_to_git`, `client_config::tests::project_config_paths_per_client`, `client_config::tests::opencode_project_token_goes_to_state_dir`, `tests/cli_setup.rs::write_config_project_writes_to_git_root` |
-| AC-PRF-62 | явный `--scope global` либо `--scope project` | запись идёт в путь уровня, вопрос не задаётся | `app::tests::resolve_scope_prefers_explicit`, `tests/cli_setup.rs::write_config_preserves_other_entries`, `tests/cli_setup.rs::write_config_project_writes_to_git_root` |
-| AC-PRF-63 | `--scope` без `--write-config` | код 2, ничего не записано | `tests/cli_setup.rs::scope_without_write_config_refuses` |
-| AC-PRF-64 | тот же профиль уже объявлен под ключом `winrig-tm` | запись обновлена на месте, ключ сохранён, дубля нет; запись на другой профиль не тронута | `client_config::tests::opencode_updates_the_existing_entry_for_the_same_profile`, `client_config::tests::opencode_leaves_entries_for_other_profiles_alone`, `client_config::tests::mcp_servers_updates_the_existing_entry_for_the_same_profile` |
-| AC-PRF-65 | `--server-name winrig-prod` | ключом записи становится указанное имя | `client_config::tests::explicit_server_name_is_used_as_the_key` |
-| AC-PRF-66 | запись конфига с корнем состояния | `WINRIG_STATE_DIR` равен корню, ссылка на токен указывает в `<корень>/<профиль>` | `client_config::tests::state_dir_in_the_entry_is_the_root`, `client_config::tests::opencode_project_token_goes_to_state_dir` |
-| AC-PRF-67 | `--user contosoalice` | отказ, профиль не создан, текст называет `DOMAIN\user`; `DOMAIN\user` и UPN проходят | `profile::tests::account_without_a_separator_is_refused`, `profile::tests::domain_and_upn_accounts_are_accepted` |
-| AC-PRF-68 | `setup --allowed-hosts` | переменная в записи каждого клиента в нормализованной форме; повтор без флага её убирает; неверный список отвергнут с именем флага | `client_config::tests::allowed_hosts_are_written_and_removed_for_every_client`, `client_config::tests::printed_definition_carries_allowed_hosts`, `cli::tests::allowed_hosts_are_normalized`, `cli::tests::malformed_allowed_hosts_name_the_flag`, `tests/cli_setup.rs::write_config_carries_allowed_hosts` |
+| AC-PRF-01 | `setup` receives a name, a user and a password | `setup` creates the file `<name>.json` and prints the profile token one time. The file holds no password and has the permissions `0600` | `profile::tests::create_writes_only_ciphertext`, `tests/cli_setup.rs::setup_prints_token_once_and_never_the_password` |
+| AC-PRF-02 | a correct profile token | the tool returns the canonical name and the password | `profile::tests::load_with_correct_token` |
+| AC-PRF-03 | a search for the profile token in the directory | no matches | `profile::tests::token_is_absent_from_disk` |
+| AC-PRF-04 | one profile, `WINRIG_TOKEN` is present, stdio without a name | `initialize` passes, the log names the profile | `paths::tests::single_profile_is_default`, `tests/stdio_mode.rs::stdio_serves_mcp_over_clean_stdout` |
+| AC-PRF-05 | stdio, `connect` on the fake transport | the transport received the name and the password of the profile. The audit log writes `identity=profile` | `session::tests::profile_identity_reaches_transport`, `session::tests::origin_label_distinguishes_sources` |
+| AC-PRF-06 | HTTP with a profile token without `X-AD-User`; `serve --port/--host` | the answer is not 401. The flags override the environment | `tests/http_gate.rs::profile_token_without_user_reaches_the_service`, `tests/cli_setup.rs::serve_port_flag_overrides_env` |
+| AC-PRF-07 | HTTP with the shared secret, `X-AD-User` and a password | it works. The server isolates the sessions | `tests/http_gate.rs::header_path_still_works_with_profile_bound`, `session::tests::sessions_are_isolated_per_user` |
+| AC-PRF-08 | `WINRIG_LOG_DIR` is absent | the logs go into the state directory of the profile | `paths::tests::state_dir_is_per_profile`, `paths::tests::state_dir_override_wins`, `app::tests::log_dir_prefers_explicit_override` |
+| AC-PRF-09 | `WINRIG_LOG_DIR` is present | the logs go into `WINRIG_LOG_DIR` | `app::tests::log_dir_prefers_explicit_override` |
+| AC-PRF-10 | `list` with two profiles; `list --json` | a table with headers or JSON, without secrets | `profile::tests::list_exposes_no_secrets`, `profile::tests::profile_files_use_json_extension`, `tests/cli_setup.rs::list_prints_table_with_headers`, `tests/cli_setup.rs::list_json_is_valid_and_secret_free`, `tests/cli_setup.rs::list_json_empty_directory` |
+| AC-PRF-11 | `rotate` | the new profile token works, the old profile token does not, the name stays | `profile::tests::rotate_changes_token_only` |
+| AC-PRF-12 | `forget` | `forget` deletes the file | `profile::tests::forget_is_idempotent` |
+| AC-PRF-13 | the host rejected the profile password 3 times | a lockout, without the transport | `session::tests::lockout_applies_to_profile_password` |
+| AC-PRF-14 | the output holds the password of the profile | the audit log and the reply hold no secret | `session::tests::run_ps_redacts_secret_from_reply_and_audit`, `session::tests::run_ps_redacts_profile_password` |
+| AC-PRF-15 | `setup --write-config <client>` | `setup` adds the entry, the other entries stay, for opencode a link to the file. A second entry replaces and does not double | `client_config::tests::opencode_preserves_other_entries`, `client_config::tests::mcp_servers_clients_write_stdio_entry`, `client_config::tests::codex_replaces_only_its_own_section`, `client_config::tests::codex_rewrite_replaces_env_section`, `client_config::tests::mcp_servers_rewrite_replaces_entry`, `client_config::tests::codex_broken_file_is_reported_not_overwritten`, `client_config::tests::unreadable_config_is_reported_not_overwritten`, `client_config::tests::inline_token_config_is_private`, `client_config::tests::definition_carries_directories`, `tests/cli_setup.rs::write_config_preserves_other_entries` |
+| AC-PRF-20 | two profiles without a name | a refusal, the message lists the names | `paths::tests::ambiguous_selection_is_rejected`, `app::tests::ambiguous_profile_is_refused` |
+| AC-PRF-21 | any subcommand | no password in stdout or in stderr. The Debug output holds no tokens | `tests/cli_setup.rs::setup_prints_token_once_and_never_the_password`, `tests/stdio_mode.rs::stdio_with_wrong_token_refuses`, `config::tests::debug_redacts_tokens` |
+| AC-PRF-22 | stdio, the errors and the log | stdout holds only JSON-RPC | `tests/stdio_mode.rs::stdio_serves_mcp_over_clean_stdout` |
+| AC-PRF-23 | the encryption metadata is corrupt | the password is not recoverable | `profile::tests::stripped_crypto_metadata_is_unrecoverable` |
+| AC-PRF-24 | a second `setup` without `--overwrite` | a refusal, the file is not changed | `profile::tests::create_twice_without_overwrite_fails`, `tests/cli_setup.rs::setup_twice_without_overwrite_refuses` |
+| AC-PRF-25 | the permissions `0644` on Unix | a warning, not a refusal | `profile::tests::loose_permissions_warn_but_load` |
+| AC-PRF-26 | `DOMAIN\Alice` | the canonical form matches the header | `profile::tests::canonical_username_matches_identity` |
+| AC-PRF-27 | a name with path characters | a refusal, no file outside the directory | `paths::tests::invalid_profile_names_are_rejected`, `paths::tests::path_traversal_creates_nothing`, `app::tests::rotate_and_forget_reject_path_names` |
+| AC-PRF-30 | `forget` of a missing profile | a success, nothing to delete | `profile::tests::forget_is_idempotent` |
+| AC-PRF-31 | a rotation | no temporary file stays | `profile::tests::rotation_leaves_no_temp_files` |
+| AC-PRF-32 | a second load | the file is not changed | `profile::tests::repeated_load_keeps_file_unchanged` |
+| AC-PRF-33 | a rotation on the disk while the process runs | the old profile token keeps working, the new profile token does not | `auth::tests::rotation_on_disk_does_not_affect_bound_profile` |
+| AC-PRF-34 | `forget` on the disk while the process runs | it works until a restart | `auth::tests::forgetting_on_disk_does_not_affect_bound_profile` |
+| AC-PRF-40 | a wrong profile token | a refusal, the log entry `invalid profile token`, without the value | `profile::tests::wrong_token_is_invalid_token_error`, `app::tests::profile_bind_reason_distinguishes_failures`, `tests/http_gate.rs::wrong_profile_token_is_rejected` |
+| AC-PRF-41 | a corrupt file | a refusal, the log entry `profile file corrupt`, 401 to the client or code 2 | `profile::tests::corrupt_file_is_distinct_error`, `auth::tests::corrupt_profile_is_a_distinct_error`, `app::tests::profile_bind_reason_distinguishes_failures`, `tests/cli_setup.rs::corrupt_profile_refuses_stdio` |
+| AC-PRF-42 | stdio without `WINRIG_TOKEN` | code 2, stdout is empty | `app::tests::missing_profile_token_names_variable`, `tests/stdio_mode.rs::stdio_without_token_refuses` |
+| AC-PRF-43 | the profile is not found | code 2, the name and the directory | `paths::tests::missing_profile_is_reported`, `app::tests::missing_profile_is_reported_by_locations` |
+| AC-PRF-44 | the tool cannot prepare the profile directory | a refusal with the path | `tests/stdio_mode.rs::unusable_profile_dir_refuses_setup` |
+| AC-PRF-45 | an empty name or password | a refusal, no file | `profile::tests::empty_input_is_rejected` |
+| AC-PRF-46 | a format version above the known one | a refusal, the file is not changed | `profile::tests::unsupported_version_is_reported` |
+| AC-PRF-47 | no profile and no `WINRIG_AUTH_TOKEN` | code 2, the message names the two ways | `tests/cli_setup.rs::serve_without_secret_refuses`, `config::tests::no_secret_is_accepted_by_parser` (the parser does not refuse; the entry point decides) |
+| AC-PRF-48 | `tools/list` | exactly 37 unique names | `server::tests::tool_router_lists_registered_tools`, `tests/stdio_mode.rs::stdio_serves_mcp_over_clean_stdout` |
+| AC-PRF-49 | the headers without a secret | 401, the transport is not called | `tests/http_gate.rs::headers_without_token_are_rejected_even_with_profile` |
+| AC-PRF-50 | `WINRIG_AUTH_TOKEN` equals the profile token | startup refuses | `app::tests::auth_token_equal_to_profile_key_is_refused` |
+| AC-PRF-51 | the profile token and the headers together | the identity of the profile, the server ignores the headers | `identity::tests::profile_identity_wins_over_headers` |
+| AC-PRF-52 | `WINRIG_AUTH_TOKEN` without `X-AD-User` | 401 | `tests/http_gate.rs::request_with_token_but_without_user_is_rejected` |
+| AC-PRF-53 | a series of wrong profile tokens, then the correct one | the correct profile token works. The check does not repeat the KDF | `tests/http_gate.rs::profile_token_stays_valid_after_failures` (by behavior); the absence of a second KDF is a property of the code (the HMAC mark) |
+| AC-PRF-54 | a second process with the same profile | code 2, advice about HTTP, the first process stays alive | `tests/stdio_mode.rs::second_process_on_same_profile_refuses_then_clears`, `paths::tests::second_process_lock_is_refused` |
+| AC-PRF-55 | the process ended, the lock is gone | a new process completes the handshake | `tests/stdio_mode.rs::second_process_on_same_profile_refuses_then_clears` |
+| AC-PRF-56 | a second lockout in a row | stdio code 3, an HTTP refusal, the transport is not called, six calls in total | `session::tests::profile_password_rejected_twice_is_refused`, `session::tests::header_password_does_not_refuse_profile`, `app::tests::stdio_outcome_maps_refusal_to_code_three`; the end-to-end code 3 needs a refusal of a live AD — not verifiable without a host (Q-08) |
+| AC-PRF-57 | a successful `connect` after a lockout | the counter in a row resets | `session::tests::successful_connect_resets_lockout_streak` |
+| AC-PRF-59 | the account `contoso\alice` goes to NTLM | the name `alice`, the domain `contoso`, no backslash in the name | `session::tests::split_account_handles_all_forms`, `session::tests::credentials_for_splits_domain` |
+| AC-PRF-58 | `serve --token`/`--auth-token` without environment variables; a flag against a wrong env | authentication passes. The value from the flag wins. The secret is not visible in the output | `tests/cli_setup.rs::serve_token_flag_authenticates_profile`, `tests/cli_setup.rs::serve_auth_token_flag_authenticates_header_path`, `tests/cli_setup.rs::serve_token_flag_overrides_env` |
+| AC-PRF-60 | `--write-config` without `--scope`, stdin is not a terminal | code 2, the message names `--scope`, no profile and no configuration created | `app::tests::resolve_scope_non_interactive_refuses_without_flag`, `tests/cli_setup.rs::write_config_without_scope_refuses_non_interactive` |
+| AC-PRF-61 | `--write-config opencode --scope project` from a subdirectory of a git repository | the entry goes into `<git-root>/opencode.json`. The profile token is a file `0600` in `WINRIG_STATE_DIR/<profile>`. No profile token in the project tree | `client_config::tests::find_project_root_walks_up_to_git`, `client_config::tests::project_config_paths_per_client`, `client_config::tests::opencode_project_token_goes_to_state_dir`, `tests/cli_setup.rs::write_config_project_writes_to_git_root` |
+| AC-PRF-62 | an explicit `--scope global` or `--scope project` | the entry goes into the path of the level, the tool asks no question | `app::tests::resolve_scope_prefers_explicit`, `tests/cli_setup.rs::write_config_preserves_other_entries`, `tests/cli_setup.rs::write_config_project_writes_to_git_root` |
+| AC-PRF-63 | `--scope` without `--write-config` | code 2, the tool writes nothing | `tests/cli_setup.rs::scope_without_write_config_refuses` |
+| AC-PRF-64 | the same profile is already declared under the key `winrig-tm` | `setup` updates the entry in place, the key stays, no double. The entry for another profile stays | `client_config::tests::opencode_updates_the_existing_entry_for_the_same_profile`, `client_config::tests::opencode_leaves_entries_for_other_profiles_alone`, `client_config::tests::mcp_servers_updates_the_existing_entry_for_the_same_profile` |
+| AC-PRF-65 | `--server-name winrig-prod` | the given name becomes the key of the entry | `client_config::tests::explicit_server_name_is_used_as_the_key` |
+| AC-PRF-66 | a configuration entry with the state root | `WINRIG_STATE_DIR` equals the root, the profile token link points into `<root>/<profile>` | `client_config::tests::state_dir_in_the_entry_is_the_root`, `client_config::tests::opencode_project_token_goes_to_state_dir` |
+| AC-PRF-67 | `--user contosoalice` | a refusal, no profile created, the text names `DOMAIN\user`. `DOMAIN\user` and a UPN pass | `profile::tests::account_without_a_separator_is_refused`, `profile::tests::domain_and_upn_accounts_are_accepted` |
+| AC-PRF-68 | `setup --allowed-hosts` | the variable in the entry of each client in a normalized form. A second run without the flag removes it. An invalid list refuses with the name of the flag | `client_config::tests::allowed_hosts_are_written_and_removed_for_every_client`, `client_config::tests::printed_definition_carries_allowed_hosts`, `cli::tests::allowed_hosts_are_normalized`, `cli::tests::malformed_allowed_hosts_name_the_flag`, `tests/cli_setup.rs::write_config_carries_allowed_hosts` |
 
-## 4. Решённые параметры (ADR-0005)
+## 4. Decided parameters (ADR-0005)
 
-Порог блокировки 3, окно 1800 с, минимальная длина редактирования 4, allowlist по умолчанию пуст (только loopback-литералы, ADR-0015), TLS-понижение по умолчанию запрещено (ADR-0015), идемпотентность модификаций сохраняется. Носитель конфигурации — переменные окружения (ADR-0004). Двойная блокировка профиля — ADR-0009.
+The lockout threshold is 3. The window is 1800 s. The minimum redaction length is 4. The default allowlist is empty (only loopback literals, ADR-0015). The TLS downgrade is off by default (ADR-0015). The idempotence of modifications stays. The environment variables hold the configuration (ADR-0004). The double lockout of the profile is in ADR-0009.

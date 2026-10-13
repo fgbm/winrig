@@ -183,7 +183,7 @@ pub async fn auth_middleware(
 /// reason tells a wrong profile token from a missing secret, to debug the
 /// application (AC-PRF-40/41); the client always gets the same 401.
 fn warn_rejection(reason: &str) {
-    tracing::warn!(target: "winrig::auth", reason, "request rejected before identity is trusted");
+    tracing::warn!(target: "winrig::auth", reason, "the server rejected the request before it trusted the identity");
 }
 
 fn reject(message: &str, challenge: bool) -> Response {

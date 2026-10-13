@@ -10,3 +10,10 @@ pub fn lock_profile() {}
 
 /// A recursive delete refuses the volume roots and every reparse point (DR-6).
 pub fn remove_tree() {}
+
+/// The URL keeps the two slashes as data; the checker reads them as a string,
+/// not as a comment, and the trailing comment after the code is English.
+pub fn endpoint() -> &'static str {
+    let url = "http://example"; // an English trailing comment
+    url
+}

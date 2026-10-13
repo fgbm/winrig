@@ -180,6 +180,39 @@ while IFS= read -r file; do
   fi
 done < <(rg --files -g '*.rs' "${dirs[@]}")
 
+# A trailing comment after code on the same line (`code; // text`) carries the
+# same Cyrillic and review-reference bans. awk finds the comment outside a
+# double-quoted string; rg then matches the comment text, because the Cyrillic
+# range needs a UTF-8-aware engine. A `//` inside a string ("http://") and a
+# comment-only line (no code before the slashes) are skipped.
+trailing_comments="$(
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    awk '
+      {
+        s = $0
+        if (s ~ /comment-check: allow/) next
+        n = length(s)
+        instr = 0; has_code = 0; pos = 0
+        for (i = 1; i < n; i++) {
+          c = substr(s, i, 1)
+          if (c == "\\" && instr) { i++; continue }
+          if (c == "\"") { instr = 1 - instr; continue }
+          if (instr) continue
+          if (c == "/" && substr(s, i + 1, 1) == "/" && has_code && (substr(s, i - 1, 1) == " " || substr(s, i - 1, 1) == "\t")) { pos = i; break }
+          if (c != " " && c != "\t") has_code = 1
+        }
+        if (pos) print FILENAME ":" FNR ":" substr(s, pos)
+      }
+    ' "$file"
+  done < <(rg --files -g '*.rs' "${dirs[@]}")
+)"
+
+if [ -n "$trailing_comments" ]; then
+  emit cyrillic-not-english < <(printf '%s\n' "$trailing_comments" | rg -N -e '[А-Яа-яЁё]' || true)
+  emit review-reference < <(printf '%s\n' "$trailing_comments" | rg -N -e '\b[NDMHL][0-9]+\b' -e 'per (the )?review' -e 'review finding' -e 'issue #[0-9]+' -e '\bW[0-9]+\b' || true)
+fi
+
 # The allow markers stay visible: each one is a deliberate exception.
 allow_markers="$(rg --no-heading -o -g '*.rs' -e 'comment-check: allow' "${dirs[@]}" 2>/dev/null | wc -l | tr -d ' ' || true)"
 

@@ -1,9 +1,9 @@
-//! Журналирование с ротацией по размеру и приватными правами.
+//! Logging with size-based rotation and private permissions.
 //!
-//! Порт поведения `_PrivateRotatingFileHandler`: каталог создаётся `0700`,
-//! файлы — `0600`, ротация по `WINRIG_LOG_MAX_BYTES` с хранением `WINRIG_LOG_BACKUP_COUNT`
-//! копий. Права переприменяются на каждом открытии, иначе новая копия после
-//! ротации получила бы права процесса.
+//! A port of the `_PrivateRotatingFileHandler` behaviour: the directory is `0700`
+//! and files are `0600`; rotation uses `WINRIG_LOG_MAX_BYTES` and keeps
+//! `WINRIG_LOG_BACKUP_COUNT` copies. The modes are reapplied on every open,
+//! otherwise a new copy after rotation would get the process modes.
 
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -14,7 +14,6 @@ use tracing_subscriber::fmt::MakeWriter;
 
 use crate::private_fs::{create_private_dir, open_private_append};
 
-/// Файл журнала с ротацией по размеру.
 #[derive(Debug)]
 pub struct RotatingFile {
     inner: Mutex<Inner>,
@@ -30,11 +29,11 @@ struct Inner {
 }
 
 impl RotatingFile {
-    /// Открывает журнал, создавая каталог и файл с приватными правами.
+    /// Opens the log, creating the directory and file with private permissions.
     ///
     /// # Errors
     ///
-    /// Ошибка ввода-вывода, если каталог или файл нельзя создать.
+    /// An I/O error if the directory or file cannot be created.
     pub fn new(path: impl AsRef<Path>, max_bytes: u64, backups: u32) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -54,7 +53,7 @@ impl RotatingFile {
 }
 
 impl Inner {
-    /// Записывает байты, ротируя файл при превышении размера.
+    /// Appends bytes; rotates the file when the size limit is reached.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.max_bytes > 0 && self.written + buf.len() as u64 > self.max_bytes {
             self.rotate()?;
@@ -73,11 +72,10 @@ impl Inner {
         Ok(buf.len())
     }
 
-    /// Сдвигает копии и открывает новый файл.
+    /// Shifts the backup copies up and opens a fresh file.
     fn rotate(&mut self) -> io::Result<()> {
         self.file = None;
         if self.backups > 0 {
-            // Удаляем самый старый слот, затем сдвигаем нумерацию вверх.
             let oldest = backup_path(&self.path, self.backups);
             let _ = fs::remove_file(&oldest);
             for index in (1..self.backups).rev() {
@@ -117,7 +115,7 @@ impl<'a> MakeWriter<'a> for RotatingFile {
     }
 }
 
-/// Временный держатель блокировки журнала.
+/// Holds the log lock for the duration of a write.
 pub struct RotatingGuard<'a> {
     inner: std::sync::MutexGuard<'a, Inner>,
 }

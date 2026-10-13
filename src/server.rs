@@ -597,6 +597,14 @@ struct RegistryReadParams {
     )]
     #[serde(default)]
     value_name: String,
+    #[schemars(description = "Also return the names of the child keys.")]
+    #[serde(default)]
+    subkeys: bool,
+    #[schemars(
+        description = "Levels of child keys to return. The default is 1 and the range is 1 to 5. Used only when subkeys is true."
+    )]
+    #[serde(default = "default_one")]
+    depth: i64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1144,7 +1152,7 @@ impl WinrigServer {
 
     #[tool(
         name = "get_registry",
-        description = "Read a registry key or one value and return JSON. This tool is read-only."
+        description = "Read a registry key or one value and return JSON. With subkeys true, the result also holds the child key names relative to the key. This tool is read-only."
     )]
     async fn get_registry(
         &self,
@@ -1156,7 +1164,12 @@ impl WinrigServer {
             .run(
                 &identity,
                 &params.session_id,
-                &ps::get_registry(&params.key, &params.value_name),
+                &ps::get_registry(
+                    &params.key,
+                    &params.value_name,
+                    params.subkeys,
+                    params.depth,
+                ),
                 "get_registry",
             )
             .await)
@@ -1614,7 +1627,7 @@ impl WinrigServer {
         );
         // Show the current value before the write: without the old value the
         // operator cannot see what changes.
-        let read_command = ps::get_registry(&key, &params.value_name);
+        let read_command = ps::get_registry(&key, &params.value_name, false, 1);
         let before_reply = self
             .run_value_redacted(
                 &identity,

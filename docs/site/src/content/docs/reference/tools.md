@@ -36,7 +36,7 @@ The binary declares 37 tools, plus `write_file` when the operator enables it. Th
 | `get_system_info` | The OS version, uptime, RAM, CPU count, domain, time zone |
 | `get_disk_space` | The free space on all fixed disks |
 | `get_perf_snapshot` | A snapshot of CPU, memory, disk I/O and network, independent of the locale |
-| `get_registry` | Read a registry key or value (read only) |
+| `get_registry` | Read a registry key or value and, on request, the child key names (read only) |
 | `get_certificates` | The certificates in the personal store, sorted by the days to expiry |
 | `get_network_config` | IP, gateway and DNS for each network adapter |
 | `test_network` | An ICMP ping or a TCP port check from the host |

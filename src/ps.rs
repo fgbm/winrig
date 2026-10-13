@@ -69,6 +69,10 @@ const MIN_WRITE_CHUNK_BYTES: usize = 256;
 /// with more than 256 characters of margin in the worst case.
 pub const WRITE_CHUNK_BYTES: usize = 1536;
 
+// A common key such as `HKLM\SOFTWARE` holds thousands of subkeys. The cap keeps
+// one answer readable; the tool fetches one extra key to set the `truncated` flag.
+const REGISTRY_SUBKEY_LIMIT: usize = 500;
+
 /// Counts the preamble and the launcher prefix next to the script.
 pub fn command_line_chars(script: &str) -> usize {
     let units = crate::session::PREAMBLE.encode_utf16().count() + script.encode_utf16().count();
@@ -640,24 +644,61 @@ pub fn get_disk_space() -> String {
 }
 
 #[must_use]
-pub fn get_registry(key: &str, value_name: &str) -> String {
+pub fn get_registry(key: &str, value_name: &str, subkeys: bool, depth: i64) -> String {
     let mut k = key.trim().to_owned();
     if k.to_uppercase().starts_with("HKEY_") {
         k = format!("Registry::{k}");
     }
     let safe_key = escape(&k);
-    if value_name.trim().is_empty() {
-        format!(
-            "Get-ItemProperty -LiteralPath '{safe_key}' -ErrorAction Stop \
-             | Select-Object * -ExcludeProperty PS* | ConvertTo-Json -Compress"
-        )
-    } else {
-        let safe_val = escape(value_name.trim());
+    let named_value = !value_name.trim().is_empty();
+    let safe_val = escape(value_name.trim());
+    let values = if named_value {
         format!(
             "Get-ItemProperty -LiteralPath '{safe_key}' -Name '{safe_val}' -ErrorAction Stop \
-             | Select-Object -Property '{safe_val}' | ConvertTo-Json -Compress"
+             | Select-Object -Property '{safe_val}'"
         )
+    } else {
+        format!(
+            "Get-ItemProperty -LiteralPath '{safe_key}' -ErrorAction Stop \
+             | Select-Object * -ExcludeProperty PS*"
+        )
+    };
+    if !subkeys {
+        return format!("{values} | ConvertTo-Json -Compress");
     }
+    // TR-REL-11: depth counts child levels, so level 1 is `-Depth 0` (a plain
+    // child listing); a value outside 1..=5 is clamped. The walk skips a child that
+    // denies access and reports the count. Each child is a path relative to the
+    // key: the registry item `Name` is the hive path, so the root prefix is cut.
+    let walk = cap(depth, 1, 5) - 1;
+    let limit = REGISTRY_SUBKEY_LIMIT;
+    // The value and the subkeys are read separately: a value that is absent must
+    // not hide the subkeys, so its read does not stop on error and reports an
+    // `error` field instead.
+    let values_read = if named_value {
+        format!(
+            "$v=Get-ItemProperty -LiteralPath '{safe_key}' -Name '{safe_val}' \
+             -ErrorAction SilentlyContinue | Select-Object -Property '{safe_val}'; \
+             $e=if($null -eq $v){{'value not read'}}else{{$null}}"
+        )
+    } else {
+        format!(
+            "$v=Get-ItemProperty -LiteralPath '{safe_key}' -ErrorAction Stop \
+             | Select-Object * -ExcludeProperty PS*; $e=$null"
+        )
+    };
+    format!(
+        "$root=Get-Item -LiteralPath '{safe_key}' -ErrorAction Stop; {values_read}; \
+         $items=@(Get-ChildItem -LiteralPath '{safe_key}' -Recurse -Depth {walk} \
+         -ErrorVariable subErr -ErrorAction SilentlyContinue | Select-Object -First {over}); \
+         $truncated=$items.Count -gt {limit}; \
+         $keys=@($items | Select-Object -First {limit} \
+         | ForEach-Object {{ $_.Name.Substring($root.Name.Length+1) }}); \
+         $skipped=@($subErr).Count; \
+         [PSCustomObject]@{{ values=$v; error=$e; subkeys=$keys; \
+         truncated=$truncated; skipped=$skipped }} | ConvertTo-Json -Compress -Depth 3",
+        over = limit + 1,
+    )
 }
 
 #[must_use]
@@ -1079,19 +1120,155 @@ mod tests {
     #[test]
     fn get_registry_prefixes_hkey_forms() {
         assert!(
-            get_registry("HKEY_LOCAL_MACHINE\\SOFTWARE", "")
+            get_registry("HKEY_LOCAL_MACHINE\\SOFTWARE", "", false, 1)
                 .contains("Registry::HKEY_LOCAL_MACHINE")
         );
-        assert!(get_registry("HKLM:\\SOFTWARE", "").contains("-LiteralPath 'HKLM:\\SOFTWARE'"));
+        assert!(
+            get_registry("HKLM:\\SOFTWARE", "", false, 1)
+                .contains("-LiteralPath 'HKLM:\\SOFTWARE'")
+        );
     }
 
     #[test]
     fn registry_generators_use_literal_path() {
         // AC-REL06-1: a literal path with wildcard characters is not treated as
         // a pattern, so `-Path` is not allowed here, only `-LiteralPath`.
-        let read = get_registry("HKLM:\\SOFTWARE\\App[1]", "");
+        let read = get_registry("HKLM:\\SOFTWARE\\App[1]", "", false, 1);
         assert!(read.contains("-LiteralPath '"), "{read}");
         assert!(!read.contains("-Path '"), "{read}");
+        // The subkey walk uses the same literal path, so a name with a wildcard
+        // character cannot widen the query.
+        let walk = get_registry("HKLM:\\SOFTWARE\\App[1]", "", true, 2);
+        assert!(
+            walk.contains("-LiteralPath 'HKLM:\\SOFTWARE\\App[1]'"),
+            "{walk}"
+        );
+        assert!(!walk.contains("-Path '"), "{walk}");
+    }
+
+    /// AC-REL11-1: with `subkeys=true` the command lists the child key names down
+    /// to `depth` next to the values. `depth` counts child levels, so level 1 is a
+    /// plain child listing (`-Depth 0`) and level 2 is `-Depth 1`.
+    #[test]
+    fn get_registry_lists_subkeys_down_to_depth() {
+        let one = get_registry("HKLM:\\SOFTWARE", "", true, 1);
+        assert!(
+            one.contains("Get-ChildItem -LiteralPath 'HKLM:\\SOFTWARE' -Recurse -Depth 0"),
+            "{one}"
+        );
+        let two = get_registry("HKLM:\\SOFTWARE", "", true, 2);
+        assert!(
+            two.contains("Get-ChildItem -LiteralPath 'HKLM:\\SOFTWARE' -Recurse -Depth 1"),
+            "{two}"
+        );
+        assert!(
+            two.contains("Get-ItemProperty -LiteralPath 'HKLM:\\SOFTWARE'"),
+            "{two}"
+        );
+        assert!(two.contains("ConvertTo-Json"), "{two}");
+    }
+
+    /// AC-REL11-1: each child is a path relative to the key, cut from the item
+    /// `Name` (the hive path) by the length of the root `Name`.
+    #[test]
+    fn get_registry_returns_relative_child_paths() {
+        let cmd = get_registry("HKLM:\\SOFTWARE", "", true, 2);
+        assert!(
+            cmd.contains("$_.Name.Substring($root.Name.Length+1)"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains("$root=Get-Item -LiteralPath 'HKLM:\\SOFTWARE'"),
+            "{cmd}"
+        );
+    }
+
+    /// AC-REL11-1: the answer is capped and flags a truncation. The command fetches
+    /// one key over the cap so a full result is not reported as truncated.
+    #[test]
+    fn get_registry_caps_subkeys_and_flags_truncation() {
+        let cmd = get_registry("HKLM:\\SOFTWARE", "", true, 2);
+        assert!(
+            cmd.contains(&format!(
+                "Select-Object -First {}",
+                REGISTRY_SUBKEY_LIMIT + 1
+            )),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains(&format!(
+                "$truncated=$items.Count -gt {REGISTRY_SUBKEY_LIMIT}"
+            )),
+            "{cmd}"
+        );
+        assert!(cmd.contains("truncated=$truncated"), "{cmd}");
+    }
+
+    /// AC-REL11-1: a child that denies access is skipped and counted, not fatal.
+    #[test]
+    fn get_registry_reports_skipped_children() {
+        let cmd = get_registry("HKLM:\\SOFTWARE", "", true, 2);
+        assert!(cmd.contains("-ErrorVariable subErr"), "{cmd}");
+        assert!(cmd.contains("$skipped=@($subErr).Count"), "{cmd}");
+        assert!(cmd.contains("skipped=$skipped"), "{cmd}");
+    }
+
+    /// AC-REL11-1: the range 1 to 5 is a safety limit, so a value outside it is
+    /// clamped rather than refused.
+    #[test]
+    fn get_registry_clamps_depth() {
+        assert!(get_registry("HKLM:\\A", "", true, 0).contains("-Depth 0"));
+        assert!(get_registry("HKLM:\\A", "", true, -4).contains("-Depth 0"));
+        assert!(get_registry("HKLM:\\A", "", true, 99).contains("-Depth 4"));
+        assert!(get_registry("HKLM:\\A", "", true, 5).contains("-Depth 4"));
+    }
+
+    /// AC-REL11-1: a named value and the subkeys come together. The value read does
+    /// not stop on error, so an absent value gives `values=null` with an `error`
+    /// field and the subkeys still arrive.
+    #[test]
+    fn get_registry_keeps_subkeys_when_a_named_value_is_absent() {
+        let named = get_registry("HKLM:\\A", "Version", true, 3);
+        assert!(
+            named.contains("-Name 'Version' -ErrorAction SilentlyContinue"),
+            "{named}"
+        );
+        assert!(named.contains("$e=if($null -eq $v)"), "{named}");
+        // The same text covers an absent value and an access-denied read.
+        assert!(named.contains("'value not read'"), "{named}");
+        assert!(named.contains("subkeys=$keys"), "{named}");
+        assert!(named.contains("-Depth 2"), "{named}");
+    }
+
+    /// AC-REL11-2: with the default `subkeys=false` the command stays the
+    /// values-only form and does not walk the key.
+    #[test]
+    fn get_registry_without_subkeys_stays_values_only() {
+        let cmd = get_registry("HKLM:\\SOFTWARE", "", false, 2);
+        assert!(!cmd.contains("Get-ChildItem"), "{cmd}");
+        assert!(
+            cmd.contains(
+                "Get-ItemProperty -LiteralPath 'HKLM:\\SOFTWARE' -ErrorAction Stop \
+                 | Select-Object * -ExcludeProperty PS* | ConvertTo-Json -Compress"
+            ),
+            "{cmd}"
+        );
+    }
+
+    /// Worst case for the WinRS command line: the deepest walk, the cap and a long
+    /// key with a named value. The command must still fit one line.
+    #[test]
+    fn get_registry_subkey_command_fits_the_winrs_line_for_a_long_key() {
+        let key = format!(
+            "HKLM:\\{}",
+            "Microsoft\\Windows\\CurrentVersion\\Uninstall\\".repeat(8)
+        );
+        let cmd = get_registry(&key, "DisplayName", true, 5);
+        assert!(
+            command_line_chars(&cmd) < WINRS_COMMAND_LINE_LIMIT,
+            "chars: {}",
+            command_line_chars(&cmd)
+        );
     }
 
     #[test]
@@ -1393,7 +1570,8 @@ mod tests {
             get_event_log(evil, "error", 24, evil, 10).expect("valid"),
             get_services(evil, "all", true),
             list_processes(evil, "memory", 10),
-            get_registry(evil, evil),
+            get_registry(evil, evil, false, 1),
+            get_registry(evil, evil, true, 2),
             get_environment_variables(evil, "machine").expect("valid"),
             test_network(evil, 443),
             get_tcp_connections("established", 1),

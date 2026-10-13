@@ -444,6 +444,103 @@ async fn timeout_refuses_and_does_not_execute() {
     harness.client.cancel().await.ok();
 }
 
+/// AC-REL11-1: with `subkeys=true` the recorded command lists the child key names
+/// down to the given depth next to the values, and a depth above the range is
+/// clamped to the deepest walk (TR-REL-11).
+#[tokio::test]
+async fn get_registry_subkeys_lists_the_child_key_names() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let key = "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Print\\Printers";
+    let result = harness
+        .call(
+            CallToolRequestParams::new("get_registry").with_arguments(args(&serde_json::json!({
+                "session_id": HOST,
+                "key": key,
+                "subkeys": true,
+                "depth": 2
+            }))),
+        )
+        .await;
+    assert_eq!(
+        error_of(&result),
+        None,
+        "subkeys read must not fail: {:?}",
+        result.structured_content
+    );
+    // `depth` counts child levels, so depth 2 is `-Depth 1`.
+    assert!(
+        harness.transport.saw(&format!(
+            "Get-ChildItem -LiteralPath '{key}' -Recurse -Depth 1"
+        )),
+        "the subkey walk of depth 2 never reached the host"
+    );
+    assert!(
+        harness
+            .transport
+            .saw("$_.Name.Substring($root.Name.Length+1)"),
+        "the child keys are not returned as paths relative to the key"
+    );
+    assert!(
+        harness.transport.saw("Get-ItemProperty"),
+        "the values part left the command"
+    );
+
+    let clamped = harness
+        .call(
+            CallToolRequestParams::new("get_registry").with_arguments(args(&serde_json::json!({
+                "session_id": HOST,
+                "key": key,
+                "subkeys": true,
+                "depth": 7
+            }))),
+        )
+        .await;
+    assert_eq!(
+        error_of(&clamped),
+        None,
+        "a clamped depth must not fail: {:?}",
+        clamped.structured_content
+    );
+    assert!(
+        harness.transport.saw("-Depth 4"),
+        "depth 5 is the deepest walk, so a higher value clamps to -Depth 4"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// AC-REL11-2: with the default `subkeys=false` the recorded command stays the
+/// values-only form (TR-REL-11).
+#[tokio::test]
+async fn get_registry_default_stays_values_only() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let key = "HKLM:\\SOFTWARE\\MyApp";
+    let result = harness
+        .call(
+            CallToolRequestParams::new("get_registry").with_arguments(args(&serde_json::json!({
+                "session_id": HOST,
+                "key": key
+            }))),
+        )
+        .await;
+    assert_eq!(
+        error_of(&result),
+        None,
+        "values-only read must not fail: {:?}",
+        result.structured_content
+    );
+    assert!(
+        harness.transport.saw(&format!(
+            "Get-ItemProperty -LiteralPath '{key}' -ErrorAction Stop"
+        )),
+        "the values read never reached the host"
+    );
+    assert!(
+        !harness.transport.saw("Get-ChildItem"),
+        "the default call must not walk the key"
+    );
+    harness.client.cancel().await.ok();
+}
+
 /// AC-SEC05-1, AC-SEC05-2: without `WINRIG_ALLOWED_HOSTS` a remote host is refused
 /// before the network, and loopback passes (TR-SEC-14).
 #[tokio::test]

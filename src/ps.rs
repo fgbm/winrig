@@ -121,7 +121,7 @@ pub fn write_commit(temp_path: &str, path: &str, encoding: &str) -> Result<Strin
     let key = encoding.trim().to_lowercase();
     if !VALID_ENCODINGS.contains(&key.as_str()) {
         return Err(format!(
-            "Invalid encoding '{encoding}'. Valid: {}",
+            "Invalid encoding '{encoding}'. Valid values: {}",
             VALID_ENCODINGS.join(", ")
         ));
     }
@@ -312,7 +312,7 @@ pub fn read_file(
     let enc_key = encoding.trim().to_lowercase();
     if !VALID_ENCODINGS.contains(&enc_key.as_str()) {
         return Err(format!(
-            "Invalid encoding '{encoding}'. Valid: {}",
+            "Invalid encoding '{encoding}'. Valid values: {}",
             VALID_ENCODINGS.join(", ")
         ));
     }
@@ -451,7 +451,7 @@ pub fn get_event_log(
     let level_key = level.trim().to_lowercase();
     let Some(position) = EVENT_LEVELS.iter().position(|(name, _)| *name == level_key) else {
         return Err(format!(
-            "Invalid level '{level}'. Valid: Critical, Error, Warning, Info"
+            "Invalid level '{level}'. Valid values: Critical, Error, Warning, Info"
         ));
     };
     let levels = EVENT_LEVELS[..=position]
@@ -724,7 +724,7 @@ pub fn resolve_dns_name(name: &str, record_type: &str, dns_server: &str) -> Resu
     let rt = record_type.trim().to_uppercase();
     if !VALID.contains(&rt.as_str()) {
         return Err(format!(
-            "Invalid record_type '{record_type}'. Valid: {}",
+            "Invalid record_type '{record_type}'. Valid values: {}",
             VALID.join(", ")
         ));
     }

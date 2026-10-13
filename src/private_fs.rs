@@ -1,10 +1,10 @@
-//! Приватные файлы и каталоги: каталог `0700`, файл `0600` на Unix (ADR-0009).
+//! Private files and directories: directory `0700`, file `0600` on Unix (ADR-0009).
 //!
-//! Общий хелпер для журналов (`src/logging.rs`), каталогов профилей
-//! (`src/paths.rs`) и самого файла профиля (`src/profile.rs`): права
-//! переприменяются на каждом открытии, иначе новая копия после ротации или
-//! перезаписи получила бы права процесса. На платформах без `cfg(unix)`
-//! приватность обеспечивается средствами ОС по умолчанию.
+//! A shared helper for the logs (`src/logging.rs`), the profile directories
+//! (`src/paths.rs`) and the profile file itself (`src/profile.rs`): the modes are
+//! reapplied on every open, otherwise a new copy after rotation or rewrite would
+//! get the process modes. On platforms without `cfg(unix)`, the OS defaults
+//! provide the privacy.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -15,15 +15,15 @@ const DIR_MODE: u32 = 0o700;
 #[cfg(unix)]
 const FILE_MODE: u32 = 0o600;
 
-/// Режим файла, ожидаемый для приватных данных на текущей платформе.
+/// Mode required for private data on this platform.
 #[cfg(unix)]
 pub const EXPECTED_FILE_MODE: u32 = FILE_MODE;
 
-/// Создаёт каталог и выставляет права `0700` на Unix.
+/// Makes a directory and sets the `0700` mode on Unix.
 ///
 /// # Errors
 ///
-/// Ошибка ввода-вывода, если каталог нельзя создать.
+/// An I/O error if the directory cannot be created.
 pub fn create_private_dir(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
     #[cfg(unix)]
@@ -34,14 +34,14 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Создаёт каталог с правами `0700`, только если его ещё нет.
+/// Makes a `0700` directory only when it does not exist yet.
 ///
-/// Существующий каталог не трогается: это может быть чужой каталог конфигов
-/// (например `~/.config/opencode`), и менять его режим нельзя.
+/// An existing directory is left untouched: it may belong to another tool (for
+/// example `~/.config/opencode`), and its mode must not change.
 ///
 /// # Errors
 ///
-/// Ошибка ввода-вывода, если каталог нельзя создать.
+/// An I/O error if the directory cannot be created.
 pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
     if path.is_dir() {
         return Ok(());
@@ -49,11 +49,11 @@ pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
     create_private_dir(path)
 }
 
-/// Открывает файл на дозапись, создавая его с правами `0600`.
+/// Opens a file for append, creating it with the `0600` mode.
 ///
 /// # Errors
 ///
-/// Ошибка ввода-вывода, если файл нельзя открыть.
+/// I/O error if the file cannot be opened.
 pub fn open_private_append(path: &Path) -> io::Result<(File, u64)> {
     ensure_parent(path)?;
     let file = OpenOptions::new().create(true).append(true).open(path)?;
@@ -62,11 +62,11 @@ pub fn open_private_append(path: &Path) -> io::Result<(File, u64)> {
     Ok((file, written))
 }
 
-/// Открывает файл на запись с усечением, создавая его с правами `0600`.
+/// Opens a file for write with truncation, creating it with the `0600` mode.
 ///
 /// # Errors
 ///
-/// Ошибка ввода-вывода, если файл нельзя открыть.
+/// I/O error if the file cannot be opened.
 pub fn open_private_truncate(path: &Path) -> io::Result<File> {
     ensure_parent(path)?;
     let file = OpenOptions::new()
@@ -78,8 +78,8 @@ pub fn open_private_truncate(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-/// Создаёт родительский каталог файла с приватными правами, не трогая
-/// существующий каталог.
+/// Makes the parent directory with private modes, leaving an existing directory
+/// untouched.
 fn ensure_parent(path: &Path) -> io::Result<()> {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => ensure_private_dir(parent),
@@ -87,7 +87,7 @@ fn ensure_parent(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Выставляет права `0600` на файл.
+/// Applies the `0600` mode to a file.
 pub fn apply_private_file_mode(path: &Path) {
     #[cfg(unix)]
     {
@@ -100,10 +100,11 @@ pub fn apply_private_file_mode(path: &Path) {
     }
 }
 
-/// Проверяет, что права файла не шире ожидаемых; `None` — проверка невозможна.
+/// The file mode when it is wider than `0600`, or `None` when the check is not
+/// possible.
 ///
-/// На Unix возвращает фактический режим, если он отличается от `0600`.
-/// На остальных платформах всегда `None`.
+/// On Unix it is the actual mode when it differs from `0600`; on other platforms
+/// it is always `None`.
 #[must_use]
 pub fn loose_file_mode(path: &Path) -> Option<u32> {
     #[cfg(unix)]

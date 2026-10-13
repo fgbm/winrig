@@ -1,32 +1,32 @@
-# ADR-0009 — Профиль учётной записи, CLI-настройка и stdio-режим
+# ADR-0009 — Account profile, CLI setup and stdio mode
 
-- Статус: принято
-- Дата: 2026-09-20
-- Связано: ADR-0001, ADR-0004, ADR-0005, ADR-0006, ADR-0007, DR-1, DR-2, DR-4, DR-5
+- Status: accepted
+- Date: 2026-09-20
+- Related: ADR-0001, ADR-0004, ADR-0005, ADR-0006, ADR-0007, DR-1, DR-2, DR-4, DR-5
 
-## Контекст
+## Context
 
-README предлагал класть AD-пароль открытым текстом в конфиг каждого MCP-клиента (`X-AD-Password` в `mcp.json`). Это противоречит цели «нигде не хранить пароль открытым текстом»: файл клиента попадает в бэкапы, синхронизацию и репозитории dotfiles. Python-версия вводила пароль через elicitation, но ADR-0006 отбросил этот путь: спецификация MCP исключает секреты из elicitation, а ревизия `2026-07-28` удаляет его.
+README offered to put the AD password as plain text in the configuration of each MCP client (`X-AD-Password` in `mcp.json`). This contradicts the goal "store the password nowhere as plain text": the client file goes into backups, synchronization and dotfiles repositories. The Python version gave the password through elicitation. ADR-0006 rejected this path: the MCP specification excludes secrets from elicitation, and revision `2026-07-28` deletes it.
 
-Продукт многопользовательский, но типичный локальный сценарий — одна учётная запись на одну машину. CLI-настройка должна один раз принять пароль и дальше не показывать его ни оператору, ни клиенту, ни диску. Сервер должен работать из одного бинаря и как HTTP-сервис (несколько проектов), и как локальный stdio-процесс.
+The product is multi-user, but the usual local scenario is one account on one computer. The CLI setup must take the password one time and then show it to no operator, client or disk. The server must work from one binary both as an HTTP service (many projects) and as a local stdio process.
 
-## Решение
+## Decision
 
-1. **Профиль учётной записи.** `winrig setup` принимает имя вида `DOMAIN\user` (канонизируется как в `src/identity.rs`) и пароль без эха, генерирует токен доступа из 32 случайных байт и записывает в каталог профилей один файл на профиль (`<name>.json`): версия формата, каноническое имя, соль HKDF-SHA256, nonce и аутентифицированный шифртекст XChaCha20-Poly1305. Имя пользователя — связанные данные AEAD, поэтому его подмена обнаруживается. Токен печатается ровно один раз; на сервере ключа нет.
-2. **Модель угроз.** Профиль защищает от чтения файла, бэкапов и синхронизации конфигов: в покое на диске только шифртекст, ключ у клиента. Профиль **не** защищает от атакующего, у которого есть доступ к файлу профиля и к токену под тем же пользователем. Он также не заменяет TLS: утечка bearer-токена по сети раскрывает и доступ к серверу, и пароль AD.
-3. **Секрет обязателен, но один из двух.** Старт требует `WINRIG_AUTH_TOKEN` (путь по заголовкам) либо токен профиля `WINRIG_TOKEN`. Совпадение `WINRIG_AUTH_TOKEN` с токеном профиля отказывает старту: ключ профиля не должен лежать на сервере.
-4. **Идентичность определяет предъявленный секрет.** Токен профиля даёт идентичность профиля; заголовки `X-AD-*` игнорируются с предупреждением, а `X-AD-Password` не кэшируется и не логируется. `WINRIG_AUTH_TOKEN` требует `X-AD-User`, как раньше (DR-1, DR-2). Проверка токена после первой успешной расшифровки — сравнение HMAC за константное время, без повторного KDF.
-5. **Один профиль на процесс.** Один файл профиля, выбор по имени; при единственном профиле имя необязательно, при нескольких без имени — отказ старта. Процесс держит lock-файл в каталоге состояния профиля; второй процесс с тем же профилем отказывает с советом использовать HTTP. Изменения профиля на диске действуют со следующего старта.
-6. **Каталоги.** Профили — `platform-dirs`/`dirs-next` `config_dir` (`~/.config/winrig` на Linux, Roaming AppData на Windows, Application Support на macOS) с переопределением `WINRIG_PROFILE_DIR`. Состояние — `state_dir` с фолбэком на локальный каталог данных, переопределение `WINRIG_STATE_DIR`. Журналы без `WINRIG_LOG_DIR` идут в подкаталог профиля каталога состояния.
-7. **CLI.** Подкоманды `serve`, `stdio`, `setup`, `list`, `rotate`, `forget`. `setup` по умолчанию печатает JSON-определение MCP-сервера, а по флагу `--write-config <client>` записывает его в конфиг opencode, Claude Code, Codex или Cursor, не трогая другие записи. Уровень записи (`--scope global|project`) и проектные пути определяет ADR-0012. Для opencode токен выносится в отдельный файл `0600` и подставляется ссылкой `{file:...}`. `list` печатает таблицу с заголовками `NAME`, `USER`, `PATH`; `list --json` даёт те же данные машинночитаемо. Ни один формат не содержит секретов.
-8. **Двойная блокировка профиля.** Второй набор порога отказов тем же паролем в новом окне переводит профиль в отказ: в stdio процесс завершается с кодом 3, в HTTP профиль отвечает ошибкой без вызова транспорта до перезапуска. Успешный `connect` сбрасывает счёт подряд идущих блокировок.
-9. **Права и ошибки.** Права файла профиля шире `0600` на Unix дают предупреждение, не отказ. В журнале различаются «неверный токен» и «повреждённый файл»; клиент в обоих случаях получает 401.
-10. **TTL.** В режиме профиля `WINRIG_PASSWORD_TTL_SECONDS` ограничивает только время жизни открытого пароля в памяти: повторного ввода TTL не вызывает, потому что пароль восстанавливается из профиля.
+1. **Account profile.** `winrig setup` takes a name of the form `DOMAIN\user` and a password without echo. The name is canonicalized as in `src/identity.rs`. The command generates a profile token from 32 random bytes. It writes one file per profile into the profile directory (`<name>.json`). The file holds the format version, the canonical name, the HKDF-SHA256 salt, the nonce and the authenticated XChaCha20-Poly1305 ciphertext. The account name is the AEAD associated data, so its substitution is detected. The command prints the profile token one time only. The server holds no key.
+2. **Threat model.** The profile protects against the reading of the file, backups and the synchronization of client configurations. At rest on disk there is only ciphertext, and the key is at the client. The profile does **not** protect against an attacker who has access to the profile file and to the profile token under the same user. It also does not replace TLS. A leak of the bearer token on the network exposes the access to the server and the AD password.
+3. **The secret is mandatory, but one of two.** Startup requires `WINRIG_AUTH_TOKEN` (the header path) or the profile token `WINRIG_TOKEN`. A match of `WINRIG_AUTH_TOKEN` with the profile token refuses startup: the profile key must not lie on the server.
+4. **The offered secret determines the identity.** The profile token gives the profile identity. The server then ignores the `X-AD-*` headers with a warning, and it does not cache or log `X-AD-Password`. `WINRIG_AUTH_TOKEN` requires `X-AD-User`, as before (DR-1, DR-2). The profile token check after the first successful decryption is a comparison of an HMAC in constant time, without a second KDF.
+5. **One profile per process.** One profile file, selected by name; with a single profile the name is optional, and with several profiles and no name startup refuses. The process holds a lock file in the state directory of the profile. A second process with the same profile refuses and advises the use of HTTP. Changes of the profile on disk apply from the next start.
+6. **Directories.** Profiles use `platform-dirs`/`dirs-next` `config_dir` (`~/.config/winrig` on Linux, Roaming AppData on Windows, Application Support on macOS) with the override `WINRIG_PROFILE_DIR`. The state directory is `state_dir` with a fallback to the local data directory, and the override is `WINRIG_STATE_DIR`. Logs without `WINRIG_LOG_DIR` go to the profile subdirectory of the state directory.
+7. **CLI.** The subcommands are `serve`, `stdio`, `setup`, `list`, `rotate` and `forget`. `setup` prints an MCP server JSON definition by default. With the flag `--write-config <client>` it writes that definition into the client configuration of opencode, Claude Code, Codex or Cursor. It does not touch other records. ADR-0012 defines the write scope (`--scope global|project`) and the project paths. For opencode the tool moves the profile token into a separate file with permissions `0600` and refers to it by `{file:...}`. `list` prints a table with the headings `NAME`, `USER`, `PATH`; `list --json` gives the same data in a machine-readable form. No format contains secrets.
+8. **Double lockout of the profile.** A second set of the failure threshold with the same password in a new window turns the profile into a refusal state. In stdio the process exits with code 3. In HTTP the profile answers with an error without a call to the transport until a restart. A successful `connect` resets the count of consecutive lockouts.
+9. **Permissions and errors.** Profile file permissions wider than `0600` on Unix give a warning, not a refusal. The log distinguishes "invalid token" and "damaged file"; the client gets 401 in both cases.
+10. **TTL.** In the profile mode `WINRIG_PASSWORD_TTL_SECONDS` limits only the lifetime of the open password in memory. TTL does not cause a second input, because the password is restored from the profile.
 
-## Последствия
+## Consequences
 
-- DR-1, DR-2 и DR-4 переформулированы в `AGENTS.md`; ADR-0004 уточнён: файл профиля — не конфигурация, а хранилище шифртекста, параметры по-прежнему через окружение.
-- ADR-0005 §1 дополнен правилом двойной блокировки профиля. ADR-0007 §6 про systemd снят: проект кроссплатформенный.
-- Новые зависимости: `clap`, `rpassword`, `chacha20poly1305`, `hkdf`, `zeroize`, `rand`, `platform-dirs`. `directories` отвергнут `cargo-deny`: транзитивный `option-ext` под MPL-2.0, а `deny.toml` без этого ADR не ослабляется.
-- Модифицирующие инструменты по-прежнему требуют elicitation и остаются fail-closed на клиентах без него (opencode 1.18.31 объявляет только `roots`). Это записано в README и вынесено в ROADMAP.
-- Порт 13 инструментов Python-версии, keyring и Docker остаются вне среза.
+- DR-1, DR-2 and DR-4 are restated in `AGENTS.md`. ADR-0004 receives a refinement: the profile file is not a configuration but a store of ciphertext, and the parameters still come from the environment.
+- ADR-0005 §1 gains the rule of the double lockout of the profile. ADR-0007 §6 about systemd is removed: the project is cross-platform.
+- New dependencies: `clap`, `rpassword`, `chacha20poly1305`, `hkdf`, `zeroize`, `rand`, `platform-dirs`. `cargo-deny` rejected `directories`: the transitive `option-ext` is under MPL-2.0, and this ADR does not weaken `deny.toml` for it.
+- Modifying tools still require elicitation and stay fail-closed on clients without it (opencode 1.18.31 declares only `roots`). The README records this, and the roadmap holds it.
+- The port of the 13 tools of the Python version, keyring and Docker stay outside the slice.

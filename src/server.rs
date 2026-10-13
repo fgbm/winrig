@@ -43,7 +43,7 @@ impl std::fmt::Debug for WinrigServer {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ConfirmResponse {
-    #[schemars(description = "`true` runs the operation.")]
+    #[schemars(description = "The value `true` runs the operation.")]
     confirm: bool,
 }
 
@@ -346,15 +346,19 @@ macro_rules! require_confirmation {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ConnectParams {
-    #[schemars(description = "Windows hostname or IP to connect to, e.g. 'web-server-01'.")]
+    #[schemars(
+        description = "Hostname or IP address of the Windows host, for example 'web-server-01'."
+    )]
     host: String,
-    #[schemars(description = "WinRM port. Defaults to 5985 for HTTP and 5986 for HTTPS.")]
+    #[schemars(description = "WinRM port. The default is 5985 for HTTP and 5986 for HTTPS.")]
     #[serde(default)]
     port: Option<i64>,
-    #[schemars(description = "Use HTTPS transport. Derived from the port when omitted.")]
+    #[schemars(
+        description = "Use the HTTPS transport. The tool derives the value from the port when it is omitted."
+    )]
     #[serde(default)]
     use_ssl: Option<bool>,
-    #[schemars(description = "Validate the server TLS certificate on HTTPS.")]
+    #[schemars(description = "Validate the TLS certificate of the host on HTTPS.")]
     #[serde(default = "default_true")]
     verify_cert: bool,
 }
@@ -365,32 +369,32 @@ fn default_true() -> bool {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SessionIdParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ListDirectoryParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
     #[schemars(
-        description = "Absolute directory path to list, e.g. 'C:\\\\Users' or 'D:\\\\Logs'."
+        description = "Absolute path of the directory to list, for example 'C:\\\\Users' or 'D:\\\\Logs'."
     )]
     path: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct FindFilesParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
-    #[schemars(description = "Root directory to start the recursive search from.")]
+    #[schemars(description = "Root directory where the recursive search starts.")]
     path: String,
-    #[schemars(description = "Filename wildcard to match, e.g. '*.log'.")]
+    #[schemars(description = "Filename wildcard to match, for example '*.log'.")]
     pattern: String,
-    #[schemars(description = "Maximum recursion depth, default 5, capped at 10.")]
+    #[schemars(description = "Maximum recursion depth. The default is 5 and the maximum is 10.")]
     #[serde(default = "default_depth")]
     max_depth: i64,
-    #[schemars(description = "Include each file's size in the output.")]
+    #[schemars(description = "Include the size of each file in the output.")]
     #[serde(default = "default_true")]
     include_size: bool,
 }
@@ -401,20 +405,24 @@ fn default_depth() -> i64 {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ReadFileParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
     #[schemars(description = "Absolute path of the file to read.")]
     path: String,
-    #[schemars(description = "First 1-based line to return in range mode.")]
+    #[schemars(
+        description = "First line to return in the range mode. The line numbers start at 1."
+    )]
     #[serde(default = "default_one")]
     start_line: i64,
-    #[schemars(description = "Last line in range mode, or line count from end in tail mode.")]
+    #[schemars(
+        description = "Last line in the range mode. In the tail mode it is the number of lines from the end."
+    )]
     #[serde(default = "default_200")]
     end_line: i64,
     #[schemars(description = "Read the last N lines instead of a range.")]
     #[serde(default)]
     tail: bool,
-    #[schemars(description = "File encoding, default UTF8.")]
+    #[schemars(description = "File encoding. The default is UTF8.")]
     #[serde(default = "default_utf8")]
     encoding: String,
 }
@@ -431,23 +439,29 @@ fn default_utf8() -> String {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SearchFileContentParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
-    #[schemars(description = "Single file, or narrowest directory to search recursively.")]
+    #[schemars(
+        description = "Path of one file, or of the narrowest directory to search recursively."
+    )]
     path: String,
-    #[schemars(description = "Distinctive literal text to find; no regex or wildcards.")]
+    #[schemars(
+        description = "Distinctive literal text to find. The tool does not accept a regex or wildcards."
+    )]
     pattern: String,
-    #[schemars(description = "Filename wildcard for directory searches.")]
+    #[schemars(description = "Filename wildcard for a directory search.")]
     #[serde(default = "default_star")]
     file_filter: String,
-    #[schemars(description = "Max matching lines to return, capped at 100.")]
+    #[schemars(description = "Maximum number of matching lines to return. The maximum is 100.")]
     #[serde(default = "default_50")]
     max_results: i64,
-    #[schemars(description = "Lines shown before and after each match, max 10.")]
+    #[schemars(
+        description = "Number of lines to show before and after each match. The maximum is 10."
+    )]
     #[serde(default)]
     context_lines: i64,
     #[schemars(
-        description = "Only search files changed within this many hours; 0 means all files."
+        description = "Search only files that changed within this number of hours. The value 0 means all files."
     )]
     #[serde(default)]
     modified_after_hours: i64,
@@ -462,36 +476,36 @@ fn default_50() -> i64 {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CompareFilesParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
-    #[schemars(description = "Absolute path to the first file (reference).")]
+    #[schemars(description = "Absolute path of the first file (the reference).")]
     path_a: String,
-    #[schemars(description = "Absolute path to the second file (difference).")]
+    #[schemars(description = "Absolute path of the second file (the difference).")]
     path_b: String,
-    #[schemars(description = "Maximum differing lines to show, capped at 200.")]
+    #[schemars(description = "Maximum number of differing lines to show. The maximum is 200.")]
     #[serde(default = "default_50")]
     max_diffs: i64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct EventLogParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
-    #[schemars(description = "Event log to read: System (default), Application, or Security.")]
+    #[schemars(description = "Event log to read: System (default), Application or Security.")]
     #[serde(default = "default_system")]
     log_name: String,
     #[schemars(
-        description = "Severity threshold including higher: Critical, Error, Warning, Info."
+        description = "Severity threshold. The tool includes this level and all higher levels: Critical, Error, Warning, Info."
     )]
     #[serde(default = "default_error_level")]
     level: String,
-    #[schemars(description = "How many hours back to search, capped at 720.")]
+    #[schemars(description = "Number of hours back to search. The maximum is 720.")]
     #[serde(default = "default_24")]
     hours_back: i64,
-    #[schemars(description = "Provider name filter, wildcards allowed.")]
+    #[schemars(description = "Filter on the provider name. Wildcards are allowed.")]
     #[serde(default)]
     source: String,
-    #[schemars(description = "Max events to return, capped at 100.")]
+    #[schemars(description = "Maximum number of events to return. The maximum is 100.")]
     #[serde(default = "default_25")]
     count: i64,
 }
@@ -511,15 +525,15 @@ fn default_25() -> i64 {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GetServicesParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
-    #[schemars(description = "Wildcard on Name or DisplayName.")]
+    #[schemars(description = "A wildcard on the Name or the DisplayName.")]
     #[serde(default)]
     name_filter: String,
-    #[schemars(description = "Filter by state: Running, Stopped, or All.")]
+    #[schemars(description = "Filter on the state: Running, Stopped or All.")]
     #[serde(default = "default_all")]
     status_filter: String,
-    #[schemars(description = "Deep JSON inspection per service.")]
+    #[schemars(description = "Return a deep JSON inspection of each service.")]
     #[serde(default)]
     detail: bool,
 }
@@ -530,15 +544,15 @@ fn default_all() -> String {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ListProcessesParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
-    #[schemars(description = "Wildcard on process name.")]
+    #[schemars(description = "A wildcard on the process name.")]
     #[serde(default)]
     name_filter: String,
-    #[schemars(description = "Sort descending by CPU or Memory.")]
+    #[schemars(description = "Sort in descending order by CPU or Memory.")]
     #[serde(default = "default_memory")]
     sort_by: String,
-    #[schemars(description = "Number of processes to show, capped at 100.")]
+    #[schemars(description = "Number of processes to show. The maximum is 100.")]
     #[serde(default = "default_30")]
     top: i64,
 }
@@ -552,12 +566,16 @@ fn default_30() -> i64 {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct PerfParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
-    #[schemars(description = "Seconds between samples; kept for compatibility, capped at 10.")]
+    #[schemars(
+        description = "Number of seconds between samples. The parameter is kept for compatibility. The maximum is 10."
+    )]
     #[serde(default = "default_two")]
     interval_sec: i64,
-    #[schemars(description = "Wildcard for per-process stats; empty omits that section.")]
+    #[schemars(
+        description = "Wildcard for the per-process statistics. An empty value omits that section."
+    )]
     #[serde(default)]
     process_filter: String,
 }
@@ -568,25 +586,29 @@ fn default_two() -> i64 {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct RegistryReadParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
     #[schemars(
-        description = "Registry path with 'HKLM:\\\\' prefix; HKEY_LOCAL_MACHINE form also accepted."
+        description = "Registry path with the 'HKLM:\\\\' prefix. The tool also accepts the HKEY_LOCAL_MACHINE form."
     )]
     key: String,
-    #[schemars(description = "Single value to read; empty dumps all values under the key.")]
+    #[schemars(
+        description = "Name of one value to read. An empty value dumps all the values under the key."
+    )]
     #[serde(default)]
     value_name: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CertificatesParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
-    #[schemars(description = "Certificate store location: LocalMachine or CurrentUser.")]
+    #[schemars(description = "Location of the certificate store: LocalMachine or CurrentUser.")]
     #[serde(default = "default_localmachine")]
     store: String,
-    #[schemars(description = "Only show certs expiring within this many days; 0 shows all.")]
+    #[schemars(
+        description = "Show only the certificates that expire within this number of days. The value 0 shows all."
+    )]
     #[serde(default)]
     days_until_expiry: i64,
 }
@@ -597,23 +619,23 @@ fn default_localmachine() -> String {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct TestNetworkParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
-    #[schemars(description = "Hostname or IP to test connectivity to.")]
+    #[schemars(description = "Hostname or IP address to test the connectivity to.")]
     target: String,
-    #[schemars(description = "TCP port to test, or 0 (default) for an ICMP ping.")]
+    #[schemars(description = "TCP port to test. The value 0 (default) sends an ICMP ping.")]
     #[serde(default)]
     port: i64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct EnvParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
-    #[schemars(description = "Wildcard on variable name.")]
+    #[schemars(description = "A wildcard on the variable name.")]
     #[serde(default)]
     name_filter: String,
-    #[schemars(description = "Variable scope: Machine, User, or Process.")]
+    #[schemars(description = "Scope of the variables: Machine, User or Process.")]
     #[serde(default = "default_machine")]
     scope: String,
 }
@@ -624,35 +646,37 @@ fn default_machine() -> String {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ScheduledTasksParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
-    #[schemars(description = "Wildcard on task name.")]
+    #[schemars(description = "A wildcard on the task name.")]
     #[serde(default)]
     name_filter: String,
-    #[schemars(description = "Include disabled tasks.")]
+    #[schemars(description = "Include the disabled tasks.")]
     #[serde(default)]
     include_disabled: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct UserGroupsParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
-    #[schemars(description = "User to look up; empty lists all local groups.")]
+    #[schemars(description = "User to look up. An empty value lists all the local groups.")]
     #[serde(default)]
     username: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct TcpConnectionsParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
     #[schemars(
-        description = "State filter: Established (default), Listen, TimeWait, CloseWait, or All."
+        description = "Filter on the state: Established (default), Listen, TimeWait, CloseWait or All."
     )]
     #[serde(default = "default_established")]
     state_filter: String,
-    #[schemars(description = "Only show connections involving this port; 0 means all ports.")]
+    #[schemars(
+        description = "Show only the connections that use this port. The value 0 means all the ports."
+    )]
     #[serde(default)]
     port_filter: i64,
 }
@@ -663,32 +687,36 @@ fn default_established() -> String {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct DnsCacheParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
-    #[schemars(description = "Wildcard on record name.")]
+    #[schemars(description = "A wildcard on the record name.")]
     #[serde(default)]
     name_filter: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct InstalledSoftwareParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
-    #[schemars(description = "Wildcard on software name.")]
+    #[schemars(description = "A wildcard on the software name.")]
     #[serde(default)]
     name_filter: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ResolveDnsParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
     #[schemars(description = "Hostname or FQDN to resolve.")]
     name: String,
-    #[schemars(description = "Record type: A (default), AAAA, CNAME, MX, NS, PTR, SOA, SRV, TXT.")]
+    #[schemars(
+        description = "Type of the record: A (default), AAAA, CNAME, MX, NS, PTR, SOA, SRV, TXT."
+    )]
     #[serde(default = "default_a")]
     record_type: String,
-    #[schemars(description = "Specific DNS server to query; empty uses the system default.")]
+    #[schemars(
+        description = "DNS server to query. An empty value uses the default of the system."
+    )]
     #[serde(default)]
     dns_server: String,
 }
@@ -699,15 +727,15 @@ fn default_a() -> String {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ServiceNameParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
-    #[schemars(description = "Exact service name, not display name.")]
+    #[schemars(description = "Exact name of the service, not the display name.")]
     name: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct KillProcessParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
     #[schemars(description = "Process ID to kill.")]
     pid: i64,
@@ -715,16 +743,16 @@ struct KillProcessParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetRegistryParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
-    #[schemars(description = "Registry path, e.g. 'HKLM:\\\\SOFTWARE\\\\MyApp'.")]
+    #[schemars(description = "Registry path, for example 'HKLM:\\\\SOFTWARE\\\\MyApp'.")]
     key: String,
     #[schemars(description = "Name of the registry value to set.")]
     value_name: String,
-    #[schemars(description = "Data to write as a string.")]
+    #[schemars(description = "Data to write, as a string.")]
     value_data: String,
     #[schemars(
-        description = "Value type: String, DWord, QWord, ExpandString, MultiString, Binary."
+        description = "Type of the value: String, DWord, QWord, ExpandString, MultiString, Binary."
     )]
     #[serde(default = "default_string")]
     value_type: String,
@@ -736,26 +764,28 @@ fn default_string() -> String {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct DeleteFileParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
-    #[schemars(description = "Absolute path to the file to delete.")]
+    #[schemars(description = "Absolute path of the file to delete.")]
     path: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WriteFileParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
-    #[schemars(description = "Absolute path of the file to write on the remote host.")]
+    #[schemars(description = "Absolute path of the file to write on the host.")]
     path: String,
-    #[schemars(description = "Full contents to write. The file is replaced, not appended to.")]
+    #[schemars(
+        description = "Full contents to write. The tool replaces the file and does not append to it."
+    )]
     content: String,
     #[schemars(
-        description = "Replace the file when it already exists. Without this the call is\nrefused, so creating a file cannot destroy one by accident."
+        description = "Replace the file when it already exists. Without this flag the tool refuses the call, so a new file cannot destroy an existing file by accident."
     )]
     #[serde(default)]
     overwrite: bool,
-    #[schemars(description = "Encoding of the written file; defaults to UTF-8 without a BOM.")]
+    #[schemars(description = "Encoding of the written file. The default is UTF-8 without a BOM.")]
     #[serde(default = "default_write_encoding")]
     encoding: String,
 }
@@ -766,11 +796,11 @@ fn default_write_encoding() -> String {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct DeleteDirectoryParams {
-    #[schemars(description = "Session ID returned by connect.")]
+    #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
-    #[schemars(description = "Absolute path to the directory to delete recursively.")]
+    #[schemars(description = "Absolute path of the directory to delete recursively.")]
     path: String,
-    #[schemars(description = "Safety cap; refuse if more items exist.")]
+    #[schemars(description = "Safety limit. The tool refuses the call if more items exist.")]
     #[serde(default = "default_5000")]
     max_items: i64,
 }
@@ -787,7 +817,7 @@ fn default_5000() -> i64 {
 impl WinrigServer {
     #[tool(
         name = "connect",
-        description = "Open a WinRM session to a Windows host and return a session_id; this is the required first step before any other tool. The AD password is taken from the X-AD-Password request header and cached only in server memory."
+        description = "Open a WinRM session to a Windows host. The call returns a session_id. This is the required first step before any other tool. The server takes the AD password from the X-AD-Password request header and caches it in memory only."
     )]
     async fn connect(
         &self,
@@ -825,7 +855,7 @@ impl WinrigServer {
 
     #[tool(
         name = "disconnect",
-        description = "Close an active WinRM session and release it; sessions are not auto-cleaned, so always disconnect when done."
+        description = "Close an active WinRM session and release it. The server does not clean up sessions automatically. Always disconnect when the work is done."
     )]
     async fn disconnect(
         &self,
@@ -841,7 +871,7 @@ impl WinrigServer {
 
     #[tool(
         name = "list_sessions",
-        description = "List active WinRM sessions with host, connection time, last used time, and command count."
+        description = "List the active WinRM sessions with host, connection time, last used time and command count."
     )]
     async fn list_sessions(
         &self,
@@ -855,7 +885,7 @@ impl WinrigServer {
 
     #[tool(
         name = "list_directory",
-        description = "List files and directories at a path as tabular text (Mode, LastWriteTime, Length, Name)."
+        description = "List the files and directories at a path as tabular text (Mode, LastWriteTime, Length, Name)."
     )]
     async fn list_directory(
         &self,
@@ -875,7 +905,7 @@ impl WinrigServer {
 
     #[tool(
         name = "find_files",
-        description = "Recursively find files matching a wildcard pattern (max 100 results). Matches files only."
+        description = "Find the files that match a wildcard pattern, recursively. The tool returns a maximum of 100 results and matches files only."
     )]
     async fn find_files(
         &self,
@@ -900,7 +930,7 @@ impl WinrigServer {
 
     #[tool(
         name = "read_file",
-        description = "Read file contents as numbered lines (max 500 per call). Range mode reads start_line through end_line; tail mode reads the last N lines."
+        description = "Read the contents of a file as numbered lines, with a maximum of 500 lines for each call. The range mode reads start_line through end_line. The tail mode reads the last N lines."
     )]
     async fn read_file(
         &self,
@@ -925,7 +955,7 @@ impl WinrigServer {
 
     #[tool(
         name = "search_file_content",
-        description = "Search for literal text inside files like grep; pass a file path to search one file or a directory to search recursively."
+        description = "Search for literal text inside files, in the manner of grep. Pass a file path to search one file. Pass a directory to search it recursively."
     )]
     async fn search_file_content(
         &self,
@@ -952,7 +982,7 @@ impl WinrigServer {
 
     #[tool(
         name = "file_info",
-        description = "Return JSON metadata for one file or directory: size, timestamps, and attributes."
+        description = "Return JSON metadata for one file or one directory: size, timestamps and attributes."
     )]
     async fn file_info(
         &self,
@@ -972,7 +1002,7 @@ impl WinrigServer {
 
     #[tool(
         name = "compare_files",
-        description = "Compare two files line by line like diff, showing each differing line and which file it came from."
+        description = "Compare two files line by line, in the manner of the diff tool. The result shows each differing line and the file that contains it."
     )]
     async fn compare_files(
         &self,
@@ -992,7 +1022,7 @@ impl WinrigServer {
 
     #[tool(
         name = "get_event_log",
-        description = "Read the Windows Event Log for crashes, service failures, auth errors, and disk warnings."
+        description = "Read the Windows Event Log. Use it for crashes, service failures, authentication errors and disk warnings."
     )]
     async fn get_event_log(
         &self,
@@ -1017,7 +1047,7 @@ impl WinrigServer {
 
     #[tool(
         name = "get_services",
-        description = "List Windows services: summary mode returns tabular Name, Status, StartType, DisplayName; detail mode returns JSON per service."
+        description = "List the Windows services. The summary mode returns tabular text with Name, Status, StartType and DisplayName. The detail mode returns JSON for each service."
     )]
     async fn get_services(
         &self,
@@ -1037,7 +1067,7 @@ impl WinrigServer {
 
     #[tool(
         name = "list_processes",
-        description = "List running processes as tabular text with PID, name, CPU seconds, memory MB, handle count, and start time."
+        description = "List the running processes as tabular text with PID, name, CPU seconds, memory MB, handle count and start time."
     )]
     async fn list_processes(
         &self,
@@ -1057,7 +1087,7 @@ impl WinrigServer {
 
     #[tool(
         name = "get_system_info",
-        description = "Return a JSON system overview in one call: OS version, uptime, last boot, total/free RAM, CPU count, domain, and timezone."
+        description = "Return a system overview as JSON in one call: OS version, uptime, last boot, total and free RAM, CPU count, domain and timezone."
     )]
     async fn get_system_info(
         &self,
@@ -1077,7 +1107,7 @@ impl WinrigServer {
 
     #[tool(
         name = "get_disk_space",
-        description = "Return disk space for all fixed drives as tabular text: DeviceID, Total_GB, Free_GB, and Used_Pct."
+        description = "Return the disk space of all fixed drives as tabular text: DeviceID, Total_GB, Free_GB and Used_Pct."
     )]
     async fn get_disk_space(
         &self,
@@ -1097,7 +1127,7 @@ impl WinrigServer {
 
     #[tool(
         name = "get_perf_snapshot",
-        description = "Capture a locale-independent performance snapshot as JSON: CPU, memory, disk I/O, network, and optionally per-process stats."
+        description = "Capture a performance snapshot as JSON. The output does not depend on the locale. It holds CPU, memory, disk I/O and network data, and optionally per-process statistics."
     )]
     async fn get_perf_snapshot(
         &self,
@@ -1117,7 +1147,7 @@ impl WinrigServer {
 
     #[tool(
         name = "get_registry",
-        description = "Read a registry key or a single value (read-only) and return JSON."
+        description = "Read a registry key or one value and return JSON. This tool is read-only."
     )]
     async fn get_registry(
         &self,
@@ -1137,7 +1167,7 @@ impl WinrigServer {
 
     #[tool(
         name = "get_certificates",
-        description = "List certificates from the Personal (My) store sorted by days until expiry, showing Subject, Expires, DaysLeft, and Thumbprint."
+        description = "List the certificates from the Personal (My) store, sorted by the days until expiry. The output shows Subject, Expires, DaysLeft and Thumbprint."
     )]
     async fn get_certificates(
         &self,
@@ -1156,7 +1186,7 @@ impl WinrigServer {
 
     #[tool(
         name = "get_network_config",
-        description = "Return per-NIC network configuration as tabular text: interface name, status, IPv4, gateway, and DNS servers."
+        description = "Return the network configuration of each NIC as tabular text: interface name, status, IPv4, gateway and DNS servers."
     )]
     async fn get_network_config(
         &self,
@@ -1176,7 +1206,7 @@ impl WinrigServer {
 
     #[tool(
         name = "test_network",
-        description = "Test connectivity from the remote Windows host's perspective: port=0 sends three ICMP pings; port>0 runs a TCP test."
+        description = "Test the connectivity from the perspective of the host. With port=0 the tool sends three ICMP pings. With port>0 it runs a TCP test."
     )]
     async fn test_network(
         &self,
@@ -1196,7 +1226,7 @@ impl WinrigServer {
 
     #[tool(
         name = "get_environment_variables",
-        description = "Return environment variables (name and value) for the chosen scope as tabular text."
+        description = "Return the environment variables of the chosen scope as tabular text. Each row has a name and a value."
     )]
     async fn get_environment_variables(
         &self,
@@ -1220,7 +1250,7 @@ impl WinrigServer {
 
     #[tool(
         name = "get_scheduled_tasks",
-        description = "List Windows scheduled tasks as tabular text with name, state, last run time, last result, and next run time."
+        description = "List the Windows scheduled tasks as tabular text with name, state, last run time, last result and next run time."
     )]
     async fn get_scheduled_tasks(
         &self,
@@ -1240,7 +1270,7 @@ impl WinrigServer {
 
     #[tool(
         name = "get_local_users",
-        description = "List local user accounts as tabular text with name, enabled status, last logon, and description."
+        description = "List the local user accounts as tabular text with name, enabled status, last logon and description."
     )]
     async fn get_local_users(
         &self,
@@ -1260,7 +1290,7 @@ impl WinrigServer {
 
     #[tool(
         name = "get_user_groups",
-        description = "Show local group memberships: with no username it lists all local groups and members; with a username it shows that user's local groups."
+        description = "Show the local group memberships. With no username the tool lists all the local groups and their members. With a username it shows the local groups of that user."
     )]
     async fn get_user_groups(
         &self,
@@ -1280,7 +1310,7 @@ impl WinrigServer {
 
     #[tool(
         name = "get_security_context",
-        description = "Show the current WinRM session's security context as JSON: identity, group memberships, privileges, and integrity level."
+        description = "Show the security context of the current WinRM session as JSON: identity, group memberships, privileges and integrity level."
     )]
     async fn get_security_context(
         &self,
@@ -1300,7 +1330,7 @@ impl WinrigServer {
 
     #[tool(
         name = "get_permissions",
-        description = "Return the access control list (ACL) for a file or folder as tabular text: identity, Allow/Deny type, rights, and inheritance."
+        description = "Return the access control list (ACL) of a file or a directory as tabular text: identity, Allow/Deny type, rights and inheritance."
     )]
     async fn get_permissions(
         &self,
@@ -1320,7 +1350,7 @@ impl WinrigServer {
 
     #[tool(
         name = "get_tcp_connections",
-        description = "List active TCP connections as tabular text with local/remote addresses, ports, state, and owning process."
+        description = "List the active TCP connections as tabular text with local and remote addresses, ports, state and owning process."
     )]
     async fn get_tcp_connections(
         &self,
@@ -1340,7 +1370,7 @@ impl WinrigServer {
 
     #[tool(
         name = "get_dns_cache",
-        description = "Read the local DNS client cache as tabular text: record name, type, TTL, and resolved data."
+        description = "Read the local DNS client cache as tabular text: record name, type, TTL and resolved data."
     )]
     async fn get_dns_cache(
         &self,
@@ -1360,7 +1390,7 @@ impl WinrigServer {
 
     #[tool(
         name = "get_installed_software",
-        description = "List installed software as tabular text with name, version, publisher, and install date, reading both 64-bit and 32-bit uninstall keys."
+        description = "List the installed software as tabular text with name, version, publisher and install date. The tool reads both the 64-bit and the 32-bit uninstall keys."
     )]
     async fn get_installed_software(
         &self,
@@ -1380,7 +1410,7 @@ impl WinrigServer {
 
     #[tool(
         name = "resolve_dns_name",
-        description = "Resolve a DNS name from the remote server's perspective as tabular text, showing the full resolution chain including CNAMEs."
+        description = "Resolve a DNS name from the perspective of the host as tabular text. The output shows the full resolution chain, including CNAMEs."
     )]
     async fn resolve_dns_name(
         &self,
@@ -1402,7 +1432,7 @@ impl WinrigServer {
 
     #[tool(
         name = "flush_dns",
-        description = "Clear the local DNS client cache on the remote server; prompts for confirmation."
+        description = "Clear the local DNS client cache on the host. This modifying operation prompts for confirmation."
     )]
     async fn flush_dns(
         &self,
@@ -1427,7 +1457,7 @@ impl WinrigServer {
 
     #[tool(
         name = "restart_service",
-        description = "Restart a Windows service, prompting for confirmation and returning pre and post state."
+        description = "Restart a Windows service. This modifying operation prompts for confirmation. The result shows the state before and after the restart."
     )]
     async fn restart_service(
         &self,
@@ -1459,7 +1489,7 @@ impl WinrigServer {
 
     #[tool(
         name = "stop_service",
-        description = "Stop a running Windows service, prompting for confirmation and returning pre and post state."
+        description = "Stop a running Windows service. This modifying operation prompts for confirmation. The result shows the state before and after the stop."
     )]
     async fn stop_service(
         &self,
@@ -1488,7 +1518,7 @@ impl WinrigServer {
 
     #[tool(
         name = "start_service",
-        description = "Start a stopped Windows service, prompting for confirmation and returning pre and post state."
+        description = "Start a stopped Windows service. This modifying operation prompts for confirmation. The result shows the state before and after the start."
     )]
     async fn start_service(
         &self,
@@ -1517,7 +1547,7 @@ impl WinrigServer {
 
     #[tool(
         name = "kill_process",
-        description = "Force-terminate a process by PID, showing its details in the confirmation prompt."
+        description = "Terminate a process by PID. The confirmation prompt shows the details of the process."
     )]
     async fn kill_process(
         &self,
@@ -1548,7 +1578,7 @@ impl WinrigServer {
 
     #[tool(
         name = "set_registry",
-        description = "Set a registry value, creating it if absent, and show old vs new in the confirmation prompt."
+        description = "Set a registry value and create it if it is absent. The confirmation prompt shows the old value and the new value."
     )]
     async fn set_registry(
         &self,
@@ -1626,7 +1656,7 @@ impl WinrigServer {
 
     #[tool(
         name = "write_file",
-        description = "Write a file on the remote host, replacing it as a whole. Refuses protected paths, and refuses an existing file unless overwrite is set. Content travels in ~2 KB chunks because the WinRS command line is limited, so this suits configuration files and scripts rather than large payloads. To run a script too long for one command, write it here and then execute it by path."
+        description = "Write a file on the host and replace it as a whole. The tool refuses protected paths. It refuses an existing file unless overwrite is set. The content travels in chunks of about 2 KB, because the WinRS command line is limited. Use this tool for configuration files and scripts, not for large payloads. To run a script that is too long for one command, write it here and then execute it by path."
     )]
     async fn write_file(
         &self,
@@ -1769,7 +1799,7 @@ impl WinrigServer {
 
     #[tool(
         name = "delete_file",
-        description = "Permanently delete a single file, scanning first and refusing protected paths and directories. Shows the resolved path and metadata in the confirmation prompt."
+        description = "Delete one file permanently. The tool scans first and refuses protected paths and directories. The confirmation prompt shows the resolved path and the metadata."
     )]
     async fn delete_file(
         &self,
@@ -1842,7 +1872,7 @@ impl WinrigServer {
 
     #[tool(
         name = "delete_directory",
-        description = "Recursively delete a directory and all contents. Scans first and refuses drive roots, system directories and reparse points (junction/symlink), and when the item count exceeds max_items."
+        description = "Delete a directory and all its contents, recursively. The tool scans first. It refuses drive roots, system directories and reparse points (junction or symlink). It also refuses a directory with more items than max_items."
     )]
     async fn delete_directory(
         &self,

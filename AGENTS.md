@@ -13,11 +13,11 @@ The product is multi-user: several operators at the same time in the HTTP mode. 
 - `src/main.rs` — the entry point: CLI parsing, exit code.
 - `src/app.rs` — orchestration: subcommands, logging, the serve and stdio modes.
 - `src/cli.rs` — the `clap` subcommand definitions.
-- `src/client_config.rs` — the write of the MCP server definition into client configuration files (ADR-0009, ADR-0012).
+- `src/client_config.rs` — the write and the read of the MCP server definitions in the client configuration files (ADR-0009, ADR-0012; the read serves the `doctor` check, TR-PRF-18).
 - `src/profile.rs` — the account profile: password ciphertext, profile token, rotation (ADR-0009).
 - `src/paths.rs` — the profile and state directories, profile selection, the process lock (ADR-0009).
 - `src/private_fs.rs` — private files and directories with the modes `0700`/`0600`.
-- `src/config.rs` — `AppConfig`, the read and validation of environment variables (ADR-0003).
+- `src/config.rs` — `AppConfig`, the read and validation of the environment variables (ADR-0003), and the list of the known non-secret settings for `doctor` (TR-PRF-18).
 - `src/policy.rs` — the decisions "allowed/not allowed": host allowlist, the TLS downgrade mode, path normalization and classification, protected prefixes (ADR-0003).
 - `src/executor.rs` — secret editing, truncation, field escaping and neutralization of the audit body (ADR-0003).
 - `src/session.rs` — the WinRM session registry (the client is created for each call), the TTL password cache, the lockout after failures, the audit. The `WinRmTransport` trait separates the transport.

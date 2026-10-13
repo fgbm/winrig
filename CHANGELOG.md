@@ -12,6 +12,14 @@ A release goes out under the tag `vX.Y.Z`; the tag starts `.github/workflows/rel
 - The Russian README (`README.ru.md`).
 - The style guides and the Vale check.
 - The comment check.
+- The `subkeys` and `depth` parameters of `get_registry`, which list the child key names of a key (#18).
+- Any event channel in `get_event_log`, and the read-only tool `list_event_logs` (#16).
+- The read-only tool `get_open_handles`, which names the processes that hold a file open (#21).
+- The read-only tools `get_printers` and `get_print_jobs` (#19).
+- The `from_end`, `count_only`, `since`, `until` and `timestamp_format` parameters of `search_file_content`, and the `exclude` filter of the `read_file` tail mode (#17).
+- The read-only tool `get_service_config` and the modifying tool `set_service_start_type`; `stop_service` verifies the stop (#10).
+- The subcommand `winrig doctor`, which compares the settings of the winrig servers in the client configuration (#24).
+- The `summary` mode and the `pid` and `process` filters of `get_tcp_connections` (#20).
 
 ### Changed
 
@@ -20,10 +28,20 @@ A release goes out under the tag `vX.Y.Z`; the tag starts `.github/workflows/rel
 - The error messages, the log messages and the tool results are rewritten in STE.
 - The comment check is stricter. It also finds a first sentence that restates the name. It finds a short field doc without information and a repeated subject in a doc block.
 - The confirmation form describes its field in English.
+- Every confirmation names the tool, the host and the user, and states the effect and whether the operator can undo it (TR-SEC-16..20).
+- Every generated script carries a preamble that silences the PowerShell progress stream, and `write_file` sizes each chunk by the WinRS command-line budget.
+- The tool list holds 44 declared tools, 43 of them visible by default.
 
 ### Fixed
 
 - Two tests that capture the tracing output failed about one time in 300 runs. The capture now rebuilds the tracing interest cache (#9).
+- The CLIXML progress record that PowerShell wrote to stderr no longer appears in the result of a tool call (#22).
+
+### Security
+
+- The result parser drops the CLIXML position lines that can hold a fragment of a secret (DR-4).
+- The confirmation sanitizes every field that the host provides, so a value cannot forge the dialog (DR-4).
+- `set_registry` hides the old value next to the new value, and `kill_process` shows the executable path and never the command line (DR-4).
 
 ## [0.2.0] - 2026-09-22
 

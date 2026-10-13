@@ -11,8 +11,8 @@ The project needs an MCP server in Rust with remote PowerShell execution over Wi
 ## Decision
 
 1. **WinRM/NTLM — the crate `winrm-rs`** (async, NTLMv2, `secrecy::SecretString`, `run_powershell`, the reuse of the shell). The project does not write an own implementation of SOAP+NTLM.
-   - The version is `1.2.2`. The pin `=1.1.2` stayed while the branch 1.2.x needed rustc 1.98, which stable did not have. Version 1.98 came out on 2026-09-01, and the project removed the pin together with the rise of the MSRV to 1.98 (Q-07, slice W18). The check at the change: `auth/ntlm.rs` is identical between the versions, so the analysis of errors in `session::classify_auth_failure` (TR-SEC-10) stays correct. `CHUNK_SIZE` is still 2000, so `ps::WRITE_CHUNK_BYTES` needed no change.
-   - The default output encoding is `65001` (UTF-8), so the preamble `[Console]::OutputEncoding` from the Python version is not necessary.
+   - The version is `1.2.2`. The pin `=1.1.2` stayed while the branch 1.2.x needed rustc 1.98, which stable did not have. Version 1.98 came out on 2026-09-01, and the project removed the pin together with the rise of the MSRV to 1.98 (Q-07, slice W18). The check at the change: `auth/ntlm.rs` is identical between the versions, so the analysis of errors in `session::classify_auth_failure` (TR-SEC-10) stays correct. `CHUNK_SIZE` is still 2000. `ps::WRITE_CHUNK_BYTES` is 1536: slice W23 (TR-REL-10) sized the piece by the WinRS command-line budget, because the preamble counts against the same line.
+   - The default output encoding is `65001` (UTF-8). The preamble `[Console]::OutputEncoding` from the Python version returned with slice W23 (TR-REL-10). `powershell.exe` uses its own console encoding for redirected output, so the preamble sets it, and `$ProgressPreference = 'SilentlyContinue'` silences the progress stream.
 2. **MCP — the official SDK `rmcp`** with the transport `transport-streamable-http-server`; the macros `#[tool]`/`#[tool_router]`.
 3. **HTTP — `axum`**; the MCP service embeds through `nest_service("/mcp", service)`.
 4. **Runtime — `tokio`** (multi-thread).

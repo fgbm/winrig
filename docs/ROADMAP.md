@@ -26,15 +26,16 @@ Product: `winrig`. Canon: `AGENTS.md`. Cycle: `docs/IMPLEMENTATION_CYCLE.md`. St
 | W20 | Accounts and group membership | TR-AD-06..09/12..15, ADR-0014 | yes | pending |
 | W21 | Attribute editing by rules | TR-AD-10/11, ADR-0014 | yes | pending |
 | W22 | Safe defaults: PowerShell quotes, the password on `connect`, loopback and TLS by default, the host roots, the audit of refusals | TR-SEC-04/06/12/13/14, TR-FS-06, TR-OBS-03, TR-PRF-17, ADR-0015 | yes | accepted |
-| W23 | The progress stream of the generated scripts (CLIXML bug, GitHub #22) | TR-REL-10, AC-REL10-1 | no | pending |
-| W24 | Registry subkey listing (GitHub #18) | TR-REL-11, AC-REL11-1/2 | no | pending |
-| W25 | Any event log channel and a channel list (GitHub #16) | TR-REL-12, AC-REL12-1/2 | no | pending |
-| W26 | TCP connections: states, filters and a summary (GitHub #20) | TR-REL-13, AC-REL13-1 | no | pending |
-| W27 | Which process holds a file open (GitHub #21) | TR-REL-14, AC-REL14-1 | no | pending |
-| W28 | Printers and print jobs (GitHub #19) | TR-REL-15, AC-REL15-1/2 | no | pending |
-| W29 | Log search from the end, by time and by count (GitHub #17) | TR-REL-16, AC-REL16-1/2 | no | pending |
-| W30 | Service configuration, the start type and a verified stop (GitHub #10) | TR-REL-17/18, TR-SEC-15, AC-REL17-1, AC-REL18-1/2, AC-SEC15-1/2/3 | yes | pending |
-| W31 | Check that the environment agrees across project servers (`doctor`, GitHub #24) | TR-PRF-18, AC-PRF-69 | no | pending |
+| W23 | The progress stream of the generated scripts (CLIXML bug, GitHub #22) | TR-REL-10, AC-REL10-1 | no | accepted |
+| W24 | Registry subkey listing (GitHub #18) | TR-REL-11, AC-REL11-1/2 | no | accepted |
+| W25 | Any event log channel and a channel list (GitHub #16) | TR-REL-12, AC-REL12-1/2 | no | accepted |
+| W26 | TCP connections: states, filters and a summary (GitHub #20) | TR-REL-13, AC-REL13-1 | no | accepted |
+| W27 | Which process holds a file open (GitHub #21) | TR-REL-14, AC-REL14-1 | no | accepted |
+| W28 | Printers and print jobs (GitHub #19) | TR-REL-15, AC-REL15-1/2 | no | accepted |
+| W29 | Log search from the end, by time and by count (GitHub #17) | TR-REL-16, AC-REL16-1/2 | no | accepted |
+| W30 | Service configuration, the start type and a verified stop (GitHub #10) | TR-REL-17/18, TR-SEC-15, AC-REL17-1, AC-REL18-1/2, AC-SEC15-1/2/3 | yes | accepted |
+| W31 | Check that the environment agrees across project servers (`doctor`, GitHub #24) | TR-PRF-18, AC-PRF-69 | no | accepted |
+| W32 | Clear confirmation text (the wording of the prompts, no issue) | TR-SEC-16..20, AC-SEC16-1, AC-SEC17-1/2, AC-SEC18-1, AC-SEC19-1, AC-SEC20-1 | no | accepted |
 
 ## Phase criteria
 
@@ -69,7 +70,7 @@ This section comes from the traces of live operation: the agent hit a missing ca
 
 ### Execution of arbitrary commands
 
-There is no tool for arbitrary execution. All 37 tools carry a hard-coded PowerShell script from `src/ps.rs`. `SessionRegistry::run_ps` is an internal method and the server does not expose it as an MCP tool. Nothing can run: no third-party utility, no one-off script, no software installation.
+There is no tool for arbitrary execution. All 44 tools carry a hard-coded PowerShell script from `src/ps.rs`. `SessionRegistry::run_ps` is an internal method and the server does not expose it as an MCP tool. Nothing can run: no third-party utility, no one-off script, no software installation.
 
 The decision is to add it: slice W16, ADR-0013, and Q-14 has a decision. Before the operator made the decision, the absence of arbitrary execution was not a position of anybody, only a state of the code.
 
@@ -149,7 +150,7 @@ Goal: the agent can write a file to a Windows host without a way to rewrite the 
 
 The content (ADR-0013): the tool `write_file`, off by default through `WINRIG_ALLOW_FILE_WRITE`. While the tool is off the server removes it from the router instead of hiding it from the list. It needs a confirmation by DR-5. It refuses by `is_protected_path` before a call to the host, with the same list that guards a delete. An overwrite needs an explicit `overwrite: true`. The default encoding is UTF-8 without a BOM, with the same list of encodings that `read_file` accepts.
 
-The size hits the command line, not `MaxEnvelopeSize` as the first draft of the ADR supposed. The script goes to the host as the argument `powershell.exe -EncodedCommand <base64>`, and WinRS limits that argument to about 8191 characters. After the triple encoding, one call holds less than 2 KB of raw data. The encoding is base64 of the content, then UTF-16LE of the script, then base64 of the argument, about 3.5×. Therefore the write goes in chunks of 2000 bytes, exactly as in `winrm-rs::transfer`, where `CHUNK_SIZE` has the same reason. The write uses the existing seam `run_ps` and not `WinrmClient::upload_file`. The method of the crate takes a local file as input, and it passes by the audit, the redaction and the fake transport. The tool writes the chunks into a temporary file and replaces the target with a rename. Therefore a refusal in the middle leaves no truncated file. The default of `WINRIG_MAX_WRITE_BYTES` is 64 KiB. This limit is a property of patience, not of the protocol. It is 33 calls to the host, and the server creates a client for each call (Q-11).
+The size hits the command line, not `MaxEnvelopeSize` as the first draft of the ADR supposed. The script goes to the host as the argument `powershell.exe -EncodedCommand <base64>`, and WinRS limits that argument to about 8191 characters. After the triple encoding, one call holds less than 2 KB of raw data. The encoding is base64 of the content, then UTF-16LE of the script, then base64 of the argument, about 3.5×. The write sizes each chunk by that budget: `ps::WRITE_CHUNK_BYTES` is 1536 bytes. A long path gives a smaller chunk, because the preamble (TR-REL-10) and the launcher prefix count against the same line. The same boundary exists in `winrm-rs::transfer`, where `CHUNK_SIZE` has the same reason. The write uses the existing seam `run_ps` and not `WinrmClient::upload_file`. The method of the crate takes a local file as input, and it passes by the audit, the redaction and the fake transport. The tool writes the chunks into a temporary file and replaces the target with a rename. Therefore a refusal in the middle leaves no truncated file. The default of `WINRIG_MAX_WRITE_BYTES` is 64 KiB. This limit is a property of patience, not of the protocol. It is about 43 calls to the host, and the server creates a client for each call (Q-11).
 
 The subject of the check is the frame, not the presence of the tool. TR-FS-01 keeps the tool off by default and undeclared. TR-FS-02 refuses a protected path before the network. TR-FS-03 allows an overwrite only by the flag. TR-FS-04 gives a clear refusal above the size limit. TR-FS-05 writes chunks and replaces the target by a rename.
 
@@ -157,7 +158,7 @@ Outside the slice: the check of the path length against `MAX_PATH` (260), which 
 
 ## W16. Execution of arbitrary commands
 
-Goal: close the class of one-off tasks that none of the 37 tools covers, from diagnostics to software installation.
+Goal: close the class of one-off tasks that none of the 44 tools covers, from diagnostics to software installation.
 
 The content (ADR-0013): the tool `run_command` with arbitrary PowerShell, off by default through `WINRIG_ALLOW_COMMAND_EXEC`. The allowlist of prefixes `WINRIG_ALLOWED_COMMANDS` has the same empty-list semantics as `WINRIG_ALLOWED_HOSTS`. A confirmation by DR-5 shows the full text of the command without truncation. The redaction of secrets works in the reply and always in the audit log. The timeout and the truncation of the output come from the existing settings. The slice adds no separate form "run an exe with arguments": that form is the same arbitrary run with a new escape surface.
 
@@ -206,7 +207,7 @@ The grouping by `kind`/`direction` is the decision of ADR-0014 §10. Symmetric o
 
 The subject of the check is the frame, not the presence of the tools. TR-AD-01 checks the host role in the script, so a host that is a domain member gives a clear refusal, not a directory error. TR-AD-02 keeps a value inside the LDAP filter: an escape of RFC 4515 before the escape of PowerShell. TR-AD-03 names the result ceiling in the answer. TR-AD-04 makes the parse independent of the locale. TR-AD-05 gives no write to any tool.
 
-The invariant "the exact tool count" from W9 moves. The number of declared tools becomes 44 instead of 38, and the number visible by default becomes 43 instead of 37. The same slice corrects the criterion AC-PRF-48 and both tests (`server::tests::tool_router_lists_registered_tools`, `tests/stdio_mode.rs::stdio_serves_mcp_over_clean_stdout`).
+The invariant "the exact tool count" from W9 moves. The number of declared tools becomes 50 instead of 44, and the number visible by default becomes 49 instead of 43. The same slice corrects the criterion AC-PRF-48 and both tests (`server::tests::tool_router_lists_registered_tools`, `tests/stdio_mode.rs::stdio_serves_mcp_over_clean_stdout`).
 
 Outside the slice: a change of the topology of the domain and the forest (ADR-0014 §12) is not deferred. It does not belong to the product.
 
@@ -284,7 +285,7 @@ Goal: answer "which process holds this file" in one call. GitHub #21.
 
 A database file appeared again after each delete while the service looked stopped; the cause was a crash loop, and the agent found it only through the event log.
 
-The content: the read-only tool `get_open_handles(path)` returns the pid, the name and the start time of each process that holds the file, or a file under the directory (TR-REL-14, AC-REL14-1). On a host without the Sysinternals `handle.exe` the tool uses the Restart Manager (`RmGetList`), so it needs no third-party software. Read-only, no confirmation. The tool count grows by one.
+The content: the read-only tool `get_open_handles(path)` returns the pid, the name and the start time of each process that holds the file, or a file under the directory (TR-REL-14, AC-REL14-1). The tool uses the Restart Manager (`RmGetList`) through `Reflection.Emit`, so it needs no Sysinternals `handle.exe` and leaves no temporary file on the host. A directory is checked file by file, with caps on the files and the rows. Read-only, no confirmation. The tool count grows by one.
 
 ## W28. Printers and print jobs
 
@@ -336,7 +337,7 @@ The content:
 
 - **TR-SEC-16.** Every confirmation names the host, the identity and the tool, and it holds one plain line that states what the operation does and whether the operator can undo it.
 - **TR-SEC-17.** Each modifying tool lists its target and the effective operation with the details that are available before the call. The table below is the per-tool list.
-- **TR-SEC-18.** A hidden value appears only as the marker `hidden`. The new value of `set_registry` and the content of `write_file` are hidden values (DR-4).
+- **TR-SEC-18.** A hidden value appears only as the marker `hidden`. The old value and the new value of `set_registry` and the content of `write_file` are hidden values (DR-4).
 - **TR-SEC-19.** The server sanitizes each field of the text (TR-SEC-09, ADR-0008 §11) and caps the field at 200 characters. A cut field carries a visible marker, and the marker counts inside the cap.
 - **TR-SEC-20.** The confirmation text is STE English, stable and independent of the host locale. A test through the MCP harness (`tests/tool_calls.rs`) checks the text on the fake transport.
 
@@ -348,8 +349,8 @@ The per-tool list of TR-SEC-17:
 | `restart_service` | the service and the host | restarts the service. The text shows the state before the call and the intended state `Running` | yes, by another restart, a stop or a start |
 | `stop_service` | the service and the host | stops the service. The text shows the state before the call and the intended state `Stopped` | yes, by a start |
 | `start_service` | the service and the host | starts the service. The text shows the state before the call and the intended state `Running` | yes, by a stop |
-| `kill_process` | the process and the host | terminates the process by PID. The text shows the name, the start time, the command line, and it states that the tree of the process stays | no |
-| `set_registry` | the key, the value and the host | sets the value with the given type. The text shows the old value, and the new value as `hidden` | yes, by the old value |
+| `kill_process` | the process and the host | terminates the process by PID. The text shows the name, the executable path and the start time, and it states that the child processes continue to run | no |
+| `set_registry` | the key, the value and the host | sets the value with the given type. The text shows the old value and the new value, both as `hidden` | yes, by the old value |
 | `write_file` | the path and the host | writes the file and replaces the whole file. The text shows the resolved path, the size, the encoding, the content as `hidden`, and the presence of an existing file | no; the previous content is lost |
 | `delete_file` | the path and the host | deletes one file permanently. The text shows the resolved path and the metadata | no |
 | `delete_directory` | the directory and the host | deletes the directory and all the contents, recursively. The text shows the resolved path, the counts, and the second check of the reparse points after the confirmation | no |

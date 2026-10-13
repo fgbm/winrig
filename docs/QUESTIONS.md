@@ -98,7 +98,7 @@ Named directly and accepted: an already open session runs commands without a rep
 
 ## Q-17. The CLIXML progress record in stderr
 
-Decided: every generated script sets `$ProgressPreference = 'SilentlyContinue'` in its preamble (TR-REL-10, slice W23, GitHub #22). The bug report offered two options — the preamble, or a result parser that drops the `S="progress"` records. The preamble removes the record at the cause, on the host, and it needs no change of the parser. The parser option stays available as a second line of defense, but it is not a requirement.
+Decided: every generated script sets `$ProgressPreference = 'SilentlyContinue'` in its preamble (TR-REL-10, slice W23, GitHub #22). The bug report offered two options — the preamble, or a result parser that drops the `S="progress"` records. The preamble removes the record at the cause, on the host. The slice takes both. The preamble silences the stream. The parser `strip_clixml` keeps the stream records and drops the progress objects and the position lines. The slice also sizes the `write_file` chunk by the WinRS command-line budget: `WRITE_CHUNK_BYTES` is 1536 and the path limit comes from the budget. `run_ps` refuses a command that does not fit one WinRS command line before the transport, with the audit entry `COMMAND REFUSED`.
 
 ## Q-18. Registry subkeys: a new tool or a parameter
 
@@ -106,11 +106,11 @@ Decided: `get_registry` takes the parameters `subkeys: bool` (default `false`) a
 
 ## Q-19. The parameter names of `get_tcp_connections`
 
-Decided: the existing `state_filter` and `port_filter` stay, and the slice adds `pid: i64` (default 0), `process` (a wildcard, default empty) and `summary: bool` (default `false`) (TR-REL-13, slice W26, GitHub #20). The issue used the names `state` and `local_port`. A rename would break the response contract of the ported tool (ADR-0003), so the slice keeps the existing names.
+Decided: the existing `state_filter` and `port_filter` stay, and the slice adds `pid: i64` (default 0), `process` (a wildcard, default empty) and `summary: bool` (default `false`) (TR-REL-13, slice W26, GitHub #20). The issue used the names `state` and `local_port`. A rename would break the response contract of the ported tool (ADR-0003), so the slice keeps the existing names. The summary groups the rows by process, local port, local address and remote address, with a count for each group. The server refuses an unknown state before the call.
 
 ## Q-20. Protected services for the service tools
 
-Decided: `set_service_start_type` and `stop_service` refuse a service that is critical for the remote session, for example `WinRM`, `RpcSs`, `LanmanServer` and the Service Control Manager (TR-SEC-15, AC-SEC15-3, slice W30, GitHub #10). The issue says "as `stop_service` does now, if it does". The code has no such refusal today: `src/server.rs` holds no service protection list. The conservative choice is to add the refusal. The exact set of names is an implementation detail of the slice and stays in the policy module.
+Decided: `set_service_start_type`, `stop_service` and `restart_service` refuse a service that is critical for the remote session (TR-SEC-15, AC-SEC15-3, slice W30, GitHub #10). The issue says "as `stop_service` does now, if it does". The code had no such refusal before the slice. The set is fixed in `policy::PROTECTED_SERVICES`: `WinRM`, `RpcSs`, `DcomLaunch`, `LanmanServer` and `Winmgmt`. The server also refuses a target on which a protected service depends. The host resolves the canonical name and repeats the check, because `ServiceController` also accepts a display name.
 
 ## Q-21. Personal data in the print job result
 
@@ -118,14 +118,14 @@ Decided: `get_print_jobs` returns the document name and the owner only with `inc
 
 ## Q-22. The time filter of the log search
 
-Decided: `search_file_content` takes `since` and `until` (timestamps) and `timestamp_format` (a regular expression, default `yyyy-MM-dd HH:mm:ss` at the start of the line) (TR-REL-16, slice W29, GitHub #17). If the caller gives `since` or `until` without a format, the server uses the default format. The `exclude` pattern of the `read_file` tail mode is a literal string (the `-SimpleMatch` rule, as in `search_file_content`), not a regular expression.
+Decided: `search_file_content` takes `since` and `until` (timestamps) and `timestamp_format` (a .NET fixed-width custom format, default `yyyy-MM-dd HH:mm:ss`, at the start of the line) (TR-REL-16, slice W29, GitHub #17). The format is not a regular expression. The host parses the timestamp prefix with `InvariantCulture`. The server refuses a variable-width specifier, a quoted or escaped literal and a non-ASCII character. If the caller gives `since` or `until` without a format, the server uses the default format. A date-only bound is the start of the day for `since` and the end of the day for `until`. The `exclude` pattern of the `read_file` tail mode is a literal substring, as in `search_file_content` (the `-SimpleMatch` rule), not a regular expression. `exclude` without the tail mode is refused.
 
 ## Q-23. The form of `doctor`
 
-Decided: `doctor` is a read-only subcommand (TR-PRF-18, AC-PRF-69, slice W31, GitHub #24). The issue offered a command `winrig doctor` or an option of `setup`. The subcommand keeps `setup` a single responsibility for the client configuration write. The optional part of the issue — `setup` writes the same set of variables for each profile it adds — stays outside the slice: it changes the write of the client configuration and needs its own decision.
+Decided: `doctor` is a read-only subcommand (TR-PRF-18, AC-PRF-69, slice W31, GitHub #24). The issue offered a command `winrig doctor` or an option of `setup`. The subcommand keeps `setup` a single responsibility for the client configuration write. The command shows a value only for a known non-secret setting. Its exit code is 0 without a difference, 1 on a difference or an incomplete scan and 2 on a usage error. The optional part of the issue — `setup` writes the same set of variables for each profile it adds — stays outside the slice: it changes the write of the client configuration and needs its own decision.
 
 ## Q-24. The markers and the envelope of the confirmation text
 
-Decided (slice W32): the server shows a hidden value as the literal `hidden` beside its label, for example `new value: hidden` (TR-SEC-18). The server caps a field of the confirmation at 200 characters. The marker of a cut is `...`, and it counts inside the cap: the server cuts the value to 197 characters and appends `...`, so the field holds at most 200 characters. The host is the host of the session of the call. The identity is the user of the current request (DR-2). The tool is the MCP tool name; the plain line of the action may hold the action label of today next to it.
+Decided (slice W32): the server shows a hidden value as the literal `hidden` beside its label, for example `new value: hidden` (TR-SEC-18). The old value of `set_registry` is hidden too. The server caps a field of the confirmation at 200 characters. The marker of a cut is `...`, and it counts inside the cap: the server cuts the value to 197 characters and appends `...`, so the field holds at most 200 characters. The host is the host of the session of the call. The identity is the user of the current request (DR-2). The tool is the MCP tool name; the plain line of the action may hold the action label of today next to it. `kill_process` shows the executable path and the start time, never the command line (DR-4). `write_file` shows the size and the resolved path.
 
-Open: the exact sentences of the action line and of the undo line of each tool. The requirement fixes only that one line exists and states the operation and whether the operator can undo it.
+The exact sentences of the effect and undo lines of each tool are fixed in `src/server.rs` as the `EFFECT_*` constants (TR-SEC-16, TR-SEC-20). A test checks that each sentence fits the 200-character cap. The requirement fixes that one line exists and states the operation and whether the operator can undo it.

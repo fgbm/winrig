@@ -45,7 +45,7 @@ impl std::fmt::Debug for WinrigServer {
 /// Ответ на подтверждение модифицирующей операции.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ConfirmResponse {
-    /// `true` — выполнить операцию.
+    #[schemars(description = "`true` — выполнить операцию.")]
     confirm: bool,
 }
 
@@ -364,17 +364,19 @@ macro_rules! require_confirmation {
 // Параметры инструментов
 // ---------------------------------------------------------------------------
 
+// User-facing text lives in explicit attributes, so doc comments never reach `tools/list`.
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ConnectParams {
-    /// Windows hostname or IP to connect to, e.g. 'web-server-01'.
+    #[schemars(description = "Windows hostname or IP to connect to, e.g. 'web-server-01'.")]
     host: String,
-    /// WinRM port. Defaults to 5985 for HTTP and 5986 for HTTPS.
+    #[schemars(description = "WinRM port. Defaults to 5985 for HTTP and 5986 for HTTPS.")]
     #[serde(default)]
     port: Option<i64>,
-    /// Use HTTPS transport. Derived from the port when omitted.
+    #[schemars(description = "Use HTTPS transport. Derived from the port when omitted.")]
     #[serde(default)]
     use_ssl: Option<bool>,
-    /// Validate the server TLS certificate on HTTPS.
+    #[schemars(description = "Validate the server TLS certificate on HTTPS.")]
     #[serde(default = "default_true")]
     verify_cert: bool,
 }
@@ -385,30 +387,32 @@ fn default_true() -> bool {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SessionIdParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ListDirectoryParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Absolute directory path to list, e.g. 'C:\\Users' or 'D:\\Logs'.
+    #[schemars(
+        description = "Absolute directory path to list, e.g. 'C:\\\\Users' or 'D:\\\\Logs'."
+    )]
     path: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct FindFilesParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Root directory to start the recursive search from.
+    #[schemars(description = "Root directory to start the recursive search from.")]
     path: String,
-    /// Filename wildcard to match, e.g. '*.log'.
+    #[schemars(description = "Filename wildcard to match, e.g. '*.log'.")]
     pattern: String,
-    /// Maximum recursion depth, default 5, capped at 10.
+    #[schemars(description = "Maximum recursion depth, default 5, capped at 10.")]
     #[serde(default = "default_depth")]
     max_depth: i64,
-    /// Include each file's size in the output.
+    #[schemars(description = "Include each file's size in the output.")]
     #[serde(default = "default_true")]
     include_size: bool,
 }
@@ -419,20 +423,20 @@ fn default_depth() -> i64 {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ReadFileParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Absolute path of the file to read.
+    #[schemars(description = "Absolute path of the file to read.")]
     path: String,
-    /// First 1-based line to return in range mode.
+    #[schemars(description = "First 1-based line to return in range mode.")]
     #[serde(default = "default_one")]
     start_line: i64,
-    /// Last line in range mode, or line count from end in tail mode.
+    #[schemars(description = "Last line in range mode, or line count from end in tail mode.")]
     #[serde(default = "default_200")]
     end_line: i64,
-    /// Read the last N lines instead of a range.
+    #[schemars(description = "Read the last N lines instead of a range.")]
     #[serde(default)]
     tail: bool,
-    /// File encoding, default UTF8.
+    #[schemars(description = "File encoding, default UTF8.")]
     #[serde(default = "default_utf8")]
     encoding: String,
 }
@@ -449,22 +453,24 @@ fn default_utf8() -> String {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SearchFileContentParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Single file, or narrowest directory to search recursively.
+    #[schemars(description = "Single file, or narrowest directory to search recursively.")]
     path: String,
-    /// Distinctive literal text to find; no regex or wildcards.
+    #[schemars(description = "Distinctive literal text to find; no regex or wildcards.")]
     pattern: String,
-    /// Filename wildcard for directory searches.
+    #[schemars(description = "Filename wildcard for directory searches.")]
     #[serde(default = "default_star")]
     file_filter: String,
-    /// Max matching lines to return, capped at 100.
+    #[schemars(description = "Max matching lines to return, capped at 100.")]
     #[serde(default = "default_50")]
     max_results: i64,
-    /// Lines shown before and after each match, max 10.
+    #[schemars(description = "Lines shown before and after each match, max 10.")]
     #[serde(default)]
     context_lines: i64,
-    /// Only search files changed within this many hours; 0 means all files.
+    #[schemars(
+        description = "Only search files changed within this many hours; 0 means all files."
+    )]
     #[serde(default)]
     modified_after_hours: i64,
 }
@@ -478,34 +484,36 @@ fn default_50() -> i64 {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CompareFilesParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Absolute path to the first file (reference).
+    #[schemars(description = "Absolute path to the first file (reference).")]
     path_a: String,
-    /// Absolute path to the second file (difference).
+    #[schemars(description = "Absolute path to the second file (difference).")]
     path_b: String,
-    /// Maximum differing lines to show, capped at 200.
+    #[schemars(description = "Maximum differing lines to show, capped at 200.")]
     #[serde(default = "default_50")]
     max_diffs: i64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct EventLogParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Event log to read: System (default), Application, or Security.
+    #[schemars(description = "Event log to read: System (default), Application, or Security.")]
     #[serde(default = "default_system")]
     log_name: String,
-    /// Severity threshold including higher: Critical, Error, Warning, Info.
+    #[schemars(
+        description = "Severity threshold including higher: Critical, Error, Warning, Info."
+    )]
     #[serde(default = "default_error_level")]
     level: String,
-    /// How many hours back to search, capped at 720.
+    #[schemars(description = "How many hours back to search, capped at 720.")]
     #[serde(default = "default_24")]
     hours_back: i64,
-    /// Provider name filter, wildcards allowed.
+    #[schemars(description = "Provider name filter, wildcards allowed.")]
     #[serde(default)]
     source: String,
-    /// Max events to return, capped at 100.
+    #[schemars(description = "Max events to return, capped at 100.")]
     #[serde(default = "default_25")]
     count: i64,
 }
@@ -525,15 +533,15 @@ fn default_25() -> i64 {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GetServicesParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Wildcard on Name or DisplayName.
+    #[schemars(description = "Wildcard on Name or DisplayName.")]
     #[serde(default)]
     name_filter: String,
-    /// Filter by state: Running, Stopped, or All.
+    #[schemars(description = "Filter by state: Running, Stopped, or All.")]
     #[serde(default = "default_all")]
     status_filter: String,
-    /// Deep JSON inspection per service.
+    #[schemars(description = "Deep JSON inspection per service.")]
     #[serde(default)]
     detail: bool,
 }
@@ -544,15 +552,15 @@ fn default_all() -> String {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ListProcessesParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Wildcard on process name.
+    #[schemars(description = "Wildcard on process name.")]
     #[serde(default)]
     name_filter: String,
-    /// Sort descending by CPU or Memory.
+    #[schemars(description = "Sort descending by CPU or Memory.")]
     #[serde(default = "default_memory")]
     sort_by: String,
-    /// Number of processes to show, capped at 100.
+    #[schemars(description = "Number of processes to show, capped at 100.")]
     #[serde(default = "default_30")]
     top: i64,
 }
@@ -566,12 +574,12 @@ fn default_30() -> i64 {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct PerfParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Seconds between samples; kept for compatibility, capped at 10.
+    #[schemars(description = "Seconds between samples; kept for compatibility, capped at 10.")]
     #[serde(default = "default_two")]
     interval_sec: i64,
-    /// Wildcard for per-process stats; empty omits that section.
+    #[schemars(description = "Wildcard for per-process stats; empty omits that section.")]
     #[serde(default)]
     process_filter: String,
 }
@@ -582,23 +590,25 @@ fn default_two() -> i64 {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct RegistryReadParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Registry path with 'HKLM:\\' prefix; HKEY_LOCAL_MACHINE form also accepted.
+    #[schemars(
+        description = "Registry path with 'HKLM:\\\\' prefix; HKEY_LOCAL_MACHINE form also accepted."
+    )]
     key: String,
-    /// Single value to read; empty dumps all values under the key.
+    #[schemars(description = "Single value to read; empty dumps all values under the key.")]
     #[serde(default)]
     value_name: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CertificatesParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Certificate store location: LocalMachine or CurrentUser.
+    #[schemars(description = "Certificate store location: LocalMachine or CurrentUser.")]
     #[serde(default = "default_localmachine")]
     store: String,
-    /// Only show certs expiring within this many days; 0 shows all.
+    #[schemars(description = "Only show certs expiring within this many days; 0 shows all.")]
     #[serde(default)]
     days_until_expiry: i64,
 }
@@ -609,23 +619,23 @@ fn default_localmachine() -> String {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct TestNetworkParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Hostname or IP to test connectivity to.
+    #[schemars(description = "Hostname or IP to test connectivity to.")]
     target: String,
-    /// TCP port to test, or 0 (default) for an ICMP ping.
+    #[schemars(description = "TCP port to test, or 0 (default) for an ICMP ping.")]
     #[serde(default)]
     port: i64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct EnvParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Wildcard on variable name.
+    #[schemars(description = "Wildcard on variable name.")]
     #[serde(default)]
     name_filter: String,
-    /// Variable scope: Machine, User, or Process.
+    #[schemars(description = "Variable scope: Machine, User, or Process.")]
     #[serde(default = "default_machine")]
     scope: String,
 }
@@ -636,33 +646,35 @@ fn default_machine() -> String {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ScheduledTasksParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Wildcard on task name.
+    #[schemars(description = "Wildcard on task name.")]
     #[serde(default)]
     name_filter: String,
-    /// Include disabled tasks.
+    #[schemars(description = "Include disabled tasks.")]
     #[serde(default)]
     include_disabled: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct UserGroupsParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// User to look up; empty lists all local groups.
+    #[schemars(description = "User to look up; empty lists all local groups.")]
     #[serde(default)]
     username: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct TcpConnectionsParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// State filter: Established (default), Listen, TimeWait, CloseWait, or All.
+    #[schemars(
+        description = "State filter: Established (default), Listen, TimeWait, CloseWait, or All."
+    )]
     #[serde(default = "default_established")]
     state_filter: String,
-    /// Only show connections involving this port; 0 means all ports.
+    #[schemars(description = "Only show connections involving this port; 0 means all ports.")]
     #[serde(default)]
     port_filter: i64,
 }
@@ -673,32 +685,32 @@ fn default_established() -> String {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct DnsCacheParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Wildcard on record name.
+    #[schemars(description = "Wildcard on record name.")]
     #[serde(default)]
     name_filter: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct InstalledSoftwareParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Wildcard on software name.
+    #[schemars(description = "Wildcard on software name.")]
     #[serde(default)]
     name_filter: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ResolveDnsParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Hostname or FQDN to resolve.
+    #[schemars(description = "Hostname or FQDN to resolve.")]
     name: String,
-    /// Record type: A (default), AAAA, CNAME, MX, NS, PTR, SOA, SRV, TXT.
+    #[schemars(description = "Record type: A (default), AAAA, CNAME, MX, NS, PTR, SOA, SRV, TXT.")]
     #[serde(default = "default_a")]
     record_type: String,
-    /// Specific DNS server to query; empty uses the system default.
+    #[schemars(description = "Specific DNS server to query; empty uses the system default.")]
     #[serde(default)]
     dns_server: String,
 }
@@ -709,31 +721,33 @@ fn default_a() -> String {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ServiceNameParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Exact service name, not display name.
+    #[schemars(description = "Exact service name, not display name.")]
     name: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct KillProcessParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Process ID to kill.
+    #[schemars(description = "Process ID to kill.")]
     pid: i64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetRegistryParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Registry path, e.g. 'HKLM:\\SOFTWARE\\MyApp'.
+    #[schemars(description = "Registry path, e.g. 'HKLM:\\\\SOFTWARE\\\\MyApp'.")]
     key: String,
-    /// Name of the registry value to set.
+    #[schemars(description = "Name of the registry value to set.")]
     value_name: String,
-    /// Data to write as a string.
+    #[schemars(description = "Data to write as a string.")]
     value_data: String,
-    /// Value type: String, DWord, QWord, ExpandString, MultiString, Binary.
+    #[schemars(
+        description = "Value type: String, DWord, QWord, ExpandString, MultiString, Binary."
+    )]
     #[serde(default = "default_string")]
     value_type: String,
 }
@@ -744,25 +758,26 @@ fn default_string() -> String {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct DeleteFileParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Absolute path to the file to delete.
+    #[schemars(description = "Absolute path to the file to delete.")]
     path: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WriteFileParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Absolute path of the file to write on the remote host.
+    #[schemars(description = "Absolute path of the file to write on the remote host.")]
     path: String,
-    /// Full contents to write. The file is replaced, not appended to.
+    #[schemars(description = "Full contents to write. The file is replaced, not appended to.")]
     content: String,
-    /// Replace the file when it already exists. Without this the call is
-    /// refused, so creating a file cannot destroy one by accident.
+    #[schemars(
+        description = "Replace the file when it already exists. Without this the call is\nrefused, so creating a file cannot destroy one by accident."
+    )]
     #[serde(default)]
     overwrite: bool,
-    /// Encoding of the written file; defaults to UTF-8 without a BOM.
+    #[schemars(description = "Encoding of the written file; defaults to UTF-8 without a BOM.")]
     #[serde(default = "default_write_encoding")]
     encoding: String,
 }
@@ -773,11 +788,11 @@ fn default_write_encoding() -> String {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct DeleteDirectoryParams {
-    /// Session ID returned by connect.
+    #[schemars(description = "Session ID returned by connect.")]
     session_id: String,
-    /// Absolute path to the directory to delete recursively.
+    #[schemars(description = "Absolute path to the directory to delete recursively.")]
     path: String,
-    /// Safety cap; refuse if more items exist.
+    #[schemars(description = "Safety cap; refuse if more items exist.")]
     #[serde(default = "default_5000")]
     max_items: i64,
 }
@@ -2183,5 +2198,21 @@ mod tests {
     fn server_constructs_with_registry_and_config() {
         let server = server();
         assert_eq!(server.config.mcpo_port, 8005);
+    }
+
+    /// Writes the full `tools/list` payload to the path in `WINRIG_DUMP_TOOLS`
+    /// with every tool enabled. It captures the user-facing API before and after
+    /// a change so the two payloads can be compared byte for byte; the test does
+    /// nothing when the variable is unset (the common run).
+    #[test]
+    fn dump_tools_when_requested() {
+        let Ok(path) = std::env::var("WINRIG_DUMP_TOOLS") else {
+            return;
+        };
+        let server = server_with(&[("WINRIG_ALLOW_FILE_WRITE", "true")]);
+        let value =
+            serde_json::to_value(server.tool_router.list_all()).expect("serialize tool list");
+        let text = serde_json::to_string_pretty(&value).expect("pretty print tool list");
+        std::fs::write(&path, format!("{text}\n")).expect("write tool dump");
     }
 }

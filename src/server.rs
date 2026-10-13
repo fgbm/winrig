@@ -120,7 +120,7 @@ impl WinrigServer {
         }
     }
 
-    /// Policy refusals are recorded for observability (TR-OBS-03, ADR-0015 §14).
+    /// Writes a policy refusal into the audit before any host call (TR-OBS-03, ADR-0015 §14).
     fn audit_refusal(&self, identity: &RequestIdentity, tool: &str, decision: &PolicyDecision) {
         self.registry
             .audit_refusal(&identity.username, tool, decision.code, &decision.reason);
@@ -2022,6 +2022,7 @@ mod tests {
         WinrigServer::new(registry, Arc::new(config()))
     }
 
+    /// DR-6: the tool applies this pure decision before any network call.
     #[test]
     fn policy_refuses_protected_delete_before_transport() {
         assert!(!decide_delete_path("C:\\Windows").allow);

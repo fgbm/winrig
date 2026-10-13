@@ -1,7 +1,7 @@
-//! Точка входа `winrig`: разбирает CLI и возвращает код выхода.
+//! Entry point of `winrig`: it parses the CLI and returns the exit code.
 //!
-//! Вся логика в [`winrig::app`]; здесь только вызов и код выхода, чтобы
-//! CLI-пути, журналирование и оба режима были покрыты тестами библиотеки.
+//! All logic lives in [`winrig::app`]; this file only calls it and exits, so the
+//! library tests cover the CLI paths, logging and both modes.
 
 fn main() {
     std::process::exit(winrig::app::main());

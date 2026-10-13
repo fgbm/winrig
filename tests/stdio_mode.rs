@@ -1,9 +1,9 @@
-//! Интеграционные проверки stdio-режима: реальный бинарь, временный профиль,
-//! фиктивный Windows-хост не нужен (AGENTS.md §4).
+//! Integration checks of the stdio mode: the real binary, a temporary profile and
+//! no fake Windows host (AGENTS.md §4).
 //!
-//! Проверяется то, чего не видят unit-тесты: stdout занят только JSON-RPC
-//! (AC-PRF-22), `initialize` проходит без HTTP-заголовков (AC-PRF-04), а
-//! `tools/list` возвращает ровно 37 инструментов (AC-PRF-48).
+//! Checks what the unit tests cannot see: stdout carries JSON-RPC only (AC-PRF-22),
+//! `initialize` passes without HTTP headers (AC-PRF-04), and `tools/list` returns
+//! exactly 37 tools (AC-PRF-48).
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -18,12 +18,12 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// Запускает `winrig stdio` с профилем и прогоняет рукопожатие MCP.
+/// Starts `winrig stdio` with a profile and performs the MCP handshake.
 fn run_stdio(profile_dir: &std::path::Path, token: &str) -> (Vec<String>, Vec<String>) {
     run_stdio_with(profile_dir, token, &[])
 }
 
-/// То же с дополнительными переменными окружения.
+/// Same as above, with extra environment variables.
 fn run_stdio_with(
     profile_dir: &std::path::Path,
     token: &str,
@@ -77,7 +77,7 @@ fn run_stdio_with(
     (out_lines, err_lines)
 }
 
-/// AC-PRF-04/22/48: рукопожатие, чистый stdout и 37 инструментов.
+/// AC-PRF-04/22/48: the handshake, a clean stdout and 37 tools.
 #[test]
 fn stdio_serves_mcp_over_clean_stdout() {
     let dir = temp_dir("serve");
@@ -87,21 +87,21 @@ fn stdio_serves_mcp_over_clean_stdout() {
 
     let (out_lines, err_lines) = run_stdio(&dir, &token);
 
-    // AC-PRF-22: каждая строка stdout — валидный JSON-RPC.
+    // AC-PRF-22: every stdout line is valid JSON-RPC.
     for line in &out_lines {
         let value: serde_json::Value = serde_json::from_str(line)
             .unwrap_or_else(|error| panic!("stdout line is not JSON-RPC: {error}\n{line}"));
         assert_eq!(value["jsonrpc"], "2.0");
     }
 
-    // AC-PRF-04: initialize ответил.
+    // AC-PRF-04: initialize answered.
     let initialize = out_lines
         .iter()
         .find(|line| line.contains("\"id\":1"))
         .expect("initialize response");
     assert!(initialize.contains("protocolVersion"));
 
-    // AC-PRF-48: ровно 37 инструментов.
+    // AC-PRF-48: exactly 37 tools.
     let tools_line = out_lines
         .iter()
         .find(|line| line.contains("\"id\":2"))
@@ -110,7 +110,7 @@ fn stdio_serves_mcp_over_clean_stdout() {
     let tools = value["result"]["tools"].as_array().expect("tools array");
     assert_eq!(tools.len(), 37, "expected 37 tools, got {}", tools.len());
 
-    // Журнал ушёл в stderr, а не в stdout.
+    // Log lines go to stderr, not stdout.
     assert!(
         err_lines
             .iter()
@@ -121,8 +121,8 @@ fn stdio_serves_mcp_over_clean_stdout() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// TR-FS-01: на проводе виден ровно тот набор, который разрешил оператор.
-/// По умолчанию `write_file` отсутствует, с включённой настройкой появляется.
+/// TR-FS-01: the wire shows exactly the set the operator allowed.
+/// `write_file` is absent by default and appears with the setting on.
 #[test]
 fn write_file_appears_only_when_enabled() {
     let dir = temp_dir("filewrite");
@@ -156,7 +156,7 @@ fn write_file_appears_only_when_enabled() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// AC-PRF-42: без WINRIG_TOKEN процесс отказывает, ничего не пишет в stdout.
+/// AC-PRF-42: without WINRIG_TOKEN the process refuses and writes nothing to stdout.
 #[test]
 fn stdio_without_token_refuses() {
     let dir = temp_dir("notoken");
@@ -180,7 +180,7 @@ fn stdio_without_token_refuses() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// AC-PRF-41: неверный токен даёт код 2, пароль не раскрывается.
+/// AC-PRF-41: a wrong token gives exit code 2 and reveals no password.
 #[test]
 fn stdio_with_wrong_token_refuses() {
     let dir = temp_dir("wrongtoken");
@@ -203,8 +203,8 @@ fn stdio_with_wrong_token_refuses() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Запускает stdio с заданным каталогом состояния и рукопожатием; возвращает
-/// код выхода и строки stdout.
+/// Starts stdio with a given state directory and a handshake; returns the exit
+/// code and the stdout lines.
 fn run_stdio_with_state(
     dir: &std::path::Path,
     state_dir: &std::path::Path,
@@ -247,8 +247,8 @@ fn run_stdio_with_state(
     (status.code(), lines)
 }
 
-/// AC-PRF-54/55: второй процесс на том же профиле отказывает; после
-/// завершения первого lock освобождается и новый процесс отвечает.
+/// AC-PRF-54/55: a second process on the same profile refuses; after the first
+/// ends the lock is released and a new process answers.
 #[test]
 fn second_process_on_same_profile_refuses_then_clears() {
     let dir = temp_dir("lock");
@@ -258,7 +258,7 @@ fn second_process_on_same_profile_refuses_then_clears() {
     let state_dir = dir.join("state");
     let lock_path = state_dir.join("corp").join("process.lock");
 
-    // Первый процесс держит stdin открытым и потому остаётся жив.
+    // The first process keeps stdin open, so it stays alive.
     let mut first = Command::new(env!("CARGO_BIN_EXE_winrig"))
         .arg("stdio")
         .arg("--profile")
@@ -272,7 +272,7 @@ fn second_process_on_same_profile_refuses_then_clears() {
         .spawn()
         .expect("spawn first");
 
-    // Ждём появления lock-файла, но не дольше таймаута.
+    // Wait for the lock file to appear, but no longer than the timeout.
     let mut waited = 0;
     while !lock_path.exists() && waited < 100 {
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -280,7 +280,7 @@ fn second_process_on_same_profile_refuses_then_clears() {
     }
     assert!(lock_path.exists(), "first process never took the lock");
 
-    // Второй процесс должен отказать и указать на HTTP-режим.
+    // The second process must refuse and point to the HTTP mode.
     let second = Command::new(env!("CARGO_BIN_EXE_winrig"))
         .arg("stdio")
         .arg("--profile")
@@ -299,7 +299,7 @@ fn second_process_on_same_profile_refuses_then_clears() {
         "stderr must point to HTTP: {stderr}"
     );
 
-    // AC-PRF-55: завершаем первый процесс, третий проходит рукопожатие.
+    // AC-PRF-55: end the first process; the third performs the handshake.
     drop(first.stdin.take());
     let _ = first.wait();
     let (code, lines) = run_stdio_with_state(&dir, &state_dir, "corp", &token);
@@ -312,12 +312,12 @@ fn second_process_on_same_profile_refuses_then_clears() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// AC-PRF-44: каталог профилей нельзя подготовить — отказ с путём.
+/// AC-PRF-44: the profile directory cannot be prepared; the refusal names the path.
 #[cfg(unix)]
 #[test]
 fn unusable_profile_dir_refuses_setup() {
     let dir = temp_dir("unusable");
-    // Путь занят обычным файлом, поэтому каталог по нему не создаётся.
+    // A regular file occupies the path, so the directory cannot be created there.
     let occupied = dir.join("not-a-dir");
     std::fs::write(&occupied, b"x").expect("write");
 

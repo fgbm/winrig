@@ -1,49 +1,49 @@
-# Политика безопасности
+# Security policy
 
-`winrig` администрирует Windows-хосты по WinRM и держит пароль AD в памяти. Уязвимость здесь — не баг утилиты: bearer-токен это ключ, который одновременно даёт доступ к серверу и расшифровывает пароль. Сообщения рассматриваются серьёзно и ведутся приватно до выхода исправления.
+`winrig` administers Windows hosts over WinRM and keeps the AD password in memory. A vulnerability here is not a defect of a utility. A bearer token is a key that at the same time gives access to the server and decrypts the password. Reports receive serious attention and stay private until a fix goes out.
 
-## Как сообщить об уязвимости
+## How to report a vulnerability
 
-Не открывайте публичный issue. Используйте приватный канал GitHub:
+Do not open a public issue. Use the private GitHub channel:
 
 **[Report a vulnerability](https://github.com/fgbm/winrig/security/advisories/new)** (Security → Advisories → Report a vulnerability)
 
-Если канал недоступен, откройте issue, в котором сказано только, что у вас есть сообщение об уязвимости, и попросите приватный контакт; детали в текст issue не включайте.
+If the channel is not available, open an issue that says only that you have a vulnerability report. Ask for a private contact, and do not put details in the text of the issue.
 
-Пожалуйста, приложите:
+Include:
 
-- версию (тег релиза или вывод `winrig --version`) и платформу;
-- что получает атакующий — читает секрет, достигает хоста вне `WINRIG_ALLOWED_HOSTS`, выполняет модификацию без подтверждения, обходит редакцию секретов и так далее;
-- минимальное воспроизведение, какое есть, с секретами, заменёнными на плейсхолдеры;
-- затронута ли конфигурация по умолчанию или требуется задать переменную окружения.
+- the version (a release tag or the output of `winrig --version`) and the platform;
+- what the attacker gets — reads a secret, reaches a host outside `WINRIG_ALLOWED_HOSTS`, runs a modification without confirmation, bypasses the secret redaction, and so on;
+- the smallest reproduction that you have, with secrets replaced by placeholders;
+- whether the default configuration is affected or an environment variable must be set.
 
-Сообщение об отсутствующей мере защиты, которую документация уже называет принятой (см. *Границы* ниже), — это вопрос к документации, а не уязвимость.
+The documentation already names some missing protections as accepted (see *Boundaries* below). A report about them is a question about the documentation, not a vulnerability.
 
-## Чего ожидать
+## What to expect
 
-- **Подтверждение** в течение 5 рабочих дней.
-- **Оценка** в течение 10 рабочих дней: принято ли сообщение, серьёзность и примерный срок исправления.
-- **Согласованное раскрытие.** Исправление готовится приватно и выпускается; advisory называет версию, в которой оно вышло. Автор упоминается, если не попросил обратного. Платного вознаграждения нет.
+- **Acknowledgement** within 5 working days.
+- **Assessment** within 10 working days: whether the report is accepted, the severity and an approximate fix time.
+- **Coordinated disclosure.** A fix is prepared in private and released; the advisory names the version in which it went out. The author is credited, unless they ask for the opposite. There is no paid reward.
 
-## Границы
+## Boundaries
 
-В границах — всё, что нарушает доменные правила проекта (`AGENTS.md` §3 и `docs/REQUIREMENTS.md`):
+Inside the boundaries is everything that violates the domain rules of the project (`AGENTS.md` §3 and `docs/REQUIREMENTS.md`):
 
-- секрет (пароль AD, bearer-токен, токен профиля, секрет внутри команды) попадает в журнал, аудит, ответ агенту, конфигурацию или коммит;
-- запрос получает доверие до проверки его секрета, либо один оператор читает сессию или кэш паролей другого;
-- хост достигнут вне `WINRIG_ALLOWED_HOSTS`, либо проверка TLS понижена при `WINRIG_ALLOW_INSECURE_TLS=false`;
-- модифицирующий инструмент выполняется без явного подтверждения, либо выполняется вообще, когда клиент не может спросить (обязан отказать, fail-closed);
-- удаление или `write_file` выходит за список защищённых путей, в том числе через junction или symlink;
-- значение из аргумента инструмента выходит в текст PowerShell вместо передачи как данных.
+- a secret appears in a log, the audit, a reply to the agent, the configuration or a commit. The secret can be the AD password, a bearer token, a profile token or a secret inside a command;
+- a request gets trust before the check of its secret, or one operator reads the session or the password cache of another;
+- a host is reached outside `WINRIG_ALLOWED_HOSTS`, or the TLS check is downgraded while `WINRIG_ALLOW_INSECURE_TLS=false`;
+- a modifying tool runs without explicit confirmation, or runs at all when the client cannot ask (it must refuse, fail-closed);
+- a deletion or `write_file` reaches a protected path, including through a junction or a symlink;
+- a value from a tool argument goes into the text of PowerShell instead of going as data.
 
-Заведомо вне границ — это записанные решения продукта, а не дефекты:
+Deliberately outside the boundaries are the recorded decisions of the product, not defects:
 
-- **Открытый HTTP на `/mcp`.** В бинаре нет TLS-слушателя по решению; bearer-токен это ключ, а развёртывание обязано поставить впереди TLS-терминирующий обратный прокси (`README.md`, раздел «Безопасность транспорта»). Запуск на не-loopback адресе без прокси — ошибка оператора.
-- **Первый запрос на новом WinRM-соединении несёт тело открытым текстом.** Ключ сессии NTLM не существует, пока не завершится рукопожатие; это свойство WinRM поверх порта 5985, и потому рекомендуется порт 5986 (`README.md`, раздел «Безопасность транспорта»).
-- **Файл профиля на диске.** В нём только аутентифицированный шифртекст; ключ живёт у клиента и никогда не хранится вместе с ним. Атакующий, у которого уже есть и файл, и токен, вне модели угроз.
-- **Пароль, переданный оператором аргументом командной строки.** Он виден в списке процессов; документация говорит предпочитать окружение или конфиг клиента.
-- **Остаточная экспозиция, названная в документации**, например пароль AD, попадающий в собственные журналы контроллера домена при смене пароля.
+- **Plain HTTP on `/mcp`.** The binary has no TLS listener by decision. A bearer token is a key, and a deployment must put a TLS-terminating reverse proxy in front (`README.md`, section "Transport security"). A start on a non-loopback address without a proxy is an operator error.
+- **The first request on a new WinRM connection carries the body in plain text.** The NTLM session key does not exist until the handshake completes. This is a property of WinRM over port 5985, and for this reason the documentation recommends port 5986 (`README.md`, section "Transport security").
+- **The profile file on the disk.** It holds only the authenticated ciphertext; the key lives at the client and is never stored together with it. An attacker who already has both the file and the profile token is outside the threat model.
+- **A password that an operator passes as a command-line argument.** It is visible in the process list; the documentation tells you to prefer the environment or the client configuration.
+- **Residual exposure that the documentation names**, for example an AD password that reaches the domain controller's own logs at a password change.
 
-## Поддерживаемые версии
+## Supported versions
 
-Исправления идут в `main` и выпускаются тегом. Исправления безопасности не переносятся в более ранние теги; обновитесь до последнего релиза. Разработка идёт в `main`, поэтому сообщение могут попросить воспроизвести на нём.
+Fixes go to `main` and go out under a tag. Security fixes do not move to earlier tags; update to the latest release. Development happens on `main`, so a report may ask you to reproduce on it.

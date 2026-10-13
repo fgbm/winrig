@@ -1095,6 +1095,10 @@ mod tests {
     /// cache and lose events. A global subscriber is always interested in everything, and
     /// the thread buffer splits the events by test. `tokio::test` runs the test on the same
     /// thread, so asynchronous tests are visible too.
+    ///
+    /// The callsite-interest cache is process-wide and `tracing` never revisits it by itself.
+    /// `capture` rebuilds it, so a callsite first seen while the subscriber was being
+    /// installed (cached as `never`) is interested again.
     struct Capture {
         captured: Captured,
     }
@@ -1121,9 +1125,39 @@ mod tests {
             tracing::subscriber::set_global_default(subscriber)
                 .expect("no other global subscriber in unit tests");
         });
+        // The install registers the dispatcher before it becomes the default, so a callsite
+        // first hit in that window is cached as `never` and stays dead. Rebuild the cache now
+        // that the subscriber is the default; `tracing` does not revisit it on its own.
+        tracing::callsite::rebuild_interest_cache();
         let captured = Captured::default();
         SINK.with(|sink| *sink.borrow_mut() = Some(captured.clone()));
         Capture { captured }
+    }
+
+    // A stand-in callsite whose interest can be forced to the `never` state the install window
+    // produces. It is not a macro callsite, so a test can reach it.
+    static PROBE_META: tracing::Metadata<'static> = tracing::Metadata::new(
+        "probe",
+        "winrig::probe",
+        tracing::Level::INFO,
+        None,
+        None,
+        None,
+        tracing::field::FieldSet::new(&["message"], tracing::callsite::Identifier(&PROBE_CALLSITE)),
+        tracing::metadata::Kind::EVENT,
+    );
+
+    static PROBE_CALLSITE: tracing::callsite::DefaultCallsite =
+        tracing::callsite::DefaultCallsite::new(&PROBE_META);
+
+    // Emits the probe the way the `tracing` macro does: a `never` interest skips the event.
+    fn emit_probe() {
+        if PROBE_CALLSITE.interest().is_never() {
+            return;
+        }
+        let values = [Some(&"PROBE" as &dyn tracing::field::Value)];
+        let set = PROBE_META.fields().value_set_all(&values);
+        tracing::Event::dispatch(&PROBE_META, &set);
     }
 
     /// Records the commands it gets and returns preset answers.
@@ -1853,5 +1887,25 @@ mod tests {
         assert!(text.contains("POLICY REFUSED"), "{text}");
         assert!(text.contains("PASSWORD_REQUIRED"), "{text}");
         assert!(!text.contains("AUTH LOCKOUT"), "{text}");
+    }
+
+    /// The audit callsite is one static location whose interest `tracing` caches for the whole
+    /// process. A callsite first seen while the subscriber was being installed is cached as
+    /// `never` and stays dead. `capture` rebuilds the cache, so the entry does not outlive it.
+    #[test]
+    fn capture_revives_a_callsite_cached_as_never() {
+        use tracing::callsite::Callsite as _;
+        let _installed = capture();
+        tracing::callsite::register(&PROBE_CALLSITE);
+        PROBE_CALLSITE.set_interest(tracing::subscriber::Interest::never());
+        // A parallel test can also call `capture`; every call rebuilds the cache, so the
+        // forced `never` cannot outlive the next one.
+        let captured = capture();
+        assert!(
+            !PROBE_CALLSITE.interest().is_never(),
+            "capture must rebuild the interest cache"
+        );
+        emit_probe();
+        assert!(captured.text().contains("PROBE"), "{}", captured.text());
     }
 }

@@ -3,7 +3,7 @@ title: Tools
 description: The read-only tools and the modifying tools of winrig, with the switches that enable the modifying tools.
 ---
 
-The binary declares 37 tools, plus `write_file` when the operator enables it. The read-only tools need no confirmation. The modifying tools require the explicit confirmation of the operator (DR-5).
+The binary declares 38 tools, plus `write_file` when the operator enables it. The read-only tools need no confirmation. The modifying tools require the explicit confirmation of the operator (DR-5).
 
 ## Session
 
@@ -31,6 +31,7 @@ The binary declares 37 tools, plus `write_file` when the operator enables it. Th
 | Tool | Description |
 |------|-------------|
 | `get_event_log` | The Windows event log: crashes, service failures, authentication errors |
+| `list_event_logs` | The event log channels with the record count and the enabled state |
 | `get_services` | A summary of the services, or the full details of each service in JSON |
 | `list_processes` | The processes with a sort by CPU, memory or handles |
 | `get_system_info` | The OS version, uptime, RAM, CPU count, domain, time zone |

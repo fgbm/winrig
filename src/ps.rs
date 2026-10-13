@@ -500,7 +500,13 @@ pub fn compare_files(path_a: &str, path_b: &str, max_diffs: i64) -> String {
 
 /// # Errors
 ///
-/// Returns an error text for an unknown level (TR-REL-03).
+/// Returns an error text for an unknown level (TR-REL-03) or for a channel name
+/// with a wildcard character.
+///
+/// The channel name is any name that `Get-WinEvent -ListLog` returns (TR-REL-12).
+/// The name is escaped before it enters the single-quoted string, so it cannot
+/// inject. A wildcard is refused, because the validation below must check one
+/// exact channel.
 pub fn get_event_log(
     log_name: &str,
     level: &str,
@@ -508,6 +514,12 @@ pub fn get_event_log(
     source: &str,
     count: i64,
 ) -> Result<String, String> {
+    if log_name.contains(['*', '?', '[']) {
+        return Err(format!(
+            "Invalid log_name '{log_name}': the wildcard characters '*', '?' and '[' are not \
+             allowed. Use the exact channel name from list_event_logs."
+        ));
+    }
     let safe_log = escape(log_name);
     let result_cap = cap(count, 1, 100);
     let hours = cap(hours_back, 1, 720);
@@ -526,25 +538,65 @@ pub fn get_event_log(
         "@{{LogName='{safe_log}'; Level={levels}; StartTime=(Get-Date).AddHours(-{hours})}}"
     );
     let get_events = if source.trim().is_empty() {
-        format!(
-            "Get-WinEvent -FilterHashtable {filter} -MaxEvents {result_cap} -ErrorAction SilentlyContinue"
-        )
+        format!("Get-WinEvent -FilterHashtable {filter} -MaxEvents {result_cap} -ErrorAction Stop")
     } else {
         let safe_source = escape(source.trim());
         format!(
-            "Get-WinEvent -FilterHashtable {filter} -ErrorAction SilentlyContinue \
+            "Get-WinEvent -FilterHashtable {filter} -ErrorAction Stop \
              | Where-Object {{ $_.ProviderName -like '{safe_source}' }} \
              | Select-Object -First {result_cap}"
         )
     };
+    // The channel is checked first with `-ListLog`, so a missing or mistyped
+    // channel fails the call before the event query. Only a missing channel
+    // (`*NoMatchingLogs*`) is fatal; another pre-check error, for example a
+    // reader who may read Security events but not its configuration, is ignored
+    // and the query runs. In the query only `NoMatchingEventsFound` means an
+    // empty result; the message text is localized, so both branches are taken on
+    // the error id, and any other error is rethrown.
     Ok(format!(
-        "$ev = @({get_events}); \
+        "try {{ Get-WinEvent -ListLog '{safe_log}' -ErrorAction Stop | Out-Null }} \
+         catch {{ if ($_.FullyQualifiedErrorId -like '*NoMatchingLogs*') {{ throw }} }}; \
+         $ev = @(); \
+         try {{ $ev = @({get_events}) }} \
+         catch {{ if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') {{ $ev = @() }} else {{ throw }} }}; \
          if ($ev.Count -eq 0) {{ Write-Output 'No events matched: log={safe_log}, level={level_key} and higher, last {hours}h'; exit 0 }}; \
          $ev | ForEach-Object {{ \
          \"$($_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) [$($_.LevelDisplayName)] ($($_.ProviderName)) ID:$($_.Id)\"; \
          \"  $(if ($_.Message) {{ $_.Message.Substring(0,[Math]::Min($_.Message.Length,400)) }} else {{ '' }})\"; \
          \"---\" }}"
     ))
+}
+
+/// The cap on the channel list. A host exposes more than a thousand channels once
+/// the Analytic and Debug logs are included, so a query without a filter is
+/// normally truncated; the full count sets the `truncated` flag.
+const EVENT_LOG_LIMIT: usize = 300;
+
+/// Returns every accessible channel that `Get-WinEvent -ListLog` reports, with
+/// the record count and the enabled state (TR-REL-12, AC-REL12-2).
+///
+/// The filter is a wildcard on the channel name; an empty filter lists every
+/// channel. The name is escaped before it enters the single-quoted string. A
+/// channel that denies access is skipped and counted, and a filter with no match
+/// gives an empty list (the `NoMatchingLogs` error is not a skip).
+#[must_use]
+pub fn list_event_logs(filter: &str) -> String {
+    let trimmed = filter.trim();
+    let pattern = if trimmed.is_empty() { "*" } else { trimmed };
+    let safe_filter = escape(pattern);
+    let limit = EVENT_LOG_LIMIT;
+    format!(
+        "$err = @(); \
+         $logs = @(Get-WinEvent -ListLog '{safe_filter}' -ErrorAction SilentlyContinue -ErrorVariable err); \
+         $skipped = @($err | Where-Object {{ $_.FullyQualifiedErrorId -notlike '*NoMatchingLogs*' }}).Count; \
+         $truncated = $logs.Count -gt {limit}; \
+         $rows = @($logs | Select-Object -First {limit} | ForEach-Object {{ \
+         [PSCustomObject]@{{ name=$_.LogName; record_count=$_.RecordCount; enabled=[bool]$_.IsEnabled }} }}); \
+         [PSCustomObject]@{{ logs=$rows; count=$rows.Count; truncated=$truncated; skipped=$skipped }} \
+         | ConvertTo-Json -Compress -Depth 3",
+        limit = limit,
+    )
 }
 
 #[must_use]
@@ -1100,6 +1152,189 @@ mod tests {
         assert!(cmd.contains("Select-Object -First 10"));
     }
 
+    /// AC-REL12-1: a channel name with any single quote doubles every form of the
+    /// quote in the recorded command (TR-SEC-12).
+    #[test]
+    fn get_event_log_escapes_the_channel_name_quote() {
+        for quote in SINGLE_QUOTES {
+            let channel = format!("Microsoft-Windows-X{quote}Operational");
+            let cmd = get_event_log(&channel, "error", 24, "", 10).expect("valid");
+            let doubled = format!("Microsoft-Windows-X{quote}{quote}Operational");
+            assert!(
+                cmd.contains(&format!("LogName='{doubled}'")),
+                "the channel quote must be doubled: {cmd}"
+            );
+        }
+    }
+
+    /// TR-REL-12: the query selects the channel by name, so any operational
+    /// channel passes. The channel is validated with `-ListLog` before the event
+    /// query, so a mistyped channel fails before the query runs.
+    #[test]
+    fn get_event_log_accepts_an_operational_channel() {
+        let cmd = get_event_log(
+            "Microsoft-Windows-PrintService/Operational",
+            "info",
+            24,
+            "",
+            25,
+        )
+        .expect("valid");
+        assert!(
+            cmd.contains("LogName='Microsoft-Windows-PrintService/Operational'"),
+            "{cmd}"
+        );
+        let list_log = cmd.find("-ListLog").expect("the channel check");
+        let filter = cmd.find("-FilterHashtable").expect("the event query");
+        assert!(
+            list_log < filter,
+            "the channel check must precede the event query: {cmd}"
+        );
+    }
+
+    /// A channel name with a wildcard is refused before any host call, because
+    /// the validation must check one exact channel.
+    #[test]
+    fn get_event_log_refuses_a_wildcard_channel() {
+        for name in ["*", "Microsoft-Windows-*", "Print?Service", "[System]"] {
+            let error = get_event_log(name, "error", 24, "", 10).expect_err("wildcard channel");
+            assert!(error.contains("log_name"), "{error}");
+            assert!(error.contains("'*'"), "{error}");
+        }
+    }
+
+    /// The "no events" error is an empty result, not a failure. The branch is on
+    /// the error id, because the message text is localized.
+    #[test]
+    fn get_event_log_treats_no_matching_events_as_empty() {
+        let cmd = get_event_log("System", "error", 24, "", 10).expect("valid");
+        assert!(
+            cmd.contains("$_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*'"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("$ev = @()"), "{cmd}");
+    }
+
+    /// A missing channel fails the call before the query; a pre-check error for
+    /// another reason is ignored and the query runs. In the query only the "no
+    /// matching events" error becomes an empty list; any other error is rethrown.
+    #[test]
+    fn get_event_log_rethrows_only_a_missing_channel_and_query_errors() {
+        let cmd = get_event_log("Security", "error", 24, "", 10).expect("valid");
+        assert!(
+            cmd.contains(
+                "catch { if ($_.FullyQualifiedErrorId -like '*NoMatchingLogs*') { throw } }"
+            ),
+            "the pre-check must rethrow only a missing channel: {cmd}"
+        );
+        assert!(
+            cmd.contains(
+                "catch { if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { $ev = @() } else { throw } }"
+            ),
+            "the query must rethrow everything but a no-match: {cmd}"
+        );
+    }
+
+    /// Worst case for the WinRS command line: a long channel name and a long
+    /// source wildcard. The command must still fit one line.
+    #[test]
+    fn get_event_log_command_fits_the_winrs_line_for_a_long_channel() {
+        let channel = format!("Microsoft-Windows-{}/Operational", "A".repeat(200));
+        let source = format!("Microsoft-Windows-{}-*", "B".repeat(200));
+        let cmd = get_event_log(&channel, "info", 24, &source, 100).expect("valid");
+        assert!(
+            command_line_chars(&cmd) < WINRS_COMMAND_LINE_LIMIT,
+            "chars: {}",
+            command_line_chars(&cmd)
+        );
+    }
+
+    /// AC-REL12-2: the command reads `Get-WinEvent -ListLog` and the result names
+    /// each channel, the record count and the enabled state as a JSON array.
+    #[test]
+    fn list_event_logs_reads_the_channel_list() {
+        let cmd = list_event_logs("Microsoft-Windows-*");
+        assert!(
+            cmd.contains("Get-WinEvent -ListLog 'Microsoft-Windows-*'"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("name=$_.LogName"), "{cmd}");
+        assert!(cmd.contains("record_count=$_.RecordCount"), "{cmd}");
+        assert!(cmd.contains("enabled=[bool]$_.IsEnabled"), "{cmd}");
+        assert!(
+            cmd.contains("$rows = @("),
+            "the array form needs @(): {cmd}"
+        );
+        assert!(cmd.contains("ConvertTo-Json"), "{cmd}");
+        assert!(cmd.contains("truncated=$truncated"), "{cmd}");
+    }
+
+    /// A channel that denies access is skipped, not fatal: the list continues and
+    /// the count of skipped channels goes to the result.
+    #[test]
+    fn list_event_logs_skips_an_inaccessible_channel() {
+        let cmd = list_event_logs("");
+        assert!(
+            cmd.contains("-ErrorAction SilentlyContinue -ErrorVariable err"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("$skipped = @($err"), "{cmd}");
+        assert!(cmd.contains("skipped=$skipped"), "{cmd}");
+        // The "no matching logs" error is an empty result, not a skip, so it is
+        // excluded by the error id (the message text is localized).
+        assert!(
+            cmd.contains("$_.FullyQualifiedErrorId -notlike '*NoMatchingLogs*'"),
+            "{cmd}"
+        );
+    }
+
+    /// An empty filter lists every channel; the pattern is the wildcard.
+    #[test]
+    fn list_event_logs_empty_filter_lists_every_channel() {
+        let cmd = list_event_logs("   ");
+        assert!(cmd.contains("Get-WinEvent -ListLog '*'"), "{cmd}");
+    }
+
+    /// Worst case for the WinRS command line: a long channel wildcard.
+    #[test]
+    fn list_event_logs_command_fits_the_winrs_line_for_a_long_filter() {
+        let filter = format!("{}-*", "A".repeat(300));
+        let cmd = list_event_logs(&filter);
+        assert!(
+            command_line_chars(&cmd) < WINRS_COMMAND_LINE_LIMIT,
+            "chars: {}",
+            command_line_chars(&cmd)
+        );
+    }
+
+    /// The cap keeps the JSON result inside the executor output limit even with
+    /// the longest plausible channel names.
+    #[test]
+    fn list_event_logs_output_fits_the_executor_cap() {
+        let rows: Vec<Value> = (0..EVENT_LOG_LIMIT)
+            .map(|index| {
+                serde_json::json!({
+                    "name": "A".repeat(100),
+                    "record_count": 9_999_999_i64,
+                    "enabled": index % 2 == 0,
+                })
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "logs": rows,
+            "count": EVENT_LOG_LIMIT,
+            "truncated": false,
+            "skipped": 0,
+        });
+        let text = serde_json::to_string(&payload).expect("serialize");
+        assert!(
+            text.len() <= crate::executor::MAX_OUTPUT_CHARS,
+            "the capped result is {} characters, over the {} limit",
+            text.len(),
+            crate::executor::MAX_OUTPUT_CHARS
+        );
+    }
+
     #[test]
     fn get_environment_variables_rejects_unknown_scope() {
         assert!(get_environment_variables("", "galaxy").is_err());
@@ -1568,6 +1803,7 @@ mod tests {
             file_info(evil),
             compare_files(evil, evil, 5),
             get_event_log(evil, "error", 24, evil, 10).expect("valid"),
+            list_event_logs(evil),
             get_services(evil, "all", true),
             list_processes(evil, "memory", 10),
             get_registry(evil, evil, false, 1),

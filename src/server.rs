@@ -491,7 +491,9 @@ struct CompareFilesParams {
 struct EventLogParams {
     #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
-    #[schemars(description = "Event log to read: System (default), Application or Security.")]
+    #[schemars(
+        description = "Event log channel to read: System (default), Application, Security or any channel that list_event_logs returns."
+    )]
     #[serde(default = "default_system")]
     log_name: String,
     #[schemars(
@@ -521,6 +523,15 @@ fn default_24() -> i64 {
 }
 fn default_25() -> i64 {
     25
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ListEventLogsParams {
+    #[schemars(description = "Session ID that connect returns.")]
+    session_id: String,
+    #[schemars(description = "Wildcard on the channel name. An empty value lists every channel.")]
+    #[serde(default)]
+    filter: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1047,6 +1058,26 @@ impl WinrigServer {
         };
         Ok(self
             .run(&identity, &params.session_id, &command, "get_event_log")
+            .await)
+    }
+
+    #[tool(
+        name = "list_event_logs",
+        description = "List the Windows event log channels with the record count and the enabled state. The record count is null for a channel without a log file. A query without a filter returns a truncated set. Use it to find an operational channel for get_event_log."
+    )]
+    async fn list_event_logs(
+        &self,
+        Parameters(params): Parameters<ListEventLogsParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let identity = self.identity(&ctx)?;
+        Ok(self
+            .run(
+                &identity,
+                &params.session_id,
+                &ps::list_event_logs(&params.filter),
+                "list_event_logs",
+            )
             .await)
     }
 
@@ -2078,7 +2109,7 @@ mod tests {
             !names.iter().any(|name| name == "write_file"),
             "write_file must not be advertised while disabled"
         );
-        assert_eq!(names.len(), 37, "expected 37 tools without write_file");
+        assert_eq!(names.len(), 38, "expected 38 tools without write_file");
 
         let on = server_with(&[("WINRIG_ALLOW_FILE_WRITE", "true")]);
         let names: Vec<String> = on
@@ -2088,7 +2119,7 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect();
         assert!(names.iter().any(|name| name == "write_file"));
-        assert_eq!(names.len(), 38, "expected 38 tools with write_file");
+        assert_eq!(names.len(), 39, "expected 39 tools with write_file");
     }
 
     /// TR-FS-01: a removed route is not only hidden from the list but also uncallable.
@@ -2143,11 +2174,11 @@ mod tests {
         // duplicate. These are all declared tools; the configuration decides
         // how many the agent sees (TR-FS-01), and
         // `write_file_is_absent_until_the_operator_enables_it` checks that.
-        assert_eq!(tools.len(), 38, "expected 38 declared tools");
+        assert_eq!(tools.len(), 39, "expected 39 declared tools");
         let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 38, "tool names must be unique");
+        assert_eq!(names.len(), 39, "tool names must be unique");
     }
 
     #[test]

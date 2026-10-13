@@ -541,6 +541,78 @@ async fn get_registry_default_stays_values_only() {
     harness.client.cancel().await.ok();
 }
 
+/// AC-REL12-2: `list_event_logs` reads the channel list on the host, and a read
+/// asks no confirmation.
+#[tokio::test]
+async fn list_event_logs_reads_the_channel_list_on_the_host() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let before = harness.elicitations();
+    let result = harness
+        .call(
+            CallToolRequestParams::new("list_event_logs").with_arguments(args(
+                &serde_json::json!({
+                    "session_id": HOST,
+                    "filter": "Microsoft-Windows-*"
+                }),
+            )),
+        )
+        .await;
+    assert_eq!(
+        error_of(&result),
+        None,
+        "the channel list must not fail: {:?}",
+        result.structured_content
+    );
+    assert_eq!(
+        harness.elicitations(),
+        before,
+        "a read-only tool asked for confirmation"
+    );
+    assert!(
+        harness
+            .transport
+            .saw("Get-WinEvent -ListLog 'Microsoft-Windows-*'"),
+        "the channel list query never reached the host"
+    );
+    assert!(
+        harness.transport.saw("name=$_.LogName"),
+        "the recorded command does not name the channel"
+    );
+    assert!(
+        harness.transport.saw("enabled=[bool]$_.IsEnabled"),
+        "the recorded command does not return the enabled state"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// AC-REL12-1: a channel name with a single quote reaches the host with every
+/// form of the quote doubled (TR-SEC-12).
+#[tokio::test]
+async fn get_event_log_doubles_the_channel_quote_on_the_host() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let result = harness
+        .call(
+            CallToolRequestParams::new("get_event_log").with_arguments(args(&serde_json::json!({
+                "session_id": HOST,
+                "log_name": "Microsoft-Windows-X'Operational"
+            }))),
+        )
+        .await;
+    assert_eq!(
+        error_of(&result),
+        None,
+        "the event read must not fail: {:?}",
+        result.structured_content
+    );
+    assert!(
+        harness
+            .transport
+            .saw("LogName='Microsoft-Windows-X''Operational'"),
+        "the channel quote is not doubled in the recorded command"
+    );
+    harness.client.cancel().await.ok();
+}
+
 /// AC-SEC05-1, AC-SEC05-2: without `WINRIG_ALLOWED_HOSTS` a remote host is refused
 /// before the network, and loopback passes (TR-SEC-14).
 #[tokio::test]

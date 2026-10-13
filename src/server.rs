@@ -651,7 +651,6 @@ struct ScheduledTasksParams {
     #[schemars(description = "A wildcard on the task name.")]
     #[serde(default)]
     name_filter: String,
-    #[schemars(description = "Include the disabled tasks.")]
     #[serde(default)]
     include_disabled: bool,
 }
@@ -737,7 +736,6 @@ struct ServiceNameParams {
 struct KillProcessParams {
     #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
-    #[schemars(description = "Process ID to kill.")]
     pid: i64,
 }
 
@@ -747,7 +745,6 @@ struct SetRegistryParams {
     session_id: String,
     #[schemars(description = "Registry path, for example 'HKLM:\\\\SOFTWARE\\\\MyApp'.")]
     key: String,
-    #[schemars(description = "Name of the registry value to set.")]
     value_name: String,
     #[schemars(description = "Data to write, as a string.")]
     value_data: String,

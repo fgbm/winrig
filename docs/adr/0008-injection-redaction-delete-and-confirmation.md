@@ -1,45 +1,45 @@
-# ADR-0008 — Защита от инъекций, редакция на боевом пути, отсутствие пула и замена канала подтверждения
+# ADR-0008 — Injection protection, redaction on the live path, no pool and a replacement of the confirmation channel
 
-- Статус: принято
-- Дата: 2026-09-19
-- Связано: DR-4, DR-5, DR-6, DR-7, ADR-0002, ADR-0003, ADR-0006
+- Status: accepted
+- Date: 2026-09-19
+- Related: DR-4, DR-5, DR-6, DR-7, ADR-0002, ADR-0003, ADR-0006
 
-## Контекст
+## Context
 
-Повторный аудит выявил дефекты, которые первый аудит не поймал:
+The second audit found defects that the first audit did not catch:
 
-1. `compare_files` подставлял пути в строку PowerShell в двойных кавычках, где `$(...)` раскрывается: имя файла вида `a$(calc).txt` выполняло код на хосте.
-2. `run_ps` получал список редактируемых значений от вызывающего, но сервер передавал пустой список. Значение `set_registry` попадало в аудит открытым текстом, нарушая DR-4. Тест AC-SEC02-1 передавал секреты вручную и разрыв не видел.
-3. `delete_file` не проверял защищённые пути и не различал файл и каталог, хотя его описание обещало скан.
-4. `delete_directory` проверял reparse-точку только в корне: `Remove-Item -Recurse` в Windows PowerShell 5.1 мог пройти сквозь junction внутри дерева.
-5. `WINRIG_LOG_LEVEL=WARNING` и `CRITICAL` для `EnvFilter` не уровни, а имена target: журнал глушился.
-6. `whoami /priv /fo csv` разбирался по английским заголовкам и ломался на локализованной Windows.
-7. Ключи кэшей и блокировки были регистрозависимы: `alice` и `ALICE` обходили lockout.
-8. Подтверждение ждало ответа бесконечно.
-9. ADR-0003 и AGENTS.md заявляли пул WinRM-соединений, которого в коде не было.
-10. Канал подтверждения (elicitation) удалён в ревизии протокола `2026-07-28`, и это никак не было отражено.
+1. `compare_files` inserted paths into a PowerShell string in double quotes, where `$(...)` expands. A file name of the form `a$(calc).txt` ran code on the host.
+2. `run_ps` received a list of redacted values from the caller, but the server sent an empty list. The value of `set_registry` went into the audit log in cleartext and broke DR-4. The test AC-SEC02-1 sent the secrets by hand and did not see the gap.
+3. `delete_file` did not check protected paths and did not tell a file from a directory, although its description promised a scan.
+4. `delete_directory` checked a reparse point only in the root: `Remove-Item -Recurse` in Windows PowerShell 5.1 could go through a junction inside the tree.
+5. `WINRIG_LOG_LEVEL=WARNING` and `CRITICAL` are not levels for `EnvFilter`, but target names. The server silenced the log.
+6. The code parsed `whoami /priv /fo csv` by English headers, and it broke on a localized Windows.
+7. The keys of the caches and of the lockout were case-sensitive: `contoso\alice` and `CONTOSO\ALICE` went around the lockout.
+8. The confirmation waited for an answer without a limit.
+9. ADR-0003 and AGENTS.md declared a pool of WinRM connections that the code did not have.
+10. The protocol revision `2026-07-28` removes the confirmation channel (elicitation), and this change was not reflected.
 
-## Решение
+## Decision
 
-1. **Инъекции.** Свободный текст передаётся в PowerShell только в одинарных кавычках с удвоением `'`. Пути, печатаемые в ответе, не подставляются в двойные кавычки. `-Path` в генераторах реестра заменён на `-LiteralPath`. Покрытие: `ps::tests::every_generator_escapes_single_quoted_free_text`, `ps::tests::compare_files_does_not_interpolate_paths_in_double_quotes`.
-2. **Редакция на боевом пути.** `SessionRegistry::run_ps` всегда добавляет пароль самой сессии к списку секретов, а `set_registry` передаёт значение как секрет. Аудит редактируется при `min_length=1`, ответ агенту — по `WINRIG_SECRET_REDACT_MIN_LENGTH`.
-3. **Защита удаления файла.** `delete_file` делает предварительный скан хостом (`FileScan`), отказывает для защищённых путей и каталогов до подтверждения.
-4. **Вложенные reparse-точки.** `DeleteScan` несёт поле `NestedReparsePoint`; `decide_delete_scan` отказывает при `NESTED_REPARSE_POINT`, а команда удаления повторно проверяет корень и поддерево непосредственно перед `Remove-Item` (закрытие TOCTOU).
-5. **Уровень журнала.** `LogLevel::filter_directive()` отображает `WARNING`→`warn`, `CRITICAL`→`error`; `EnvFilter` получает валидный уровень.
-6. **Локаль.** `get_security_context` вызывает `whoami /priv /fo csv /nh` и разбирает позиции с явными заголовками, сохраняя сырое значение состояния.
-7. **Идентичность.** `identity_from_context` канонизирует имя к нижнему регистру; это ключ кэшей и блокировки (DR-3).
-8. **Таймаут подтверждения.** Новый `WINRIG_CONFIRM_TIMEOUT_SECONDS` (по умолчанию 300); подтверждение через `elicit_with_timeout`, истечение — fail-closed.
-9. **Пул.** Пул не вводится: клиент создаётся на каждый вызов, NTLM-шифрование тела по HTTP включено по умолчанию в `winrm-rs`. AGENTS.md и ADR-0003 синхронизированы; переиспользование клиента — задача ROADMAP.
-10. **Канал подтверждения.** Остаётся elicitation до перехода клиентов на `2026-07-28`; замена на `input_required` (SEP-2322) зафиксирована в ROADMAP и Q-10 и вводится отдельным ADR.
-11. **Текст подтверждения.** `sanitize_prompt_value` схлопывает переводы строк и разделитель, чтобы аргумент не подделал диалог.
+1. **Injections.** Free text goes to PowerShell only in single quotes with the doubling of `'`. Paths that the answer prints do not go into double quotes. The generator of the registry uses `-LiteralPath` instead of `-Path`. Coverage: `ps::tests::every_generator_escapes_single_quoted_free_text`, `ps::tests::compare_files_does_not_interpolate_paths_in_double_quotes`.
+2. **Redaction on the live path.** `SessionRegistry::run_ps` always adds the password of the session itself to the list of secrets, and `set_registry` sends the value as a secret. The server redacts the audit log at `min_length=1`, and the answer to the agent at `WINRIG_SECRET_REDACT_MIN_LENGTH`.
+3. **Protection of file deletion.** `delete_file` makes a preliminary scan with the host (`FileScan`) and fails for protected paths and directories before confirmation.
+4. **Nested reparse points.** `DeleteScan` carries the field `NestedReparsePoint`; `decide_delete_scan` fails at `NESTED_REPARSE_POINT`. The delete command checks the root and the subtree again directly before `Remove-Item` (a close of TOCTOU).
+5. **Log level.** `LogLevel::filter_directive()` maps `WARNING`→`warn` and `CRITICAL`→`error`; `EnvFilter` gets a valid level.
+6. **Locale.** `get_security_context` calls `whoami /priv /fo csv /nh` and parses the positions with explicit headers, and keeps the raw value of the state.
+7. **Identity.** `identity_from_context` canonicalizes the name to lowercase; this is the key of the caches and of the lockout (DR-3).
+8. **Confirmation timeout.** The new `WINRIG_CONFIRM_TIMEOUT_SECONDS` (default 300); the confirmation goes through `elicit_with_timeout`, and an expiry is fail-closed.
+9. **Pool.** The project does not introduce a pool: it makes a client for each call. NTLM encryption of the body over HTTP is on by default in `winrm-rs`. The project synchronized AGENTS.md and ADR-0003; the reuse of the client is a ROADMAP task.
+10. **Confirmation channel.** Elicitation stays until the clients move to `2026-07-28`; the replacement with `input_required` (SEP-2322) is in the ROADMAP and Q-10 and comes with a separate ADR.
+11. **Confirmation text.** `sanitize_prompt_value` collapses newlines and the separator, so an argument cannot forge the dialogue.
 
-## Последствия
+## Consequences
 
-- Новые переменные окружения: `WINRIG_CONFIRM_TIMEOUT_SECONDS`; изменённое умолчание `WINRIG_LOG_DIR` — тогда `./logs` вместо `/app/logs` (ADR-0009 позже заменил умолчание: без `WINRIG_LOG_DIR` журналы идут в каталог состояния профиля).
-- Новые ADR не требуются для каждого пункта: они уточняют DR-4, DR-5 и DR-6.
-- TR-SEC-08 (`invoke_http_request`) и длительность в TR-OBS-01 остаются нереализованными и явно помечены в `docs/REQUIREMENTS.md`.
-- `cargo-deny` входит в обязательный прогон (`deny.toml`), CI повторяет локальный набор и проверяет MSRV 1.98 из `Cargo.toml`/`rust-toolchain.toml`.
+- New environment variables: `WINRIG_CONFIRM_TIMEOUT_SECONDS`; the changed default of `WINRIG_LOG_DIR` was `./logs` instead of `/app/logs`. ADR-0009 later replaced the default: without `WINRIG_LOG_DIR` the logs go to the state directory of the profile.
+- A new ADR is not necessary for each item: the items clarify DR-4, DR-5 and DR-6.
+- TR-SEC-08 (`invoke_http_request`) and the duration in TR-OBS-01 stay unimplemented; `docs/REQUIREMENTS.md` marks them.
+- `cargo-deny` is part of the obligatory run (`deny.toml`). CI repeats the local set and checks the MSRV 1.98 from `Cargo.toml`/`rust-toolchain.toml`.
 
-## Уточнение (ADR-0015)
+## Clarification (ADR-0015)
 
-§1: удвоения ASCII-апострофа недостаточно. PowerShell закрывает строку в одинарных кавычках и типографскими кавычками U+2018, U+2019, U+201A, U+201B; `ps::escape` удваивает все пять форм, а тест покрывает и скрипты, собранные в `src/server.rs`.
+§1: the doubling of the ASCII apostrophe is not sufficient. PowerShell closes a single-quoted string also with the typographic quotes U+2018, U+2019, U+201A and U+201B. `ps::escape` doubles all five forms, and the test covers the scripts assembled in `src/server.rs` too.

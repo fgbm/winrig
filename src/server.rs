@@ -45,7 +45,7 @@ impl std::fmt::Debug for WinrigServer {
 /// Ответ на подтверждение модифицирующей операции.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ConfirmResponse {
-    #[schemars(description = "`true` — выполнить операцию.")]
+    #[schemars(description = "`true` runs the operation.")]
     confirm: bool,
 }
 

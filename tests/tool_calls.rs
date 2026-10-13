@@ -1,14 +1,14 @@
-//! Вызовы инструментов через настоящий MCP-канал и канал подтверждения (DR-5).
+//! Tool calls through the real MCP channel and the confirmation channel (DR-5).
 //!
-//! Unit-тесты сервера зовут функции напрямую и поэтому не касаются
-//! `WinrigServer::confirm`: elicitation существует только между двумя peer'ами.
-//! Здесь клиент и сервер соединены парой транспортов в памяти
-//! (`tokio::io::duplex`), Windows-хост заменён записывающим транспортом
-//! (AGENTS.md §4), а ветка подтверждения задаётся ответом клиента.
+//! The server unit tests call the functions directly and therefore never touch
+//! `WinrigServer::confirm`: elicitation exists only between two peers. Here the
+//! client and the server are joined by a pair of in-memory transports
+//! (`tokio::io::duplex`), the Windows host is replaced by a recording transport
+//! (AGENTS.md §4), and the client answer selects the confirmation branch.
 //!
-//! Проверяется не только текст ответа инструмента, но и то, дошла ли команда до
-//! транспорта: отказ обязан быть fail-closed, а не «ответили cancelled и всё же
-//! выполнили».
+//! The check covers not only the tool response text but also whether the command
+//! reached the transport: a refusal must be fail-closed, not "answered cancelled
+//! and still executed".
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,12 +30,12 @@ use winrig::session::{
 const HOST: &str = "host1";
 const USER: &str = "domain\\alice";
 const PASSWORD: &str = "s3cret";
-/// Подпись модифицирующей команды `flush_dns` в скрипте, ушедшем на хост.
+/// Signature of the mutating `flush_dns` command in the script sent to the host.
 const MUTATION: &str = "Clear-DnsClientCache";
-/// Ровно то, что фиктивный хост печатает на любую команду.
+/// Output the fake host prints for any command.
 const HOST_STDOUT: &str = "HOST1|Windows|10.0|2026-01-01 00:00:00";
 
-/// Фиктивный Windows-хост: запоминает каждый полученный скрипт.
+/// A fake Windows host that records every script it receives.
 struct RecordingTransport {
     calls: Mutex<Vec<String>>,
 }
@@ -57,7 +57,7 @@ impl WinRmTransport for RecordingTransport {
 }
 
 impl RecordingTransport {
-    /// Истина, если хотя бы один скрипт содержит подстроку.
+    /// True when at least one script contains the substring.
     fn saw(&self, needle: &str) -> bool {
         self.calls
             .lock()
@@ -67,21 +67,21 @@ impl RecordingTransport {
     }
 }
 
-/// Как тестовый клиент отвечает на запрос подтверждения.
+/// How the test client replies to a confirmation request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Answer {
-    /// Пользователь согласился.
+    /// User agreed.
     Accept,
-    /// Пользователь отказался.
+    /// Operator refused.
     Decline,
-    /// Пользователь не отвечает никогда — решение остаётся за таймаутом сервера.
+    /// The user never answers; the decision stays with the server timeout.
     Silent,
-    /// Клиент не объявляет elicitation: канала подтверждения нет.
+    /// The client does not declare elicitation; the confirmation channel is absent.
     NoChannel,
 }
 
-/// Клиент MCP, чья единственная задача — отвечать на подтверждение заданным
-/// образом и считать, сколько раз его об этом попросили.
+/// An MCP client whose only job is to answer a confirmation in a given way and
+/// count how many times it was asked.
 #[derive(Debug, Clone)]
 struct TestClient {
     answer: Answer,
@@ -99,8 +99,8 @@ impl ClientHandler for TestClient {
             Answer::Accept => Ok(ElicitResult::new(ElicitationAction::Accept)
                 .with_content(serde_json::json!({ "confirm": true }))),
             Answer::Decline => Ok(ElicitResult::new(ElicitationAction::Decline)),
-            // Молчание — не ошибка протокола, а неотвечающий оператор: ответ не
-            // приходит вовсе.
+            // Silence is not a protocol error but an unresponsive operator: no
+            // answer ever comes.
             Answer::Silent => std::future::pending().await,
             Answer::NoChannel => unreachable!("server must not elicit without the capability"),
         }
@@ -117,13 +117,13 @@ impl ClientHandler for TestClient {
     }
 }
 
-/// Конфигурация с общим секретом и необязательными переопределениями.
+/// Builds the settings with the shared secret and optional overrides.
 fn config(overrides: &[(&str, &str)]) -> AppConfig {
     let owned: Vec<(String, String)> = overrides
         .iter()
         .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
         .collect();
-    // `Env` не несёт времени жизни, поэтому замыкание обязано владеть данными.
+    // `Env` carries no lifetime, so the closure must own the data.
     let lookup: Box<winrig::config::Env> = Box::new(move |name: &str| {
         if name == "WINRIG_AUTH_TOKEN" {
             return Some("token".to_owned());
@@ -132,9 +132,8 @@ fn config(overrides: &[(&str, &str)]) -> AppConfig {
             .iter()
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.clone());
-        // Фиктивный хост не loopback, поэтому обвязка разрешает его явно, как
-        // сделал бы оператор (ADR-0015 §6). Пустое переопределение возвращает
-        // умолчание.
+        // The fake host is not loopback, so the harness allows it explicitly, as an
+        // operator would (ADR-0015 §6). An empty override returns the default.
         if name == "WINRIG_ALLOWED_HOSTS" {
             return match found {
                 Some(value) if value.is_empty() => None,
@@ -147,7 +146,7 @@ fn config(overrides: &[(&str, &str)]) -> AppConfig {
     load_config_from(lookup.as_ref()).expect("config")
 }
 
-/// Связка клиент — сервер — фиктивный хост для одного теста.
+/// The client, server and fake host wiring for one test.
 struct Harness {
     client: RunningService<RoleClient, TestClient>,
     transport: Arc<RecordingTransport>,
@@ -155,7 +154,7 @@ struct Harness {
 }
 
 impl Harness {
-    /// Сколько раз сервер запросил подтверждение.
+    /// How many times the server asked for confirmation.
     fn elicitations(&self) -> usize {
         self.elicitations.load(Ordering::SeqCst)
     }
@@ -165,10 +164,12 @@ impl Harness {
     }
 }
 
-/// Поднимает сервер и клиента на паре транспортов в памяти и открывает сессию.
+/// Starts the server and the client on a pair of in-memory transports and opens a
+/// session.
 ///
-/// Идентичность берётся из профиля, как в stdio: HTTP-заголовков здесь нет, а
-/// проверяется слой инструментов, а не гейт (его закрывает `http_gate.rs`).
+/// The identity comes from the profile, as in stdio: there are no HTTP headers
+/// here, and the check targets the tool layer, not the gate (`http_gate.rs` covers
+/// that).
 async fn connected(answer: Answer, overrides: &[(&str, &str)]) -> Harness {
     let harness = started(answer, overrides).await;
     let connect = harness.call(connect_to(HOST)).await;
@@ -181,14 +182,14 @@ async fn connected(answer: Answer, overrides: &[(&str, &str)]) -> Harness {
     harness
 }
 
-/// Вызов `connect` к указанному хосту.
+/// One `connect` call for the given host.
 fn connect_to(host: &str) -> CallToolRequestParams {
     CallToolRequestParams::new("connect").with_arguments(args(&serde_json::json!({
         "host": host
     })))
 }
 
-/// Поднимает сервер и клиента, не открывая сессию.
+/// Brings up the server and the client without opening a session.
 async fn started(answer: Answer, overrides: &[(&str, &str)]) -> Harness {
     let transport = Arc::new(RecordingTransport {
         calls: Mutex::new(Vec::new()),
@@ -226,12 +227,12 @@ async fn started(answer: Answer, overrides: &[(&str, &str)]) -> Harness {
     }
 }
 
-/// Превращает JSON-объект в аргументы вызова инструмента.
+/// Turns a JSON object into tool call arguments.
 fn args(value: &serde_json::Value) -> JsonObject {
     value.as_object().cloned().expect("object arguments")
 }
 
-/// Значение строкового поля структурированного ответа инструмента.
+/// The string value of a structured tool response key.
 fn field(result: &CallToolResult, name: &str) -> Option<String> {
     result
         .structured_content
@@ -241,7 +242,7 @@ fn field(result: &CallToolResult, name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Значение числового поля структурированного ответа инструмента.
+/// The numeric value of a structured tool response key.
 fn number(result: &CallToolResult, name: &str) -> Option<i64> {
     result.structured_content.as_ref()?.get(name)?.as_i64()
 }
@@ -254,17 +255,17 @@ fn error_of(result: &CallToolResult) -> Option<String> {
     field(result, "error")
 }
 
-/// Вызов модифицирующего `flush_dns` в уже открытой сессии.
+/// A call to the mutating tool `flush_dns` in an open session.
 fn flush_dns() -> CallToolRequestParams {
     CallToolRequestParams::new("flush_dns").with_arguments(args(&serde_json::json!({
         "session_id": HOST
     })))
 }
 
-/// AC-REL09-4: чтение не спрашивает подтверждения и доходит до хоста.
+/// AC-REL09-4: a read asks no confirmation and reaches the host.
 ///
-/// Клиент объявляет elicitation и готов ответить Accept, поэтому «не спросили» —
-/// утверждение о сервере, а не о неспособности клиента ответить.
+/// The client declares elicitation and is ready to answer Accept, so "it was not
+/// asked" is a statement about the server, not about a client unable to answer.
 #[tokio::test]
 async fn read_only_tool_needs_no_confirmation() {
     let harness = connected(Answer::Accept, &[]).await;
@@ -294,7 +295,7 @@ async fn read_only_tool_needs_no_confirmation() {
     harness.client.cancel().await.ok();
 }
 
-/// AC-REL09-1: подтверждённая модификация выполняется.
+/// AC-REL09-1: a confirmed modification runs.
 #[tokio::test]
 async fn confirmed_modification_executes() {
     let harness = connected(Answer::Accept, &[]).await;
@@ -309,9 +310,9 @@ async fn confirmed_modification_executes() {
         harness.transport.saw(MUTATION),
         "confirmed modification never reached the host"
     );
-    // Положительный признак: ответ — это результат исполнения на хосте.
-    // Конверт отказа таких полей не несёт вовсе, поэтому «нет поля status»
-    // проверять незачем.
+    // A positive sign: the response is the result of the run on the host. A refusal
+    // envelope carries no such fields, so there is no need to check for a missing
+    // status field.
     assert_eq!(
         number(&result, "status_code"),
         Some(0),
@@ -333,7 +334,7 @@ async fn confirmed_modification_executes() {
     harness.client.cancel().await.ok();
 }
 
-/// AC-REL09-2: отказ оператора не выполняет команду (DR-5).
+/// AC-REL09-2: an operator refusal does not run the command (DR-5).
 #[tokio::test]
 async fn declined_modification_does_not_execute() {
     let harness = connected(Answer::Decline, &[]).await;
@@ -352,7 +353,7 @@ async fn declined_modification_does_not_execute() {
     harness.client.cancel().await.ok();
 }
 
-/// AC-REL09-3: без канала подтверждения модификация отказывает (fail-closed).
+/// AC-REL09-3: without a confirmation channel a modification refuses (fail-closed).
 #[tokio::test]
 async fn client_without_elicitation_is_refused() {
     let harness = connected(Answer::NoChannel, &[]).await;
@@ -367,8 +368,8 @@ async fn client_without_elicitation_is_refused() {
         0,
         "the server asked a client that never declared elicitation"
     );
-    // Именно «спросить некого», а не «спросили и не дождались»: подстрока
-    // «was not performed» есть и в сообщении таймаута.
+    // "Nobody to ask", not "asked and timed out": the substring "was not
+    // performed" also appears in the timeout message.
     assert!(
         error_of(&result).is_some_and(|error| error.contains("Cannot ask for confirmation")),
         "a client without elicitation must be refused for the absent channel: {:?}",
@@ -377,11 +378,11 @@ async fn client_without_elicitation_is_refused() {
     harness.client.cancel().await.ok();
 }
 
-/// AC-SEC12-1: скрипты, собранные в `server.rs`, а не в генераторах `ps.rs`,
-/// удваивают каждую форму одинарной кавычки (TR-SEC-12).
+/// AC-SEC12-1: scripts built in `server.rs`, not in the `ps.rs` generators, double
+/// every form of a single quote (TR-SEC-12).
 ///
-/// Проверяется то, что ушло на хост: оператор подтверждает, поэтому до
-/// транспорта доходят и предварительные чтения, и сами модификации.
+/// The check targets what went to the host: the operator confirms, so both the
+/// preliminary reads and the modifications themselves reach the transport.
 #[tokio::test]
 async fn inline_scripts_escape_every_single_quote_form() {
     for quote in winrig::ps::SINGLE_QUOTES {
@@ -421,7 +422,7 @@ async fn inline_scripts_escape_every_single_quote_form() {
     }
 }
 
-/// AC-REL08-1: молчание оператора — отказ по таймауту, а не выполнение.
+/// AC-REL08-1: operator silence is a timeout refusal, not execution.
 #[tokio::test]
 async fn timeout_refuses_and_does_not_execute() {
     let harness = connected(Answer::Silent, &[("WINRIG_CONFIRM_TIMEOUT_SECONDS", "1")]).await;
@@ -445,8 +446,8 @@ async fn timeout_refuses_and_does_not_execute() {
     harness.client.cancel().await.ok();
 }
 
-/// AC-SEC05-1, AC-SEC05-2: без `WINRIG_ALLOWED_HOSTS` удалённый хост отвергается
-/// до сети, а loopback проходит (TR-SEC-14).
+/// AC-SEC05-1, AC-SEC05-2: without `WINRIG_ALLOWED_HOSTS` a remote host is refused
+/// before the network, and loopback passes (TR-SEC-14).
 #[tokio::test]
 async fn default_allowlist_refuses_remote_host_before_network() {
     let harness = started(Answer::Accept, &[("WINRIG_ALLOWED_HOSTS", "")]).await;
@@ -467,12 +468,12 @@ async fn default_allowlist_refuses_remote_host_before_network() {
         "loopback must pass the empty allowlist: {:?}",
         local.structured_content
     );
-    // Политика и сессия видят одну и ту же обрезанную строку хоста.
+    // The policy and the session see the same trimmed host string.
     assert_eq!(field(&local, "session_id").as_deref(), Some("localhost"));
     harness.client.cancel().await.ok();
 }
 
-/// AC-SEC06-1: по умолчанию `verify_cert=false` отвергается до сети
+/// AC-SEC06-1: by default `verify_cert=false` is refused before the network
 /// (TR-SEC-06).
 #[tokio::test]
 async fn default_config_refuses_disabled_certificate_check() {
@@ -499,12 +500,12 @@ async fn default_config_refuses_disabled_certificate_check() {
 }
 
 thread_local! {
-    /// Буфер перехвата журнала текущего потока; `None` — события выбрасываются.
+    /// Log capture buffer of the current thread; `None` means events are dropped.
     static SINK: std::cell::RefCell<Option<Arc<Mutex<Vec<u8>>>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Писатель глобального подписчика: складывает событие в буфер потока.
+/// Writer of the global subscriber: it puts an event into the thread buffer.
 struct ThreadSink;
 
 impl std::io::Write for ThreadSink {
@@ -522,12 +523,12 @@ impl std::io::Write for ThreadSink {
     }
 }
 
-/// Перехватывает журнал и аудит текущего потока.
+/// Captures the log and the audit of the current thread.
 ///
-/// Подписчик глобальный и один на бинарь: временный подписчик на поток теряет
-/// события в гонке за общий кэш интереса callsite. `tokio::test` исполняет и
-/// тест, и порождённый им сервер на одном потоке, поэтому буфер потока видит
-/// аудит сервера.
+/// The subscriber is global and single per binary: a temporary per-thread
+/// subscriber loses events in a race for the shared callsite interest cache.
+/// `tokio::test` runs the test and the server it spawns on one thread, so the
+/// thread buffer sees the server audit.
 fn capture() -> Arc<Mutex<Vec<u8>>> {
     static INSTALL: std::sync::Once = std::sync::Once::new();
     INSTALL.call_once(|| {
@@ -542,8 +543,8 @@ fn capture() -> Arc<Mutex<Vec<u8>>> {
     buffer
 }
 
-/// AC-OBS03-1: отказы политики до сети попадают в аудит с инструментом и кодом
-/// (TR-OBS-03).
+/// AC-OBS03-1: policy refusals before the network reach the audit with the tool and
+/// the code (TR-OBS-03).
 #[tokio::test]
 async fn policy_refusals_are_audited() {
     let buffer = capture();

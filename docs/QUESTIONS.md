@@ -123,3 +123,9 @@ Decided: `search_file_content` takes `since` and `until` (timestamps) and `times
 ## Q-23. The form of `doctor`
 
 Decided: `doctor` is a read-only subcommand (TR-PRF-18, AC-PRF-69, slice W31, GitHub #24). The issue offered a command `winrig doctor` or an option of `setup`. The subcommand keeps `setup` a single responsibility for the client configuration write. The optional part of the issue — `setup` writes the same set of variables for each profile it adds — stays outside the slice: it changes the write of the client configuration and needs its own decision.
+
+## Q-24. The markers and the envelope of the confirmation text
+
+Decided (slice W32): the server shows a hidden value as the literal `hidden` beside its label, for example `new value: hidden` (TR-SEC-18). The server caps a field of the confirmation at 200 characters. The marker of a cut is `...`, and it counts inside the cap: the server cuts the value to 197 characters and appends `...`, so the field holds at most 200 characters. The host is the host of the session of the call. The identity is the user of the current request (DR-2). The tool is the MCP tool name; the plain line of the action may hold the action label of today next to it.
+
+Open: the exact sentences of the action line and of the undo line of each tool. The requirement fixes only that one line exists and states the operation and whether the operator can undo it.

@@ -90,6 +90,11 @@ The server does its operations in a predictable and safe way. It does not create
 | TR-REL-18 | `stop_service` verifies the stop. After the stop the tool waits `wait_seconds: i64` (default 15) and reads the state of the service and the events 7031, 7034 and 7036 of the `System` log for this service since the stop. If the service runs again, the tool returns an error that names the recovery restart. `stop_service(disable=true)` sets the start type `Disabled` before the stop. Not implemented — slice W30 |
 | TR-SEC-15 | `set_service_start_type` and `stop_service(disable=true)` are modifying operations and need the confirmation of DR-5 (fail-closed). The confirmation text shows the current start type and the new start type. The server refuses a service that is critical for the remote session (`WinRM`, `RpcSs`, `LanmanServer` and the Service Control Manager) before a call to the host. Not implemented — slice W30 |
 | TR-PRF-18 | `winrig doctor` reads the client configuration, lists each winrig server with its effective settings (`WINRIG_ALLOWED_HOSTS`, `WINRIG_ALLOW_INSECURE_TLS`, `WINRIG_ALLOW_FILE_WRITE` and the other variables) and marks the differences between the servers. The command prints no token value. The command is read-only. Not implemented — slice W31 |
+| TR-SEC-16 | Every confirmation names the host, the identity (the user of the request) and the tool. It holds one plain line that states what the operation does and whether the operator can undo it. Not implemented — slice W32 |
+| TR-SEC-17 | Every modifying tool lists its target and the effective operation with the details that are available before the call. The per-tool list is the table of slice W32. It covers `flush_dns`, `restart_service`, `stop_service`, `start_service`, `kill_process`, `set_registry`, `write_file`, `delete_file` and `delete_directory`, and the tools of slice W30 (`set_service_start_type`, `stop_service(disable=true)`). Not implemented — slice W32 |
+| TR-SEC-18 | A hidden value appears only as the marker `hidden`. The new value of `set_registry` and the content of `write_file` are hidden values. The server does not show the value in the confirmation in any form (DR-4). Not implemented — slice W32 |
+| TR-SEC-19 | The server sanitizes each field of the confirmation text (TR-SEC-09, ADR-0008 §11) and caps the field at 200 characters. A cut field carries a visible marker, and the marker counts inside the cap. Not implemented — slice W32 |
+| TR-SEC-20 | The confirmation text is STE English. The format is stable and independent of the host locale. A test through the MCP harness (`tests/tool_calls.rs`) checks the text on the fake transport. Not implemented — slice W32 |
 
 ## 3. Acceptance criteria
 
@@ -172,6 +177,12 @@ The server does its operations in a predictable and safe way. It does not create
 | AC-SEC15-1 | `set_service_start_type` without a confirmation channel | a refusal, the transport received no command (fail-closed, DR-5) | **Not implemented** — slice W30 |
 | AC-SEC15-2 | `set_service_start_type` with a confirmation | the confirmation text holds the current start type and the new start type, and the recorded command sets the type | **Not implemented** — slice W30 |
 | AC-SEC15-3 | `set_service_start_type('WinRM', ...)` or `stop_service('RpcSs')` | a refusal before the network | **Not implemented** — slice W30 |
+| AC-SEC16-1 | a modifying call with a confirmation | the text names the host, the identity and the tool, and holds one plain line that states what the operation does and whether the operator can undo it | **Not implemented** — slice W32 |
+| AC-SEC17-1 | each current modifying tool with a confirmation | the text names the target and the effective operation with the details that are available before the call, as the table of slice W32 lists | **Not implemented** — slice W32 |
+| AC-SEC17-2 | `set_service_start_type`, or `stop_service(disable=true)`, with a confirmation | the text names the service, the host, the current start type and the new start type (TR-SEC-15) | **Not implemented** — slice W30 |
+| AC-SEC18-1 | `set_registry` with a new value, or `write_file` with content | the text holds the marker `hidden` in the place of the value, and the value is absent from the text | **Not implemented** — slice W32 |
+| AC-SEC19-1 | a field above 200 characters, or with a line break | the server sanitizes the field as TR-SEC-09, cuts it at 200 characters and the cut carries a visible marker. The structure of the dialog stays intact | **Not implemented** — slice W32 |
+| AC-SEC20-1 | a confirmation on the fake transport | the text is STE English and holds no value of the host locale. The MCP harness (`tests/tool_calls.rs`) reads the text | **Not implemented** — slice W32 |
 
 ## 3a. Acceptance criteria of the profile and the CLI (ADR-0009)
 

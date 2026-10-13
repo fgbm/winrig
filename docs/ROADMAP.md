@@ -318,6 +318,46 @@ A project had two winrig servers in one client configuration. One had `WINRIG_AL
 
 The content: the subcommand `winrig doctor` reads the client configuration, lists each winrig server with its effective settings (`WINRIG_ALLOWED_HOSTS`, `WINRIG_ALLOW_INSECURE_TLS`, `WINRIG_ALLOW_FILE_WRITE` and the other variables) and marks the differences between the servers (TR-PRF-18, AC-PRF-69). The command prints no token value (DR-4). The command is read-only (Q-23). The slice adds no MCP tool.
 
+## W32. Clear confirmation text
+
+Goal: the operator sees what a modifying operation will do before the operator confirms it. Each confirmation names the host, the identity and the tool, and it names the target and the intended result.
+
+The complaint comes from live operation. The operator could not tell the target, the identity or the effect of the operation. The gaps:
+
+- `flush_dns` names no host and no identity.
+- `restart_service`, `stop_service` and `start_service` show the state before the call only, and not the state that the call intends.
+- `kill_process` does not say whether the call kills the process tree, and it does not show the command line of the process.
+- `set_registry` hides the new value (DR-4), but it does not say that the value is hidden.
+- `write_file` does not say that the content is hidden.
+- `delete_directory` does not say that the host checks the reparse points again after the confirmation.
+- No confirmation names the host and the identity of the request (DR-2).
+
+The content:
+
+- **TR-SEC-16.** Every confirmation names the host, the identity and the tool, and it holds one plain line that states what the operation does and whether the operator can undo it.
+- **TR-SEC-17.** Each modifying tool lists its target and the effective operation with the details that are available before the call. The table below is the per-tool list.
+- **TR-SEC-18.** A hidden value appears only as the marker `hidden`. The new value of `set_registry` and the content of `write_file` are hidden values (DR-4).
+- **TR-SEC-19.** The server sanitizes each field of the text (TR-SEC-09, ADR-0008 §11) and caps the field at 200 characters. A cut field carries a visible marker, and the marker counts inside the cap.
+- **TR-SEC-20.** The confirmation text is STE English, stable and independent of the host locale. A test through the MCP harness (`tests/tool_calls.rs`) checks the text on the fake transport.
+
+The per-tool list of TR-SEC-17:
+
+| Tool | Target | Effective operation with the details that are available before the call | Undo |
+|---|---|---|---|
+| `flush_dns` | the host | clears the whole DNS client cache | no |
+| `restart_service` | the service and the host | restarts the service. The text shows the state before the call and the intended state `Running` | yes, by another restart, a stop or a start |
+| `stop_service` | the service and the host | stops the service. The text shows the state before the call and the intended state `Stopped` | yes, by a start |
+| `start_service` | the service and the host | starts the service. The text shows the state before the call and the intended state `Running` | yes, by a stop |
+| `kill_process` | the process and the host | terminates the process by PID. The text shows the name, the start time, the command line, and it states that the tree of the process stays | no |
+| `set_registry` | the key, the value and the host | sets the value with the given type. The text shows the old value, and the new value as `hidden` | yes, by the old value |
+| `write_file` | the path and the host | writes the file and replaces the whole file. The text shows the resolved path, the size, the encoding, the content as `hidden`, and the presence of an existing file | no; the previous content is lost |
+| `delete_file` | the path and the host | deletes one file permanently. The text shows the resolved path and the metadata | no |
+| `delete_directory` | the directory and the host | deletes the directory and all the contents, recursively. The text shows the resolved path, the counts, and the second check of the reparse points after the confirmation | no |
+
+The tools of slice W30 extend the same rule: `set_service_start_type` and `stop_service(disable=true)` show the service, the host, the current start type and the new start type (TR-SEC-15).
+
+The slice changes no operation, only the text before the confirmation, so the risk is low and the tool count does not change. The slice brings in no new entity, channel or role, so a new ADR is not necessary: the slice clarifies DR-5 and ADR-0006 §2. The open choices are in Q-24.
+
 ## The next iteration
 
 These issues wait for a later iteration. They have no slice and no requirement yet, because each one needs a foundation that does not exist.

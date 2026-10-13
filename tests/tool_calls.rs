@@ -38,6 +38,9 @@ const HOST_STDOUT: &str = "HOST1|Windows|10.0|2026-01-01 00:00:00";
 /// A fake Windows host that records every script it receives.
 struct RecordingTransport {
     calls: Mutex<Vec<String>>,
+    /// Canned stdout per substring: the first entry whose key is in the script
+    /// wins. Without a match the host prints [`HOST_STDOUT`].
+    responses: Mutex<Vec<(String, String)>>,
 }
 
 #[async_trait::async_trait]
@@ -48,8 +51,16 @@ impl WinRmTransport for RecordingTransport {
         script: &str,
     ) -> Result<RemoteOutput, TransportError> {
         self.calls.lock().expect("lock").push(script.to_owned());
+        let stdout = self
+            .responses
+            .lock()
+            .expect("lock")
+            .iter()
+            .find(|(needle, _)| script.contains(needle))
+            .map(|(_, stdout)| stdout.clone())
+            .unwrap_or_else(|| HOST_STDOUT.to_owned());
         Ok(RemoteOutput {
-            stdout: HOST_STDOUT.as_bytes().to_vec(),
+            stdout: stdout.into_bytes(),
             stderr: Vec::new(),
             exit_code: 0,
         })
@@ -64,6 +75,14 @@ impl RecordingTransport {
             .expect("lock")
             .iter()
             .any(|call| call.contains(needle))
+    }
+
+    /// Print `stdout` for every script that contains `needle`.
+    fn respond(&self, needle: &str, stdout: &str) {
+        self.responses
+            .lock()
+            .expect("lock")
+            .push((needle.to_owned(), stdout.to_owned()));
     }
 }
 
@@ -84,15 +103,20 @@ enum Answer {
 struct TestClient {
     answer: Answer,
     elicitations: Arc<AtomicUsize>,
+    /// The message of each confirmation the server asked for.
+    messages: Arc<Mutex<Vec<String>>>,
 }
 
 impl ClientHandler for TestClient {
     async fn create_elicitation(
         &self,
-        _params: ElicitRequestParams,
+        params: ElicitRequestParams,
         _context: RequestContext<RoleClient>,
     ) -> Result<ElicitResult, McpError> {
         self.elicitations.fetch_add(1, Ordering::SeqCst);
+        if let ElicitRequestParams::FormElicitationParams { message, .. } = &params {
+            self.messages.lock().expect("lock").push(message.clone());
+        }
         match self.answer {
             Answer::Accept => Ok(ElicitResult::new(ElicitationAction::Accept)
                 .with_content(serde_json::json!({ "confirm": true }))),
@@ -149,12 +173,23 @@ struct Harness {
     client: RunningService<RoleClient, TestClient>,
     transport: Arc<RecordingTransport>,
     elicitations: Arc<AtomicUsize>,
+    messages: Arc<Mutex<Vec<String>>>,
 }
 
 impl Harness {
     /// How many times the server asked for confirmation.
     fn elicitations(&self) -> usize {
         self.elicitations.load(Ordering::SeqCst)
+    }
+
+    /// What the server showed the operator in the most recent prompt.
+    fn last_confirmation(&self) -> String {
+        self.messages
+            .lock()
+            .expect("lock")
+            .last()
+            .cloned()
+            .unwrap_or_default()
     }
 
     async fn call(&self, params: CallToolRequestParams) -> CallToolResult {
@@ -191,6 +226,7 @@ fn connect_to(host: &str) -> CallToolRequestParams {
 async fn started(answer: Answer, overrides: &[(&str, &str)]) -> Harness {
     let transport = Arc::new(RecordingTransport {
         calls: Mutex::new(Vec::new()),
+        responses: Mutex::new(Vec::new()),
     });
     let registry = Arc::new(SessionRegistry::new(
         Arc::clone(&transport) as Arc<dyn WinRmTransport>,
@@ -210,9 +246,11 @@ async fn started(answer: Answer, overrides: &[(&str, &str)]) -> Harness {
         }
     });
     let elicitations = Arc::new(AtomicUsize::new(0));
+    let messages = Arc::new(Mutex::new(Vec::new()));
     let client = TestClient {
         answer,
         elicitations: Arc::clone(&elicitations),
+        messages: Arc::clone(&messages),
     }
     .serve(client_side)
     .await
@@ -222,6 +260,7 @@ async fn started(answer: Answer, overrides: &[(&str, &str)]) -> Harness {
         client,
         transport,
         elicitations,
+        messages,
     }
 }
 
@@ -1264,4 +1303,367 @@ async fn policy_refusals_are_audited() {
             .any(|record| record.contains("write_file") && record.contains("PATH_PROTECTED")),
         "path refusal missing from the audit: {text}"
     );
+}
+
+/// A call to `stop_service` in an open session.
+fn stop_service(name: &str, disable: bool) -> CallToolRequestParams {
+    CallToolRequestParams::new("stop_service").with_arguments(args(&serde_json::json!({
+        "session_id": HOST,
+        "name": name,
+        "disable": disable
+    })))
+}
+
+/// A call to `set_service_start_type` in an open session.
+fn set_start_type(name: &str, start_type: &str) -> CallToolRequestParams {
+    CallToolRequestParams::new("set_service_start_type").with_arguments(args(&serde_json::json!({
+        "session_id": HOST,
+        "name": name,
+        "start_type": start_type
+    })))
+}
+
+/// AC-REL17-1: `get_service_config` is read-only, asks no confirmation, and its
+/// recorded command reads the start type, the account, the binary path and the
+/// recovery actions from CIM and the registry, not from the localized `sc.exe` text
+/// (TR-REL-17).
+#[tokio::test]
+async fn get_service_config_reads_the_service_on_the_host() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let before = harness.elicitations();
+    let result = harness
+        .call(
+            CallToolRequestParams::new("get_service_config").with_arguments(args(
+                &serde_json::json!({ "session_id": HOST, "name": "Spooler" }),
+            )),
+        )
+        .await;
+    assert_eq!(
+        error_of(&result),
+        None,
+        "the read must not fail: {:?}",
+        result.structured_content
+    );
+    assert_eq!(
+        harness.elicitations(),
+        before,
+        "a read-only tool asked for confirmation"
+    );
+    assert!(
+        harness.transport.saw("$n = 'Spooler'"),
+        "the name never reached the host"
+    );
+    assert!(harness.transport.saw("Get-CimInstance Win32_Service"));
+    assert!(harness.transport.saw("[string]$svc.StartMode"));
+    assert!(harness.transport.saw("$svc.StartName"));
+    assert!(harness.transport.saw("$svc.PathName"));
+    assert!(harness.transport.saw("FailureActions"));
+    assert!(harness.transport.saw("[BitConverter]::ToUInt32($fa, 0)"));
+    assert!(
+        !harness.transport.saw("sc qfailure"),
+        "the parse must not read the localized sc.exe text"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// AC-REL18-1, findings 1/4: `stop_service` waits (default 15 s), refuses a protected
+/// dependent before any write, reads the events 7031/7034/7036 by the decoded event
+/// name, and returns an error that names the recovery restart when the service runs
+/// again (TR-REL-18).
+#[tokio::test]
+async fn stop_service_reports_a_service_that_runs_again() {
+    let harness = connected(Answer::Accept, &[]).await;
+    harness.transport.respond(
+        "running_again",
+        r#"{"name":"Spooler","state":"Running","running_again":true,"stop_error":null,"wait_seconds":15,"disabled":false,"events":[{"id":7031}],"event_count":1}"#,
+    );
+    let result = harness.call(stop_service("Spooler", false)).await;
+
+    assert!(
+        harness.transport.saw("Start-Sleep -Seconds 15"),
+        "the default wait never reached the host"
+    );
+    assert!(
+        harness.transport.saw("Id=@(7031,7034,7036)"),
+        "the events 7031/7034/7036 are not read"
+    );
+    assert!(
+        !harness.transport.saw("-Force"),
+        "the stop must not use -Force"
+    );
+    assert!(
+        harness.transport.saw("(Get-WinrigEventName $_) -eq $n"),
+        "the service is not matched by its decoded event name"
+    );
+    let error = error_of(&result).expect("a refusal when the service runs again");
+    assert!(
+        error.contains("recovery"),
+        "the error must name the recovery restart: {error}"
+    );
+    assert!(error.contains("Spooler"), "{error}");
+    harness.client.cancel().await.ok();
+}
+
+/// AC-REL18-2, finding 8: `stop_service(disable=true)` sets the start type `Disabled`
+/// after the dependent check and before `Stop-Service`, in one script (TR-REL-18).
+#[tokio::test]
+async fn stop_service_disable_sets_the_start_type_before_the_stop() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let result = harness.call(stop_service("Spooler", true)).await;
+    assert_eq!(
+        error_of(&result),
+        None,
+        "the stop must not fail: {:?}",
+        result.structured_content
+    );
+    // One script must hold the whole order: dependent check, start-type change, stop.
+    let script = harness
+        .transport
+        .calls
+        .lock()
+        .expect("lock")
+        .iter()
+        .find(|call| call.contains("Stop-Service -Name $n"))
+        .cloned()
+        .expect("the stop script reached the host");
+    let dep_at = script
+        .find("Get-WinrigDependents $n")
+        .expect("dependent check");
+    let config_at = script
+        .find("sc.exe config $n start= disabled")
+        .expect("start-type change");
+    let stop_at = script.find("Stop-Service -Name $n").expect("stop");
+    assert!(
+        dep_at < config_at && config_at < stop_at,
+        "the dependent check and the start-type change must precede the stop"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// finding 6: when the host reports a failed stop, the tool returns an error that
+/// carries the half-done state (`start_type_changed`, `previous_start_type`,
+/// `stop_error`).
+#[tokio::test]
+async fn stop_service_reports_a_partial_effect() {
+    let harness = connected(Answer::Accept, &[]).await;
+    harness.transport.respond(
+        "stop_error",
+        r#"{"name":"Spooler","state":"Running","state_before":"Running","running_again":false,"stop_error":"Cannot stop service because it has dependent services","start_type_changed":true,"previous_start_type":"Manual","dependents":["SpoolerDep"],"events":[],"event_count":0}"#,
+    );
+    let result = harness.call(stop_service("Spooler", true)).await;
+
+    let error = error_of(&result).expect("a refusal when the stop failed");
+    assert!(error.contains("failed"), "{error}");
+    assert!(
+        error.contains("SpoolerDep"),
+        "the error must name the dependent services: {error}"
+    );
+    assert_eq!(
+        result
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get("start_type_changed"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "the half-done start type must be reported: {:?}",
+        result.structured_content
+    );
+    assert_eq!(
+        field(&result, "previous_start_type").as_deref(),
+        Some("Manual"),
+        "{:?}",
+        result.structured_content
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// finding 2: the host resolves the canonical name; the recorded command carries the
+/// host-side resolution and does not fall back to a display name.
+#[tokio::test]
+async fn stop_service_resolves_the_canonical_name_on_the_host() {
+    let harness = connected(Answer::Accept, &[]).await;
+    // "Server" is the display name of LanmanServer and passes the Rust charset gate,
+    // so the host-side resolution must be present in the recorded command.
+    let result = harness.call(stop_service("Server", false)).await;
+    assert!(
+        harness.transport.saw("Resolve-WinrigService 'Server'"),
+        "the host does not resolve the canonical name: {:?}",
+        result.structured_content
+    );
+    assert!(
+        harness
+            .transport
+            .saw("the tool does not fall back to a display name"),
+        "the host does not refuse a display name"
+    );
+    assert!(
+        harness.transport.saw("$protected -contains $c"),
+        "the host does not re-check the protected list on the canonical name"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// finding 3: a service name with a quote or a control character is refused before any
+/// host call, on every modifying path.
+#[tokio::test]
+async fn invalid_service_names_are_refused_before_the_network() {
+    let harness = connected(Answer::Accept, &[]).await;
+    for (params, name) in [
+        (set_start_type("a\"b", "Disabled"), "a\"b"),
+        (stop_service("a\u{1}b", false), "a\u{1}b"),
+        (
+            CallToolRequestParams::new("restart_service").with_arguments(args(
+                &serde_json::json!({ "session_id": HOST, "name": "a/b" }),
+            )),
+            "a/b",
+        ),
+    ] {
+        let before = harness.transport.calls.lock().expect("lock").len();
+        let result = harness.call(params).await;
+        let error = error_of(&result).expect("a refusal");
+        assert!(
+            error.contains("letters, digits"),
+            "the refusal must name the allowed set for {name:?}: {error}"
+        );
+        assert_eq!(
+            harness.transport.calls.lock().expect("lock").len(),
+            before,
+            "the refused name {name:?} reached the host"
+        );
+    }
+    harness.client.cancel().await.ok();
+}
+
+/// AC-SEC15-1: without a confirmation channel `set_service_start_type` refuses
+/// (fail-closed); the set-type command never reaches the transport (DR-5).
+#[tokio::test]
+async fn set_service_start_type_without_channel_is_refused() {
+    let harness = connected(Answer::NoChannel, &[]).await;
+    let result = harness.call(set_start_type("Spooler", "Disabled")).await;
+
+    assert!(
+        !harness.transport.saw("sc.exe config"),
+        "the set-type command reached the host without a confirmation"
+    );
+    assert_eq!(
+        harness.elicitations(),
+        0,
+        "the server asked a client that never declared elicitation"
+    );
+    assert!(
+        error_of(&result).is_some_and(|error| error.contains("cannot ask for confirmation")),
+        "a client without elicitation must be refused: {:?}",
+        result.structured_content
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// AC-SEC15-2: with a confirmation the prompt shows the current and the new start
+/// type, and the recorded command sets the type (TR-SEC-15).
+#[tokio::test]
+async fn set_service_start_type_shows_both_start_types() {
+    let harness = connected(Answer::Accept, &[]).await;
+    // The pre-confirmation read returns the current start type.
+    harness.transport.respond(
+        "FailureActionsOnNonCrashFailures",
+        r#"{"name":"Spooler","start_type":"Manual","status":"Stopped"}"#,
+    );
+    let result = harness
+        .call(set_start_type("Spooler", "AutomaticDelayed"))
+        .await;
+    assert_eq!(
+        error_of(&result),
+        None,
+        "the change must not fail: {:?}",
+        result.structured_content
+    );
+    let message = harness.last_confirmation();
+    assert!(message.contains("Current start type: Manual"), "{message}");
+    assert!(
+        message.contains("New start type: AutomaticDelayed"),
+        "{message}"
+    );
+    assert!(
+        harness
+            .transport
+            .saw("sc.exe config $n start= delayed-auto"),
+        "the recorded command does not set the new start type"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// AC-SEC15-2: an unknown start type is refused before any host call.
+#[tokio::test]
+async fn set_service_start_type_refuses_an_unknown_value() {
+    let harness = connected(Answer::Accept, &[]).await;
+    let before = harness.transport.calls.lock().expect("lock").len();
+    let result = harness.call(set_start_type("Spooler", "Always")).await;
+    let error = error_of(&result).expect("a refusal");
+    assert!(error.contains("AutomaticDelayed"), "{error}");
+    assert_eq!(
+        harness.transport.calls.lock().expect("lock").len(),
+        before,
+        "the refused value reached the host"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// DR-5: an operator refusal on the verified stop stops nothing and changes no start
+/// type on the host.
+#[tokio::test]
+async fn declined_stop_service_does_not_touch_the_host() {
+    let harness = connected(Answer::Decline, &[]).await;
+    let result = harness.call(stop_service("Spooler", true)).await;
+
+    assert!(
+        !harness.transport.saw("Stop-Service"),
+        "declined stop reached the host"
+    );
+    assert!(
+        !harness.transport.saw("sc.exe config"),
+        "declined disable reached the host"
+    );
+    assert_eq!(
+        status_of(&result).as_deref(),
+        Some("cancelled"),
+        "declined stop must answer cancelled: {:?}",
+        result.structured_content
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// AC-SEC15-3, Q-20: a service critical for the remote session is refused before any
+/// host call, on every modifying path (TR-SEC-15, finding 7).
+#[tokio::test]
+async fn protected_services_are_refused_before_the_network() {
+    let harness = connected(Answer::Accept, &[]).await;
+    for (params, needle) in [
+        (set_start_type("WinRM", "Disabled"), "winrm"),
+        (stop_service("RpcSs", true), "RpCsS"),
+        (stop_service("LanmanServer", false), "LANMANSERVER"),
+        (
+            CallToolRequestParams::new("restart_service").with_arguments(args(
+                &serde_json::json!({ "session_id": HOST, "name": "winmgmt" }),
+            )),
+            "winmgmt",
+        ),
+    ] {
+        let before = harness.transport.calls.lock().expect("lock").len();
+        let result = harness.call(params).await;
+        let error = error_of(&result).expect("a refusal");
+        assert!(
+            error.to_lowercase().contains(&needle.to_lowercase()),
+            "the refusal must name the service: {error}"
+        );
+        assert!(
+            error.contains("critical"),
+            "the refusal must say why: {error}"
+        );
+        assert_eq!(
+            harness.transport.calls.lock().expect("lock").len(),
+            before,
+            "the refused service reached the host"
+        );
+    }
+    harness.client.cancel().await.ok();
 }

@@ -14,7 +14,7 @@ The full documentation is at https://fgbm.github.io/winrig/.
 `winrig` is the Rust successor of the Python project `win-mcp-server`. It keeps the same domain rules, module boundaries and tool contracts. It ships as one static binary without a container or an interpreter. It runs either as an HTTP service (`winrig serve`) or as a local stdio process (`winrig stdio`).
 
 - **Low memory, one binary**: one release binary, with no runtime and no container. Resident memory stays near 11 MiB after start and repeated requests on the development computer (`VmRSS` from `/proc`).
-- **41 tools** plus `write_file`, when the operator enables it: file system, services, registry, event logs, certificates, processes, network, scheduled tasks and more. The current version includes these ported tools. The Python version `win-mcp-server` had file transfer (copy, move, rename, archives), `invoke_http_request` and SFTP tools. The current version does not include those tools yet.
+- **43 tools** plus `write_file`, when the operator enables it: file system, services, registry, event logs, certificates, processes, network, scheduled tasks and more. The current version includes these ported tools. The Python version `win-mcp-server` had file transfer (copy, move, rename, archives), `invoke_http_request` and SFTP tools. The current version does not include those tools yet.
 - **One process for each profile**: `winrig setup` creates an encrypted profile. The printed profile token is the only key, and `setup` shows it one time. A second process on the same profile refuses to start and points to the HTTP mode.
 - **Two secrets, one for each request**: a request authenticates with `WINRIG_AUTH_TOKEN` (the header path with `X-AD-User`) or with a profile token. The profile token gives the identity and makes the server ignore `X-AD-*`.
 - **No secrets on disk**: no account credentials in configurations or in logs. The profile file holds only authenticated ciphertext.
@@ -53,6 +53,7 @@ The full documentation is at https://fgbm.github.io/winrig/.
 | `get_event_log` | The Windows event log: crashes, service failures, authentication errors |
 | `list_event_logs` | The event log channels with the record count and the enabled state |
 | `get_services` | A summary of the services, or the full details of each service in JSON |
+| `get_service_config` | One service: the start type (Automatic, AutomaticDelayed, Manual or Disabled), the account, the binary path and the recovery actions with the action, the delay and the reset period |
 | `list_processes` | The processes with a sort by CPU, memory or handles |
 | `get_open_handles` | The processes that hold a file open, with the PID, the name and the start time. It uses the Restart Manager, so a host needs no Sysinternals `handle.exe` |
 | `get_printers` | The printers with the share name, the driver, the port, the port host and number, the state as decoded flags and the job count |
@@ -108,7 +109,8 @@ The same ADR decides the directory write (slices W20–W21), and it stays intent
 
 | Tool | Description |
 |------|-------------|
-| `restart_service` / `stop_service` / `start_service` | Manage the services with the state before and after |
+| `restart_service` / `stop_service` / `start_service` | Manage the services with the state before and after. `stop_service` verifies the stop: it waits `wait_seconds` (15 by default), reads the state and the System events 7031/7034/7036, and reports an error when the service runs again. With `disable=true` it sets the start type to Disabled before the stop |
+| `set_service_start_type` | Set the start type (Automatic, AutomaticDelayed, Manual or Disabled). The confirmation shows the current and the new start type. The tool refuses a service that is critical for the remote session |
 | `kill_process` | Kill a process by PID |
 | `set_registry` | Write a registry value and show the old value and the new value |
 | `delete_file` / `delete_directory` | Delete with a confirmation prompt; the tool rejects protected paths, including by the actual location of the system on the host |

@@ -3,7 +3,7 @@
 //!
 //! Checks what the unit tests cannot see: stdout carries JSON-RPC only (AC-PRF-22),
 //! `initialize` passes without HTTP headers (AC-PRF-04), and `tools/list` returns
-//! exactly 41 tools (AC-PRF-48).
+//! exactly 43 tools (AC-PRF-48).
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -101,14 +101,14 @@ fn stdio_serves_mcp_over_clean_stdout() {
         .expect("initialize response");
     assert!(initialize.contains("protocolVersion"));
 
-    // AC-PRF-48: exactly 41 tools.
+    // AC-PRF-48: exactly 43 tools.
     let tools_line = out_lines
         .iter()
         .find(|line| line.contains("\"id\":2"))
         .expect("tools/list response");
     let value: serde_json::Value = serde_json::from_str(tools_line).expect("json");
     let tools = value["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 41, "expected 41 tools, got {}", tools.len());
+    assert_eq!(tools.len(), 43, "expected 43 tools, got {}", tools.len());
 
     // Log lines go to stderr, not stdout.
     assert!(
@@ -144,11 +144,11 @@ fn write_file_appears_only_when_enabled() {
     };
 
     let off = names(&[]);
-    assert_eq!(off.len(), 41, "expected 41 tools by default");
+    assert_eq!(off.len(), 43, "expected 43 tools by default");
     assert!(!off.iter().any(|name| name == "write_file"));
 
     let on = names(&[("WINRIG_ALLOW_FILE_WRITE", "true")]);
-    assert_eq!(on.len(), 42, "expected 42 tools once file write is allowed");
+    assert_eq!(on.len(), 44, "expected 44 tools once file write is allowed");
     assert!(on.iter().any(|name| name == "write_file"));
 
     std::fs::remove_dir_all(&dir).ok();

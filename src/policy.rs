@@ -849,6 +849,67 @@ impl WriteScan {
     }
 }
 
+/// Services critical for the remote session (TR-SEC-15, Q-20).
+///
+/// A stop or a start-type change on one of these can end the session or break the
+/// Service Control Manager: `WinRM` carries the session itself, `RpcSs` and
+/// `DcomLaunch` sit below the Service Control Manager, `LanmanServer` carries the
+/// administrative shares and `Winmgmt` answers the CIM reads. The match is on the
+/// service name, which the tools accept, not the display name, whose text is
+/// locale-dependent.
+pub const PROTECTED_SERVICES: [&str; 5] =
+    ["WinRM", "RpcSs", "DcomLaunch", "LanmanServer", "Winmgmt"];
+
+/// Characters allowed in a service name (TR-SEC-15, finding 3).
+///
+/// A conservative set: ASCII letters, digits, `_`, `-`, `.` and space. A quote, a
+/// backslash, a slash, a control character and every other character are refused
+/// before the network, so the name cannot reach WQL or a PowerShell string as code.
+#[must_use]
+pub fn is_valid_service_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' '))
+}
+
+/// Verdict for the target of `stop_service`, `restart_service` and
+/// `set_service_start_type` (TR-SEC-15, AC-SEC15-3).
+///
+/// This is the first gate, on the Rust side. The host resolver repeats the protected
+/// check on the canonical name, because `ServiceController` also accepts a display
+/// name. A name outside [`is_valid_service_name`] is refused here: a quote, a
+/// backslash or a wildcard could reach a service past an exact-name check.
+#[must_use]
+pub fn decide_service_target(name: &str) -> PolicyDecision {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return PolicyDecision::deny("the service name is empty".to_owned(), "SERVICE_NAME_EMPTY");
+    }
+    if !is_valid_service_name(trimmed) {
+        return PolicyDecision::deny(
+            format!(
+                "the tool refuses the service name {name:?}: a name may hold only letters, digits, \
+                 '_', '-', '.' and space"
+            ),
+            "SERVICE_NAME_INVALID",
+        );
+    }
+    if let Some(protected) = PROTECTED_SERVICES
+        .iter()
+        .find(|service| service.eq_ignore_ascii_case(trimmed))
+    {
+        return PolicyDecision::deny(
+            format!(
+                "the tool refuses to change the service {protected:?}: it is critical for the \
+                 remote session"
+            ),
+            "SERVICE_PROTECTED",
+        );
+    }
+    PolicyDecision::allow("service is not protected")
+}
+
 /// Write scan verdict: a protected path in either of the two resolutions, then the
 /// overwrite rule (TR-FS-03, TR-FS-06).
 #[must_use]
@@ -1637,5 +1698,60 @@ mod tests {
         ] {
             assert!(WriteScan::from_json(broken).is_err(), "{broken}");
         }
+    }
+
+    /// AC-SEC15-3, Q-20: the service target of `stop_service`, `restart_service` and
+    /// `set_service_start_type` is refused when it is critical for the remote session,
+    /// case-insensitively; a name outside the allowed charset is refused too, so a
+    /// wildcard or a display name never reaches the host (TR-SEC-15).
+    #[test]
+    fn protected_service_target_is_refused() {
+        for name in [
+            "WinRM",
+            "winrm",
+            "  RpCsS ",
+            "LANMANSERVER",
+            "DcomLaunch",
+            "winmgmt",
+        ] {
+            let decision = decide_service_target(name);
+            assert!(!decision.allow, "must refuse {name:?}");
+            assert_eq!(decision.code, "SERVICE_PROTECTED", "{name:?}");
+            assert!(decision.reason.contains("critical"), "{name:?}");
+        }
+        for name in [
+            "LanmanS*",
+            "WinR?",
+            "Svc[1]",
+            "spooler*",
+            "a\"b",
+            "a\\b",
+            "a/b",
+            "a'b",
+            "a\u{1}b",
+            "Windows Remote Management (WS-Management)",
+        ] {
+            let decision = decide_service_target(name);
+            assert!(!decision.allow, "must refuse {name:?}");
+            assert_eq!(decision.code, "SERVICE_NAME_INVALID", "{name:?}");
+        }
+        assert_eq!(decide_service_target("   ").code, "SERVICE_NAME_EMPTY");
+        for name in [
+            "Spooler",
+            "My Service",
+            "wuauserv",
+            "WinRMHelper",
+            "a.b-c_d",
+        ] {
+            assert!(decide_service_target(name).allow, "must allow {name:?}");
+            assert!(is_valid_service_name(name), "must allow {name:?}");
+        }
+        // A plain-word display name such as "Server" is a valid name, so the host
+        // resolver, not the Rust gate, must refuse it; a display name with a bracket
+        // fails the charset here.
+        assert!(is_valid_service_name("Server"));
+        assert!(!is_valid_service_name(
+            "Windows Remote Management (WS-Management)"
+        ));
     }
 }

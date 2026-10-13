@@ -1005,6 +1005,300 @@ fn capitalize(value: &str) -> String {
     }
 }
 
+/// Upper bound in characters for a service name (TR-REL-17, TR-REL-18).
+///
+/// The Service Control Manager caps a service name at 256 characters; the bound
+/// stops an absurd input before the command is built. Even a worst-case name of this
+/// length fits one WinRS command line.
+pub const SERVICE_NAME_MAX_CHARS: usize = 256;
+
+/// The start types of `set_service_start_type`, as (label, `sc.exe` value) (TR-REL-18).
+pub const SERVICE_START_TYPES: [(&str, &str); 4] = [
+    ("Automatic", "auto"),
+    ("AutomaticDelayed", "delayed-auto"),
+    ("Manual", "demand"),
+    ("Disabled", "disabled"),
+];
+
+/// The `(label, sc.exe value)` of a start type, case-insensitive, or `None`.
+#[must_use]
+pub fn start_type(input: &str) -> Option<(&'static str, &'static str)> {
+    let candidate = input.trim();
+    SERVICE_START_TYPES
+        .iter()
+        .copied()
+        .find(|(label, _)| label.eq_ignore_ascii_case(candidate))
+}
+
+/// Refusal reason if the service name is empty, outside the allowed charset, or above
+/// [`SERVICE_NAME_MAX_CHARS`] (finding 3).
+fn service_name_guard(name: &str) -> Result<(), String> {
+    let chars = name.chars().count();
+    if chars == 0 {
+        return Err("the service name is empty".to_owned());
+    }
+    if !crate::policy::is_valid_service_name(name) {
+        return Err(
+            "the service name holds a character outside letters, digits, '_', '-', '.' and space"
+                .to_owned(),
+        );
+    }
+    if chars > SERVICE_NAME_MAX_CHARS {
+        return Err(format!(
+            "service name is {chars} characters; the limit is {SERVICE_NAME_MAX_CHARS}"
+        ));
+    }
+    Ok(())
+}
+
+/// The refusal for a service command that does not fit one WinRS command line.
+fn service_command_too_long(name: &str) -> String {
+    format!(
+        "service name is {} characters; the command does not fit the WinRS command line of \
+         {WINRS_COMMAND_LINE_LIMIT} characters; shorten the service name",
+        name.chars().count()
+    )
+}
+
+/// The protected service names as a PowerShell array literal (TR-SEC-15, finding 2).
+fn protected_list_literal() -> String {
+    let quoted: Vec<String> = crate::policy::PROTECTED_SERVICES
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect();
+    format!("@({})", quoted.join(","))
+}
+
+/// PowerShell helper: map an input to the canonical service `Name` (finding 2).
+///
+/// An exact WQL match on `Win32_Service.Name`; an unknown name is refused, so a
+/// display name never reaches a service. The protected check runs again on the
+/// canonical name on the host, because `ServiceController` also accepts a display
+/// name. The WQL literal is escaped (`\`→`\\`, `'`→`\'`).
+const HELPER_RESOLVE: &str = r#"function Resolve-WinrigService($raw,$protected){$w=$raw.Replace('\','\\').Replace("'","\'");$f=@(Get-CimInstance Win32_Service -Filter "Name='$w'" -ErrorAction Stop);if($f.Count -eq 0){throw "No service with the name '$raw'; the tool does not fall back to a display name"};$c=[string]$f[0].Name;if($protected -contains $c){throw "Refusing to change '$c': it is critical for the remote session"};$c};"#;
+
+/// PowerShell helper that maps the registry `Start` value to a label (TR-REL-18).
+///
+/// `Start` is `2` automatic, `3` manual, `4` disabled, `0` boot, `1` system;
+/// `DelayedAutostart` marks `AutomaticDelayed`. `Boot` and `System` are returned
+/// as-is.
+const HELPER_START_TYPE: &str = r#"function Get-WinrigStartType($s){$p="HKLM:\SYSTEM\CurrentControlSet\Services\$s";$o=Get-ItemProperty -LiteralPath $p -ErrorAction SilentlyContinue;if(-not $o){return 'Unknown'};$n=@($o.PSObject.Properties.Name);if($n -notcontains 'Start'){return 'Unknown'};$d=$false;if($n -contains 'DelayedAutostart'){$d=([int]$o.DelayedAutostart -eq 1)};switch([int]$o.Start){2{if($d){return 'AutomaticDelayed'}else{return 'Automatic'}}3{return 'Manual'}4{return 'Disabled'}0{return 'Boot'}1{return 'System'}default{return 'Unknown'}}};"#;
+
+/// PowerShell helper that decodes a service from an event `Binary` field (TR-REL-18,
+/// finding 4).
+///
+/// `param1` holds the localized display name, so the name is decoded from the event
+/// `Binary` field: hex → bytes → UTF-16LE text, before the `/`.
+const HELPER_EVENT_NAME: &str = r#"function Get-WinrigEventName($e){$h=[string]([xml]$e.ToXml()).Event.EventData.Binary;if(-not $h){return $null};$c=[int][math]::Floor($h.Length/2);$b=[byte[]]::new($c);for($j=0;$j -lt $c;$j++){$b[$j]=[Convert]::ToByte($h.Substring($j*2,2),16)};[string](([Text.Encoding]::Unicode.GetString($b)).TrimEnd([char]0).Split('/')[0])};"#;
+
+/// PowerShell helper that walks the tree below a service (TR-REL-18, finding 1).
+const HELPER_DEPENDENTS: &str = r#"function Get-WinrigDependents($s){$d=@();$q=@($s);while($q.Count -gt 0){$c=$q[0];$q=@($q|Select-Object -Skip 1);$v=Get-Service -Name $c -ErrorAction SilentlyContinue;if($v){foreach($x in @($v.DependentServices)){if($d -notcontains $x.Name){$d+=$x.Name;$q+=$x.Name}}}};@($d)};"#;
+
+/// The configuration of one service: the start type, the account, the binary path and
+/// the recovery actions (TR-REL-17, AC-REL17-1).
+///
+/// The parse does not depend on the host locale. The status comes from CIM
+/// (`Win32_Service`: `StartMode`, `StartName`, `PathName`); the delayed marker and
+/// the recovery actions come from the service registry key — `DelayedAutostart`, and
+/// `FailureActions`, a `REG_BINARY`: `dwResetPeriod` at 0, the reboot-message offset
+/// at 4, the command offset at 8, `cActions` at 12, the action-array offset at 16 and
+/// the array of `{type, delay_ms}` pairs at that offset (normally 20). The localized
+/// text of `sc.exe` is never read. The start type is normalized to `Automatic`,
+/// `AutomaticDelayed`, `Manual` or `Disabled`; `Boot` and `System` are returned from
+/// CIM as they are.
+///
+/// # Errors
+///
+/// A name above [`SERVICE_NAME_MAX_CHARS`], or a command that does not fit one WinRS
+/// command line. Both refusals name the length and the limit.
+pub fn get_service_config(name: &str) -> Result<String, String> {
+    service_name_guard(name)?;
+    let safe = escape(name);
+    let command = format!(
+        "$n = '{safe}'; \
+         $svc = Get-CimInstance Win32_Service -Filter \"Name='$n'\" -ErrorAction Stop; \
+         if ($null -eq $svc) {{ throw \"Service not found: $n\" }}; \
+         $props = Get-ItemProperty -LiteralPath (\"HKLM:\\SYSTEM\\CurrentControlSet\\Services\\$n\") -ErrorAction SilentlyContinue; \
+         $names = @(); if ($props) {{ $names = @($props.PSObject.Properties.Name) }}; \
+         $delayed = $false; \
+         if ($names -contains 'DelayedAutostart') {{ $delayed = ([int]$props.DelayedAutostart -eq 1) }}; \
+         $start = [string]$svc.StartMode; \
+         if ($start -eq 'Auto') {{ $start = if ($delayed) {{ 'AutomaticDelayed' }} else {{ 'Automatic' }} }}; \
+         $reset = 0; $actions = @(); $has_failure = $false; $on_non_crash = $false; \
+         if ($names -contains 'FailureActions') {{ \
+           $fa = [byte[]]$props.FailureActions; \
+           if ($fa.Length -ge 20) {{ \
+             $has_failure = $true; \
+             $reset = [BitConverter]::ToUInt32($fa, 0); \
+             $count = [BitConverter]::ToUInt32($fa, 12); \
+             $start_at = [BitConverter]::ToUInt32($fa, 16); \
+             if ($start_at -lt 20) {{ $start_at = 20 }}; \
+             $max = [int](($fa.Length - $start_at) / 8); \
+             if ($max -lt 0) {{ $max = 0 }}; \
+             if ($count -gt $max) {{ $count = $max }}; \
+             for ($i = 0; $i -lt $count; $i++) {{ \
+               $off = $start_at + ($i * 8); \
+               $type = [BitConverter]::ToUInt32($fa, $off); \
+               $delay = [BitConverter]::ToUInt32($fa, $off + 4); \
+               $label = switch ($type) {{ 0 {{ 'None' }} 1 {{ 'Restart' }} 2 {{ 'Reboot' }} 3 {{ 'RunCommand' }} default {{ \"Unknown($type)\" }} }}; \
+               $actions += [PSCustomObject]@{{ action = $label; delay_ms = $delay }}; \
+             }} \
+           }} \
+         }}; \
+         if ($names -contains 'FailureActionsOnNonCrashFailures') {{ $on_non_crash = ([int]$props.FailureActionsOnNonCrashFailures -eq 1) }}; \
+         [PSCustomObject]@{{ name = $n; display_name = $svc.DisplayName; status = [string]$svc.State; \
+           start_type = $start; delayed_auto_start = $delayed; service_account = $svc.StartName; \
+           binary_path = $svc.PathName; recovery_present = $has_failure; reset_period_seconds = $reset; \
+           failure_actions_on_non_crash_failures = $on_non_crash; failure_actions = @($actions); \
+           failure_action_count = @($actions).Count }} | ConvertTo-Json -Compress -Depth 4"
+    );
+    if !fits_command_line(&command) {
+        return Err(service_command_too_long(name));
+    }
+    Ok(command)
+}
+
+/// Change the Service Control Manager start type of one service (TR-REL-18,
+/// AC-REL15-2).
+///
+/// The write uses `sc.exe config … start= <value>` and checks only its exit code,
+/// because the output of `sc.exe` is localized. `sc.exe config start= auto` does not
+/// guarantee that a previously set delayed flag is cleared, so the script sets the
+/// registry value `DelayedAutostart` explicitly: 1 for `AutomaticDelayed`, 0
+/// otherwise. It re-reads the start type and returns the normalized label, not the
+/// `sc.exe` value.
+///
+/// # Errors
+///
+/// A name above [`SERVICE_NAME_MAX_CHARS`], or a command that does not fit one WinRS
+/// command line.
+pub fn set_service_start_type(name: &str, label: &str, sc_value: &str) -> Result<String, String> {
+    service_name_guard(name)?;
+    let safe = escape(name);
+    let protected = protected_list_literal();
+    // Disabling a service whose dependents run can strand them; the same protected
+    // dependent guard as `stop_service` runs before the write (finding 2).
+    let (helpers, dependents_check) = if label == "Disabled" {
+        (
+            format!("{HELPER_RESOLVE}{HELPER_START_TYPE}{HELPER_DEPENDENTS}"),
+            "$dep=@(Get-WinrigDependents $n);\
+             $bad=@($dep|Where-Object{$protected -contains $_});\
+             if($bad.Count -gt 0){throw \"Refusing to disable ${n}: dependent $($bad -join ', ') is critical for the remote session\"};"
+                .to_owned(),
+        )
+    } else {
+        (
+            format!("{HELPER_RESOLVE}{HELPER_START_TYPE}"),
+            String::new(),
+        )
+    };
+    let command = format!(
+        "{helpers}\
+         $protected={protected};$n=Resolve-WinrigService '{safe}' $protected;\
+         {dependents_check}\
+         $null=& sc.exe config $n start= {sc_value};\
+         if($LASTEXITCODE -ne 0){{throw \"sc.exe config failed with exit code $LASTEXITCODE for $n\"}};\
+         $delayed=if('{label}' -eq 'AutomaticDelayed'){{1}}else{{0}};\
+         New-ItemProperty -LiteralPath (\"HKLM:\\SYSTEM\\CurrentControlSet\\Services\\$n\") -Name DelayedAutostart -Value $delayed -PropertyType DWord -Force -ErrorAction Stop|Out-Null;\
+         $after=Get-WinrigStartType $n;\
+         if($after -ne '{label}'){{throw \"the start type is $after, but the tool requested '{label}'\"}};\
+         [PSCustomObject]@{{name=$n;start_type=$after;requested='{label}'}}|ConvertTo-Json -Compress"
+    );
+    if !fits_command_line(&command) {
+        return Err(service_command_too_long(name));
+    }
+    Ok(command)
+}
+
+/// Restart through the canonical name (TR-SEC-15, finding 7).
+///
+/// `Restart-Service` accepts a display name and `-Force` stops the dependent
+/// services, so the script resolves the canonical name, re-checks the protected list
+/// on the host, and runs without `-Force`: a running dependent makes the restart fail
+/// with a clear host error instead of stopping the dependent.
+///
+/// # Errors
+///
+/// A name above [`SERVICE_NAME_MAX_CHARS`], or a command that does not fit one WinRS
+/// command line.
+pub fn restart_service(name: &str) -> Result<String, String> {
+    service_name_guard(name)?;
+    let safe = escape(name);
+    let protected = protected_list_literal();
+    let command = format!(
+        "{HELPER_RESOLVE}\
+         $protected={protected};$n=Resolve-WinrigService '{safe}' $protected;\
+         Restart-Service -Name $n -ErrorAction Stop;\
+         Start-Sleep -Seconds 2;\
+         Get-Service -Name $n -ErrorAction Stop|Select-Object Name,Status,StartType|ConvertTo-Json -Compress"
+    );
+    if !fits_command_line(&command) {
+        return Err(service_command_too_long(name));
+    }
+    Ok(command)
+}
+
+/// Stop a service and verify that it stays stopped (TR-REL-18, AC-REL18-1/2).
+///
+/// The script resolves the canonical name and re-checks the protected list on the
+/// host. It refuses a service whose transitive dependent services include a protected
+/// one, before any write. With `disable` it sets the start type `Disabled` before the
+/// stop, so a recovery action cannot start the service again. It stops without
+/// `-Force`, so a running dependent makes the stop fail; the failure is caught and
+/// returned as `stop_error` with the previous start type, so the operator sees the
+/// half-done state. After the stop it waits `wait_seconds`, reads the state, and reads
+/// the events 7031, 7034 and 7036 of the `System` log since the stop; the service is
+/// matched by the name decoded from the event `Binary` field, not by the localized
+/// display name. The answer holds `running_again`, so the caller can refuse when the
+/// service returned.
+///
+/// # Errors
+///
+/// A name above [`SERVICE_NAME_MAX_CHARS`], or a command that does not fit one WinRS
+/// command line.
+pub fn stop_service_verified(
+    name: &str,
+    disable: bool,
+    wait_seconds: i64,
+    previous: &str,
+) -> Result<String, String> {
+    service_name_guard(name)?;
+    let safe = escape(name);
+    let protected = protected_list_literal();
+    let previous = escape(previous);
+    let disable_step = if disable {
+        "$null=& sc.exe config $n start= disabled;\
+         if($LASTEXITCODE -ne 0){throw \"sc.exe config failed with exit code $LASTEXITCODE for $n\"};$ch=$true;"
+            .to_owned()
+    } else {
+        String::new()
+    };
+    let disabled_literal = if disable { "$true" } else { "$false" };
+    let command = format!(
+        "{HELPER_RESOLVE}{HELPER_EVENT_NAME}{HELPER_DEPENDENTS}\
+         $protected={protected};$n=Resolve-WinrigService '{safe}' $protected;\
+         $t0=(Get-Date).AddSeconds(-2);\
+         $prev='{previous}';$ch=$false;$err=$null;\
+         $dep=@(Get-WinrigDependents $n);$bad=@($dep|Where-Object{{$protected -contains $_}});\
+         if($bad.Count -gt 0){{throw \"Refusing to stop ${{n}}: dependent $($bad -join ', ') is critical for the remote session\"}};\
+         {disable_step}\
+         try{{Stop-Service -Name $n -ErrorAction Stop}}catch{{$err=[string]$_.Exception.Message}};\
+         Start-Sleep -Seconds {wait_seconds};\
+         $svc=Get-Service -Name $n -ErrorAction SilentlyContinue;\
+         $st=if($svc){{[string]$svc.Status}}else{{'Unknown'}};\
+         $ev=@();$everr=$null;\
+         try{{$ev=@(Get-WinEvent -FilterHashtable @{{LogName='System';Id=@(7031,7034,7036);StartTime=$t0}} -ErrorAction Stop)}}catch{{if($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*'){{$everr=[string]$_.Exception.Message}}}};\
+         $ev=@($ev|Where-Object{{(Get-WinrigEventName $_) -eq $n}});\
+         $rows=@($ev|ForEach-Object{{[PSCustomObject]@{{id=$_.Id;time=if($_.TimeCreated){{$_.TimeCreated.ToString('o',[Globalization.CultureInfo]::InvariantCulture)}}else{{$null}}}}}});\
+         $run=($null -eq $err)-and($st -eq 'Running');\
+         [PSCustomObject]@{{name=$n;state=$st;previous_start_type=$prev;start_type_changed=$ch;stop_error=$err;events_error=$everr;running_again=[bool]$run;wait_seconds={wait_seconds};disabled={disabled_literal};dependents=@($dep);events=@($rows);event_count=@($rows).Count}}|ConvertTo-Json -Compress -Depth 4"
+    );
+    if !fits_command_line(&command) {
+        return Err(service_command_too_long(name));
+    }
+    Ok(command)
+}
+
 #[must_use]
 pub fn list_processes(name_filter: &str, sort_by: &str, top: i64) -> String {
     let result_cap = cap(top, 1, 100);
@@ -3703,6 +3997,21 @@ mod tests {
         None
     }
 
+    /// Every generator must stay free of an unbraced `$name:` inside a double-quoted
+    /// string: PowerShell 5.1 reads `$name:` as a scope qualifier and fails to parse
+    /// the whole script (TR-REL-14, TR-REL-18). The check runs over every branch of
+    /// every generator.
+    #[test]
+    fn no_generator_has_an_unbraced_variable_colon() {
+        let mut hits = Vec::new();
+        for command in every_generator_command("x") {
+            if let Some(hit) = unbraced_variable_colon(&command) {
+                hits.push(format!("{hit} in: {command}"));
+            }
+        }
+        assert!(hits.is_empty(), "{}", hits.join("\n\n"));
+    }
+
     /// Collects the helpers the script declares, in order. A name ends at the
     /// first character that is not part of a name.
     fn function_names(script: &str) -> Vec<String> {
@@ -3964,6 +4273,9 @@ mod tests {
     /// changes the emitted script. The escape check and the brace guard share it,
     /// so a new generator is covered by both at once.
     fn every_generator_command(text: &str) -> Vec<String> {
+        // The service tools refuse a name outside the allowed charset, so they are
+        // covered with a valid name; the charset guard is tested on its own.
+        let service = "Spooler";
         vec![
             list_directory(text),
             find_files(text, text, 5, true),
@@ -4022,6 +4334,12 @@ mod tests {
             get_event_log(text, "error", 24, text, 10).expect("valid"),
             list_event_logs(text),
             get_services(text, "all", true),
+            get_service_config(service).expect("valid"),
+            set_service_start_type(service, "Automatic", "auto").expect("valid"),
+            set_service_start_type(service, "Disabled", "disabled").expect("valid"),
+            restart_service(service).expect("valid"),
+            stop_service_verified(service, false, 15, "Manual").expect("valid"),
+            stop_service_verified(service, true, 15, "Manual").expect("valid"),
             list_processes(text, "memory", 10),
             get_registry(text, text, false, 1),
             get_registry(text, text, true, 2),
@@ -4147,5 +4465,266 @@ mod tests {
             command.contains("Test-Path -LiteralPath 'x.ps1'"),
             "{command}"
         );
+    }
+
+    /// AC-REL17-1: `get_service_config` reads the start type, the account, the binary
+    /// path and the recovery actions from CIM and the registry, never from the
+    /// localized `sc.exe` text. The `FailureActions` layout is read with `cActions` at
+    /// offset 12 and the action-array offset at 16 (TR-REL-17, finding 5).
+    #[test]
+    fn get_service_config_reads_cim_and_the_registry() {
+        let command = get_service_config("Spooler").expect("valid");
+        assert!(command.contains("$n = 'Spooler'"), "{command}");
+        assert!(
+            command.contains("Get-CimInstance Win32_Service"),
+            "{command}"
+        );
+        assert!(command.contains("[string]$svc.StartMode"), "{command}");
+        assert!(command.contains("$svc.StartName"), "{command}");
+        assert!(command.contains("$svc.PathName"), "{command}");
+        assert!(command.contains("FailureActions"), "{command}");
+        assert!(
+            command.contains("[BitConverter]::ToUInt32($fa, 0)"),
+            "{command}"
+        );
+        assert!(
+            command.contains("[BitConverter]::ToUInt32($fa, 12)"),
+            "cActions is not read at offset 12: {command}"
+        );
+        assert!(
+            command.contains("[BitConverter]::ToUInt32($fa, 16)"),
+            "the action-array offset is not read at offset 16: {command}"
+        );
+        assert!(command.contains("$off = $start_at + ($i * 8)"), "{command}");
+        assert!(command.contains("DelayedAutostart"), "{command}");
+        assert!(command.contains("'AutomaticDelayed'"), "{command}");
+        // The localized text of `sc.exe` is not parsed.
+        assert!(!command.contains("sc qfailure"), "{command}");
+        assert!(!command.contains("sc.exe"), "{command}");
+    }
+
+    /// AC-REL18-2: the start type maps to the `sc.exe` value, case-insensitively, and
+    /// an unknown value is refused (TR-REL-18).
+    #[test]
+    fn start_type_maps_the_accepted_labels() {
+        assert_eq!(start_type("Automatic"), Some(("Automatic", "auto")));
+        assert_eq!(
+            start_type(" automaticdelayed "),
+            Some(("AutomaticDelayed", "delayed-auto"))
+        );
+        assert_eq!(start_type("MANUAL"), Some(("Manual", "demand")));
+        assert_eq!(start_type("Disabled"), Some(("Disabled", "disabled")));
+        assert_eq!(start_type("Automatic (Delayed)"), None);
+        assert_eq!(start_type(""), None);
+    }
+
+    /// AC-REL18-2, findings 2/6/8: `set_service_start_type` resolves the canonical
+    /// name, writes with `sc.exe config`, sets `DelayedAutostart` explicitly with
+    /// `-ErrorAction Stop`, re-reads the start type, refuses a mismatch with both
+    /// values, and — for `Disabled` — refuses a protected dependent before the write
+    /// (TR-REL-18).
+    #[test]
+    fn set_service_start_type_uses_sc_config() {
+        let command =
+            set_service_start_type("Spooler", "AutomaticDelayed", "delayed-auto").expect("valid");
+        assert!(
+            command.contains("$n=Resolve-WinrigService 'Spooler'"),
+            "{command}"
+        );
+        assert!(
+            command.contains("& sc.exe config $n start= delayed-auto"),
+            "{command}"
+        );
+        assert!(command.contains("$LASTEXITCODE"), "{command}");
+        assert!(
+            command.contains("-Name DelayedAutostart -Value $delayed -PropertyType DWord -Force -ErrorAction Stop"),
+            "the registry write must stop on error: {command}"
+        );
+        assert!(
+            command.contains("if('AutomaticDelayed' -eq 'AutomaticDelayed'){1}else{0}"),
+            "{command}"
+        );
+        assert!(
+            command.contains("$after=Get-WinrigStartType $n"),
+            "{command}"
+        );
+        assert!(
+            command.contains(
+                "if($after -ne 'AutomaticDelayed'){throw \"the start type is $after, but the tool requested 'AutomaticDelayed'\"}"
+            ),
+            "a mismatch must be refused with both values: {command}"
+        );
+        assert!(
+            command.contains("start_type=$after;requested='AutomaticDelayed'"),
+            "the answer must return the re-read label, not the sc.exe value: {command}"
+        );
+        // The helper escapes the WQL literal (finding 2).
+        assert!(
+            command.contains(r#".Replace('\','\\').Replace("'","\'")"#),
+            "{command}"
+        );
+        assert!(
+            command.contains("$protected -contains $c"),
+            "the host does not re-check the protected list: {command}"
+        );
+        // A non-Disabled change carries no dependent guard.
+        assert!(
+            !command.contains("Get-WinrigDependents"),
+            "only Disabled needs the dependent guard: {command}"
+        );
+
+        // finding 2: Disabled refuses a protected dependent before `sc.exe config`.
+        let disabled = set_service_start_type("Spooler", "Disabled", "disabled").expect("valid");
+        let dep_at = disabled
+            .find("Get-WinrigDependents $n")
+            .expect("the dependent guard must be present for Disabled");
+        let config_at = disabled
+            .find("sc.exe config $n start= disabled")
+            .expect("config");
+        assert!(
+            dep_at < config_at,
+            "the dependent guard must precede the write: {disabled}"
+        );
+        assert!(
+            disabled.contains("Refusing to disable ${n}: dependent $($bad -join ', ') is critical"),
+            "{disabled}"
+        );
+    }
+
+    /// AC-REL18-1, findings 1/4: the verified stop resolves the canonical name,
+    /// refuses a protected dependent before any write, sets `Disabled` first when
+    /// asked, stops without `-Force`, waits, and matches the events by the decoded
+    /// `Binary` name (TR-REL-18).
+    #[test]
+    fn stop_service_verified_waits_and_checks_the_events() {
+        let plain = stop_service_verified("Spooler", false, 15, "Manual").expect("valid");
+        assert!(
+            plain.contains("$n=Resolve-WinrigService 'Spooler'"),
+            "{plain}"
+        );
+        assert!(
+            !plain.contains("-Force"),
+            "the stop must not use -Force: {plain}"
+        );
+        assert!(!plain.contains("sc.exe config"), "{plain}");
+        assert!(plain.contains("$t0=(Get-Date).AddSeconds(-2)"), "{plain}");
+        let dep_at = plain
+            .find("Get-WinrigDependents $n")
+            .expect("dependent check");
+        let stop_at = plain.find("Stop-Service -Name $n").expect("stop");
+        let sleep_at = plain.find("Start-Sleep -Seconds 15").expect("wait");
+        assert!(
+            dep_at < stop_at && stop_at < sleep_at,
+            "the dependent check must precede the stop, and the wait must follow it: {plain}"
+        );
+        assert!(
+            plain.contains("$bad -join ', ') is critical for the remote session"),
+            "{plain}"
+        );
+        assert!(
+            plain.contains("Refusing to stop ${n}:"),
+            "the braced form must guard the colon: {plain}"
+        );
+        assert!(plain.contains("Id=@(7031,7034,7036)"), "{plain}");
+        // The service name comes from the event Binary, not from the localized display name.
+        assert!(plain.contains("(Get-WinrigEventName $_) -eq $n"), "{plain}");
+        assert!(plain.contains("$e.ToXml()"), "{plain}");
+        assert!(
+            plain.contains("[Text.Encoding]::Unicode.GetString($b)"),
+            "{plain}"
+        );
+        assert!(plain.contains(".Split('/')[0]"), "{plain}");
+        assert!(plain.contains("[Convert]::ToByte("), "{plain}");
+        assert!(
+            plain.contains("NoMatchingEventsFound"),
+            "only a missing-event result must be empty: {plain}"
+        );
+        assert!(plain.contains("running_again=[bool]$run"), "{plain}");
+        assert!(plain.contains("previous_start_type=$prev"), "{plain}");
+        assert!(plain.contains("$prev='Manual'"), "{plain}");
+
+        let disabled = stop_service_verified("Spooler", true, 30, "Automatic").expect("valid");
+        let dep_at = disabled
+            .find("Get-WinrigDependents $n")
+            .expect("dependent check");
+        let config_at = disabled
+            .find("sc.exe config $n start= disabled")
+            .expect("config");
+        let stop_at = disabled.find("Stop-Service -Name $n").expect("stop");
+        assert!(
+            dep_at < config_at && config_at < stop_at,
+            "the dependent check and the start-type change must precede the stop: {disabled}"
+        );
+        assert!(disabled.contains("Start-Sleep -Seconds 30"), "{disabled}");
+        assert!(disabled.contains("disabled=$true"), "{disabled}");
+        assert!(disabled.contains("start_type_changed=$ch"), "{disabled}");
+        assert!(disabled.contains("stop_error=$err"), "{disabled}");
+        assert!(
+            disabled.contains("catch{$err=[string]$_.Exception.Message}"),
+            "{disabled}"
+        );
+        assert!(
+            disabled.contains("events_error=$everr"),
+            "an event read error must land in events_error, not a throw: {disabled}"
+        );
+    }
+
+    /// finding 7: `restart_service` resolves the canonical name, re-checks the
+    /// protected list on the host and runs without `-Force`.
+    #[test]
+    fn restart_service_resolves_and_checks_on_the_host() {
+        let command = restart_service("Spooler").expect("valid");
+        assert!(
+            command.contains("$n=Resolve-WinrigService 'Spooler'"),
+            "{command}"
+        );
+        assert!(command.contains("$protected -contains $c"), "{command}");
+        assert!(
+            command.contains("Restart-Service -Name $n -ErrorAction Stop"),
+            "{command}"
+        );
+        assert!(!command.contains("-Force"), "{command}");
+    }
+
+    /// finding 3: a service name outside the allowed charset is refused before the
+    /// command is built; the name at the cap still fits one command line.
+    #[test]
+    fn service_generators_refuse_a_long_or_invalid_name() {
+        let long = "a".repeat(SERVICE_NAME_MAX_CHARS + 1);
+        for error in [
+            get_service_config(&long).expect_err("too long"),
+            set_service_start_type(&long, "Automatic", "auto").expect_err("too long"),
+            stop_service_verified(&long, false, 15, "Manual").expect_err("too long"),
+            restart_service(&long).expect_err("too long"),
+        ] {
+            assert!(
+                error.contains(&SERVICE_NAME_MAX_CHARS.to_string()),
+                "{error}"
+            );
+        }
+        for name in ["a\"b", "a\\b", "a/b", "a'b", "a\u{1}b"] {
+            for error in [
+                get_service_config(name).expect_err("invalid"),
+                set_service_start_type(name, "Automatic", "auto").expect_err("invalid"),
+                stop_service_verified(name, false, 15, "Manual").expect_err("invalid"),
+                restart_service(name).expect_err("invalid"),
+            ] {
+                assert!(error.contains("outside letters"), "{error}");
+            }
+        }
+        // A worst-case name at the cap still fits one command line.
+        let worst = "a".repeat(SERVICE_NAME_MAX_CHARS);
+        for command in [
+            get_service_config(&worst).expect("valid"),
+            set_service_start_type(&worst, "AutomaticDelayed", "delayed-auto").expect("valid"),
+            stop_service_verified(&worst, true, 15, "Automatic").expect("valid"),
+            restart_service(&worst).expect("valid"),
+        ] {
+            assert!(
+                command_line_chars(&command) < WINRS_COMMAND_LINE_LIMIT,
+                "{}",
+                command_line_chars(&command)
+            );
+        }
     }
 }

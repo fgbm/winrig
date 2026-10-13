@@ -3,7 +3,7 @@ title: Tools
 description: The read-only tools and the modifying tools of winrig, with the switches that enable the modifying tools.
 ---
 
-The binary declares 41 tools, plus `write_file` when the operator enables it. The read-only tools need no confirmation. The modifying tools require the explicit confirmation of the operator (DR-5).
+The binary declares 43 tools, plus `write_file` when the operator enables it. The read-only tools need no confirmation. The modifying tools require the explicit confirmation of the operator (DR-5).
 
 ## Session
 
@@ -33,6 +33,7 @@ The binary declares 41 tools, plus `write_file` when the operator enables it. Th
 | `get_event_log` | The Windows event log: crashes, service failures, authentication errors |
 | `list_event_logs` | The event log channels with the record count and the enabled state |
 | `get_services` | A summary of the services, or the full details of each service in JSON |
+| `get_service_config` | One service: the start type (Automatic, AutomaticDelayed, Manual or Disabled), the account, the binary path and the recovery actions with the action, the delay and the reset period |
 | `list_processes` | The processes with a sort by CPU, memory or handles |
 | `get_open_handles` | The processes that hold a file open, with the PID, the name and the start time. It uses the Restart Manager, so no Sysinternals `handle.exe` is needed |
 | `get_printers` | The printers with the share name, the driver, the port, the port host and number, the state as decoded flags and the job count |
@@ -88,7 +89,8 @@ These tools change the host and they require confirmation.
 
 | Tool | Description |
 |------|-------------|
-| `restart_service` / `stop_service` / `start_service` | Manage the services with the state before and after |
+| `restart_service` / `stop_service` / `start_service` | Manage the services with the state before and after. `stop_service` verifies the stop: it waits `wait_seconds` (15 by default), reads the state and the System events 7031/7034/7036, and reports an error when the service runs again. With `disable=true` it sets the start type to Disabled before the stop |
+| `set_service_start_type` | Set the start type (Automatic, AutomaticDelayed, Manual or Disabled). The confirmation shows the current and the new start type. The tool refuses a service that is critical for the remote session |
 | `kill_process` | Kill a process by PID |
 | `set_registry` | Write a registry value and show the old value and the new value |
 | `delete_file` / `delete_directory` | Delete with a confirmation prompt; the tool rejects protected paths, including by the actual location of the system on the host |

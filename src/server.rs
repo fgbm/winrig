@@ -21,7 +21,8 @@ use crate::executor::sanitize_prompt_value;
 use crate::identity::RequestIdentity;
 use crate::policy::{
     DeleteScan, FileScan, PolicyDecision, WriteScan, decide_delete_path, decide_delete_scan,
-    decide_file_delete, decide_host, decide_port, decide_tls, decide_write_path, decide_write_scan,
+    decide_file_delete, decide_host, decide_port, decide_service_target, decide_tls,
+    decide_write_path, decide_write_scan,
 };
 use crate::ps;
 use crate::session::{SessionRegistry, UserIdentity};
@@ -222,6 +223,34 @@ impl WinrigServer {
             .unwrap_or_else(|| "(state unavailable)".to_owned())
     }
 
+    /// Read-only, and it runs before the confirmation: it gives the current value of
+    /// one field of [`ps::get_service_config`] for the prompt. A missing or unreadable
+    /// answer is an honest string, not an empty one.
+    async fn service_field(
+        &self,
+        identity: &RequestIdentity,
+        session_id: &str,
+        name: &str,
+        field: &str,
+    ) -> Result<String, String> {
+        let command = ps::get_service_config(name)?;
+        let reply = self
+            .run_value(identity, session_id, &command, "get_service_config")
+            .await;
+        let Some(stdout) = Self::successful_stdout(&reply) else {
+            return Ok("(unknown)".to_owned());
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
+            return Ok("(unknown)".to_owned());
+        };
+        Ok(value
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.is_empty())
+            .unwrap_or("(unknown)")
+            .to_owned())
+    }
+
     /// An empty PID or a missing process yields an honest string, not an empty
     /// one: the prompt must show the target even when it no longer exists.
     async fn process_details(
@@ -286,6 +315,10 @@ impl WinrigServer {
         }
     }
 }
+
+/// The most seconds `stop_service` waits with `wait_seconds`. The wait is bounded, so
+/// a call cannot hold the session open without an end.
+const MAX_STOP_WAIT_SECONDS: i64 = 600;
 
 fn random_suffix() -> String {
     let mut bytes = [0u8; 8];
@@ -820,6 +853,38 @@ struct ServiceNameParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct SetServiceStartTypeParams {
+    #[schemars(description = "Session ID that connect returns.")]
+    session_id: String,
+    #[schemars(description = "Exact name of the service, not the display name.")]
+    name: String,
+    #[schemars(description = "Start type: Automatic, AutomaticDelayed, Manual or Disabled.")]
+    start_type: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct StopServiceParams {
+    #[schemars(description = "Session ID that connect returns.")]
+    session_id: String,
+    #[schemars(description = "Exact name of the service, not the display name.")]
+    name: String,
+    #[schemars(
+        description = "Set the start type to Disabled before the stop, so a recovery action cannot start the service again. Default false."
+    )]
+    #[serde(default)]
+    disable: bool,
+    #[schemars(
+        description = "Seconds to wait after the stop before the tool checks whether the service started again. Default 15."
+    )]
+    #[serde(default = "default_wait_seconds")]
+    wait_seconds: i64,
+}
+
+fn default_wait_seconds() -> i64 {
+    15
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct KillProcessParams {
     #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
@@ -1178,6 +1243,30 @@ impl WinrigServer {
                 &params.session_id,
                 &ps::get_services(&params.name_filter, &params.status_filter, params.detail),
                 "get_services",
+            )
+            .await)
+    }
+
+    #[tool(
+        name = "get_service_config",
+        description = "Return one service in JSON: the start type (Automatic, AutomaticDelayed, Manual or Disabled), the account, the binary path and the recovery (failure) actions, each with its action, delay in milliseconds and the reset period in seconds. Read-only. Use it before a start-type change or to see why a stopped service returned."
+    )]
+    async fn get_service_config(
+        &self,
+        Parameters(params): Parameters<ServiceNameParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let identity = self.identity(&ctx)?;
+        let command = match ps::get_service_config(&params.name) {
+            Ok(command) => command,
+            Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
+        };
+        Ok(self
+            .run(
+                &identity,
+                &params.session_id,
+                &command,
+                "get_service_config",
             )
             .await)
     }
@@ -1658,7 +1747,7 @@ impl WinrigServer {
 
     #[tool(
         name = "restart_service",
-        description = "Restart a Windows service. This modifying operation prompts for confirmation. The result shows the state before and after the restart."
+        description = "Restart a Windows service. This modifying operation prompts for confirmation. The result shows the state before and after the restart. The tool refuses a service that is critical for the remote session."
     )]
     async fn restart_service(
         &self,
@@ -1666,11 +1755,17 @@ impl WinrigServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let identity = self.identity(&ctx)?;
-        let command = format!(
-            "Restart-Service -Name '{}' -Force -ErrorAction Stop; Start-Sleep -Seconds 2; {}",
-            ps::escape(&params.name),
-            service_state_command(&params.name)
-        );
+        let decision = decide_service_target(&params.name);
+        if !decision.allow {
+            self.audit_refusal(&identity, "restart_service", &decision);
+            return Ok(CallToolResult::structured(
+                json!({ "error": decision.reason }),
+            ));
+        }
+        let command = match ps::restart_service(&params.name) {
+            Ok(command) => command,
+            Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
+        };
         let before = self
             .service_state(&identity, &params.session_id, &params.name)
             .await;
@@ -1690,30 +1785,187 @@ impl WinrigServer {
 
     #[tool(
         name = "stop_service",
-        description = "Stop a running Windows service. This modifying operation prompts for confirmation. The result shows the state before and after the stop."
+        description = "Stop a running Windows service and verify that it stays stopped. This modifying operation prompts for confirmation. After the stop the tool waits wait_seconds (default 15) and reads the state and the System events 7031, 7034 and 7036 for the service; if the service runs again, the tool returns an error that names the recovery restart. With disable=true the tool sets the start type to Disabled before the stop, so a recovery action cannot start the service again."
     )]
     async fn stop_service(
         &self,
-        Parameters(params): Parameters<ServiceNameParams>,
+        Parameters(params): Parameters<StopServiceParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let identity = self.identity(&ctx)?;
-        let command = format!(
-            "Stop-Service -Name '{}' -Force -ErrorAction Stop; Start-Sleep -Seconds 2; {}",
-            ps::escape(&params.name),
-            service_state_command(&params.name)
-        );
+        // Fail-closed before any host call: a protected service, and a name with a
+        // wildcard, are refused (TR-SEC-15, AC-SEC15-3).
+        let decision = decide_service_target(&params.name);
+        if !decision.allow {
+            self.audit_refusal(&identity, "stop_service", &decision);
+            return Ok(CallToolResult::structured(
+                json!({ "error": decision.reason }),
+            ));
+        }
+        if !(0..=MAX_STOP_WAIT_SECONDS).contains(&params.wait_seconds) {
+            return Ok(CallToolResult::structured(json!({
+                "error": format!(
+                    "wait_seconds is {}; the range is 0 to {MAX_STOP_WAIT_SECONDS}",
+                    params.wait_seconds
+                ),
+            })));
+        }
         let before = self
             .service_state(&identity, &params.session_id, &params.name)
             .await;
+        let start_type = match self
+            .service_field(&identity, &params.session_id, &params.name, "start_type")
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
+        };
+        let command = match ps::stop_service_verified(
+            &params.name,
+            params.disable,
+            params.wait_seconds,
+            &start_type,
+        ) {
+            Ok(command) => command,
+            Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
+        };
+        let details = if params.disable {
+            format!(
+                "Service: {}\nState before: {before}\nCurrent start type: {start_type}\nNew start type: Disabled\n\n\
+                 The tool sets the start type to Disabled, then stops the service. The service cannot start again until the start type is changed.",
+                params.name
+            )
+        } else {
+            format!(
+                "Service: {}\nState before: {before}\nCurrent start type: {start_type}\n\n\
+                 The tool stops the service, waits {}s, then checks whether the service started again.",
+                params.name, params.wait_seconds
+            )
+        };
+        require_confirmation!(&self, &ctx, "STOP SERVICE", &details);
+        let reply = self
+            .run_value(&identity, &params.session_id, &command, "stop_service")
+            .await;
+        Ok(self.stop_service_outcome(&params.name, params.wait_seconds, reply))
+    }
+
+    /// A stop that failed, or a service that runs again, is a refusal, not a success
+    /// (TR-REL-18, AC-REL18-1, finding 6). The half-done state (`start_type_changed`,
+    /// `previous_start_type`, `stop_error`) travels in the error. An unreadable answer
+    /// passes through.
+    fn stop_service_outcome(
+        &self,
+        name: &str,
+        wait_seconds: i64,
+        reply: serde_json::Value,
+    ) -> CallToolResult {
+        let Some(value) = Self::successful_stdout(&reply)
+            .and_then(|stdout| serde_json::from_str::<serde_json::Value>(stdout.trim()).ok())
+        else {
+            return CallToolResult::structured(reply);
+        };
+        if let Some(stop_error) = value
+            .get("stop_error")
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            let dependents: Vec<String> = value
+                .get("dependents")
+                .and_then(serde_json::Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let named = if dependents.is_empty() {
+                String::new()
+            } else {
+                format!(" Dependent services: {}.", dependents.join(", "))
+            };
+            return CallToolResult::structured(json!({
+                "error": format!(
+                    "The stop of {name} failed: {stop_error}{named} Stop the dependent service \
+                     first."
+                ),
+                "start_type_changed": value.get("start_type_changed"),
+                "previous_start_type": value.get("previous_start_type"),
+                "dependents": value.get("dependents"),
+                "result": value,
+            }));
+        }
+        if value
+            .get("running_again")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return CallToolResult::structured(json!({
+                "error": format!(
+                    "The service {name} runs again {wait_seconds} s after the stop. A recovery action \
+                     (restart the service) started it. Set the start type to Disabled, or call \
+                     stop_service with disable=true, to keep it stopped."
+                ),
+                "result": value,
+            }));
+        }
+        CallToolResult::structured(reply)
+    }
+
+    #[tool(
+        name = "set_service_start_type",
+        description = "Set the start type of a Windows service. This modifying operation prompts for confirmation and shows the current and the new start type. The values are Automatic, AutomaticDelayed, Manual and Disabled. The tool refuses a service that is critical for the remote session."
+    )]
+    async fn set_service_start_type(
+        &self,
+        Parameters(params): Parameters<SetServiceStartTypeParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let identity = self.identity(&ctx)?;
+        // Fail-closed before any host call (TR-SEC-15, AC-SEC15-3).
+        let decision = decide_service_target(&params.name);
+        if !decision.allow {
+            self.audit_refusal(&identity, "set_service_start_type", &decision);
+            return Ok(CallToolResult::structured(
+                json!({ "error": decision.reason }),
+            ));
+        }
+        let Some((label, sc_value)) = ps::start_type(&params.start_type) else {
+            return Ok(CallToolResult::structured(json!({
+                "error": format!(
+                    "Invalid start_type '{}'. Valid values: Automatic, AutomaticDelayed, Manual, Disabled",
+                    params.start_type
+                ),
+            })));
+        };
+        let command = match ps::set_service_start_type(&params.name, label, sc_value) {
+            Ok(command) => command,
+            Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
+        };
+        let current = match self
+            .service_field(&identity, &params.session_id, &params.name, "start_type")
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
+        };
         require_confirmation!(
             &self,
             &ctx,
-            "STOP SERVICE",
-            &format!("Service: {}\nState before: {before}", params.name)
+            "SET SERVICE START TYPE",
+            &format!(
+                "Service: {}\nCurrent start type: {current}\nNew start type: {label}\n\n\
+                 The tool changes the start type. The service stays in its current state; the change applies at the next start.",
+                params.name
+            )
         );
         Ok(self
-            .run(&identity, &params.session_id, &command, "stop_service")
+            .run(
+                &identity,
+                &params.session_id,
+                &command,
+                "set_service_start_type",
+            )
             .await)
     }
 
@@ -2269,7 +2521,7 @@ mod tests {
             !names.iter().any(|name| name == "write_file"),
             "write_file must not be advertised while disabled"
         );
-        assert_eq!(names.len(), 41, "expected 41 tools without write_file");
+        assert_eq!(names.len(), 43, "expected 43 tools without write_file");
 
         let on = server_with(&[("WINRIG_ALLOW_FILE_WRITE", "true")]);
         let names: Vec<String> = on
@@ -2279,7 +2531,7 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect();
         assert!(names.iter().any(|name| name == "write_file"));
-        assert_eq!(names.len(), 42, "expected 42 tools with write_file");
+        assert_eq!(names.len(), 44, "expected 44 tools with write_file");
     }
 
     /// TR-FS-01: a removed route is not only hidden from the list but also uncallable.
@@ -2332,16 +2584,22 @@ mod tests {
         assert!(tools.iter().any(|tool| tool.name == "get_open_handles"));
         assert!(tools.iter().any(|tool| tool.name == "get_printers"));
         assert!(tools.iter().any(|tool| tool.name == "get_print_jobs"));
+        assert!(tools.iter().any(|tool| tool.name == "get_service_config"));
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == "set_service_start_type")
+        );
         assert!(tools.iter().any(|tool| tool.name == "delete_directory"));
         // An exact count: "at least 30" would catch neither a lost tool nor a
         // duplicate. These are all declared tools; the configuration decides
         // how many the agent sees (TR-FS-01), and
         // `write_file_is_absent_until_the_operator_enables_it` checks that.
-        assert_eq!(tools.len(), 42, "expected 42 declared tools");
+        assert_eq!(tools.len(), 44, "expected 44 declared tools");
         let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 42, "tool names must be unique");
+        assert_eq!(names.len(), 44, "tool names must be unique");
     }
 
     #[test]
@@ -2359,6 +2617,7 @@ mod tests {
             "kill_process",
             "restart_service",
             "set_registry",
+            "set_service_start_type",
             "start_service",
             "stop_service",
         ] {

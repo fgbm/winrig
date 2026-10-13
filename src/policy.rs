@@ -341,8 +341,8 @@ fn refuse_short_name(path: &str, requested: &str, verb: &str) -> Option<PolicyDe
     short_name_component(path).map(|component| {
         PolicyDecision::deny(
             format!(
-                "refusing to {verb} {requested:?}: {component} is an 8.3 short name, which cannot \
-                 be checked against protected paths; pass the long name"
+                "the tool refuses to {verb} {requested:?}: {component} is an 8.3 short name, and the \
+                 tool cannot check a short name against the protected paths. Pass the long name."
             ),
             "PATH_PROTECTED",
         )
@@ -493,8 +493,8 @@ pub fn tls_decision(verify_cert: bool, allow_insecure_tls: bool) -> Option<(bool
     if !verify_cert && !allow_insecure_tls {
         return Some((
             false,
-            "TLS certificate verification is disabled and WINRIG_ALLOW_INSECURE_TLS \
-             forbids accepting that connection",
+            "the request disables the TLS certificate check and WINRIG_ALLOW_INSECURE_TLS \
+             does not allow this connection",
         ));
     }
     None
@@ -545,7 +545,7 @@ pub fn decide_delete_path(path: &str) -> PolicyDecision {
     }
     if is_protected_path(path) {
         PolicyDecision::deny(
-            format!("refusing to delete protected path: {path:?}"),
+            format!("the tool refuses to delete a protected path: {path:?}"),
             "PATH_PROTECTED",
         )
     } else {
@@ -564,7 +564,7 @@ pub fn decide_write_path(path: &str) -> PolicyDecision {
     }
     if is_protected_path(path) {
         PolicyDecision::deny(
-            format!("refusing to write to protected path: {path:?}"),
+            format!("the tool refuses to write to a protected path: {path:?}"),
             "PATH_PROTECTED",
         )
     } else {
@@ -712,7 +712,7 @@ fn refuse_resolved(
     if is_protected_path(resolved) {
         return Some(PolicyDecision::deny(
             format!(
-                "refusing to {verb} a protected path (resolved by the host to {resolved}): {requested}"
+                "the tool refuses to {verb} a protected path (the host resolved it to {resolved}): {requested}"
             ),
             "PATH_PROTECTED",
         ));
@@ -720,8 +720,8 @@ fn refuse_resolved(
     roots.containing(resolved).map(|(name, root)| {
         PolicyDecision::deny(
             format!(
-                "refusing to {verb} a protected path (resolved by the host to {resolved}, inside \
-                 the {name} root {root}): {requested}"
+                "the tool refuses to {verb} a protected path (the host resolved it to {resolved}, \
+                 inside the {name} root {root}): {requested}"
             ),
             "PATH_PROTECTED",
         )
@@ -867,7 +867,7 @@ pub fn decide_file_delete(scan: &FileScan, requested: &str) -> PolicyDecision {
     if scan.is_directory {
         return PolicyDecision::deny(
             format!(
-                "refusing to delete a directory with delete_file (use delete_directory): {requested}"
+                "the tool refuses to delete a directory with delete_file (use delete_directory): {requested}"
             ),
             "PATH_IS_DIRECTORY",
         );
@@ -889,14 +889,14 @@ pub fn decide_delete_scan(scan: &DeleteScan, requested: &str, cap: i64) -> Polic
     }
     if scan.is_reparse_point {
         return PolicyDecision::deny(
-            format!("refusing to delete a reparse point (junction/symlink): {requested}"),
+            format!("the tool refuses to delete a reparse point (junction/symlink): {requested}"),
             "PATH_REPARSE_POINT",
         );
     }
     if scan.nested_reparse_point {
         return PolicyDecision::deny(
             format!(
-                "refusing to delete: the subtree contains a reparse point (junction/symlink): {requested}"
+                "the tool refuses to delete: the subtree contains a reparse point (junction/symlink): {requested}"
             ),
             "NESTED_REPARSE_POINT",
         );
@@ -904,7 +904,7 @@ pub fn decide_delete_scan(scan: &DeleteScan, requested: &str, cap: i64) -> Polic
     if scan.total_items > cap {
         return PolicyDecision::deny(
             format!(
-                "directory contains {}+ items — exceeds safety cap of {cap}. Review the scan and set max_items higher if you are sure.",
+                "the directory contains {}+ items, above the safety cap of {cap}. Review the scan and raise max_items if the count is correct.",
                 scan.total_items
             ),
             "TOO_MANY_ITEMS",

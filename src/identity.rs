@@ -1,48 +1,49 @@
-//! Извлечение идентичности вызывающего из текущего запроса (DR-2, ADR-0009).
+//! Extraction of the caller identity from the current request (DR-2, ADR-0009).
 //!
-//! В HTTP идентичность определяется предъявленным секретом (ADR-0009 §4):
-//! токен профиля даёт идентичность профиля и заголовки `X-AD-*` игнорируются;
-//! общий секрет `WINRIG_AUTH_TOKEN` требует `X-AD-User`. Идентичность берётся из
-//! `http::request::Parts`, которые streamable-HTTP транспорт `rmcp` кладёт в
-//! расширения запроса, и никогда не наследуется из задачи, создавшей сессию.
+//! In HTTP the presented secret determines the identity (ADR-0009 §4): a profile
+//! token gives the profile identity and the `X-AD-*` headers are ignored; the
+//! shared secret `WINRIG_AUTH_TOKEN` requires `X-AD-User`. The identity comes from
+//! the `http::request::Parts` that the `rmcp` streamable-HTTP transport puts into
+//! the request extensions, and is never inherited from the task that created the
+//! session.
 //!
-//! В stdio HTTP-запроса нет, поэтому идентичность берётся из профиля процесса и
-//! передаётся серверу как локальная ([`RequestIdentity`] с источником
-//! [`IdentitySource::Profile`]).
+//! stdio has no HTTP request, so the identity comes from the process profile and
+//! is passed to the server as local ([`RequestIdentity`] with the
+//! [`IdentitySource::Profile`] source).
 
 use http::request::Parts;
 use rmcp::model::ErrorData;
 use winrm_rs::SecretString;
 
-/// Откуда взята идентичность текущего вызова.
+/// Origin of the identity of the current call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentitySource {
-    /// Из заголовков `X-AD-User`/`X-AD-Password` (HTTP, общий секрет).
+    /// From `X-AD-User`/`X-AD-Password` (HTTP, shared secret).
     Headers,
-    /// Из профиля учётной записи (токен профиля или stdio).
+    /// From the stored account (token or stdio).
     Profile,
 }
 
-/// Идентичность вызывающего пользователя.
+/// Identity of the calling user.
 #[derive(Debug, Clone)]
 pub struct RequestIdentity {
-    /// Каноническое имя учётной записи.
+    /// Canonical account name.
     pub username: String,
-    /// Пароль AD, если он был передан или восстановлен из профиля.
+    /// AD secret, given or recovered from the profile.
     pub password: Option<SecretString>,
-    /// Источник идентичности.
+    /// Where it came from.
     pub source: IdentitySource,
 }
 
-/// Идентичность профиля, положенная middleware в расширения запроса.
+/// Placed by the middleware into the request extensions.
 ///
-/// Наличие этой отметки означает, что запрос аутентифицирован токеном профиля;
-/// заголовки `X-AD-*` при этом игнорируются (ADR-0009 §4).
+/// Its presence means the request is authenticated by a profile token; the
+/// `X-AD-*` headers are then ignored (ADR-0009 §4).
 #[derive(Debug, Clone)]
 pub struct ProfileIdentity {
-    /// Каноническое имя учётной записи из профиля.
+    /// Canonical account name from the profile.
     pub username: String,
-    /// Пароль AD, расшифрованный из профиля и живущий только в памяти.
+    /// AD secret decrypted from the profile, kept only in memory.
     pub password: SecretString,
 }
 
@@ -55,31 +56,31 @@ fn header<'a>(parts: &'a Parts, name: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
-/// Читает `http::request::Parts` из контекста запроса.
+/// The HTTP parts stored in the context extensions.
 pub fn request_parts(ctx: &rmcp::service::RequestContext<rmcp::RoleServer>) -> Option<&Parts> {
     ctx.extensions.get::<Parts>()
 }
 
-/// Приводит имя учётной записи к канонической форме.
+/// Brings the account name to canonical form.
 ///
-/// AD не различает регистр в имени пользователя, а карты кэшей и счётчиков
-/// отказов различали бы: `alice` и `ALICE` дали бы разные записи, обойдя
-/// блокировку. Имя приводится к нижнему регистру. Та же функция применяется к
-/// имени из профиля, чтобы ключ кэша совпадал с ключом для заголовка (AC-PRF-26).
+/// AD does not distinguish case in a user name, but the cache and lockout maps
+/// would: `alice` and `ALICE` would get separate entries and bypass the lockout.
+/// The name is lowercased. The same function applies to the profile name, so the
+/// cache key matches the key for a header (AC-PRF-26).
 #[must_use]
 pub fn canonical_username(value: &str) -> String {
     value.to_ascii_lowercase()
 }
 
-/// Возвращает идентичность из заголовков текущего HTTP-запроса.
+/// Returns the identity from the headers of the current HTTP request.
 ///
-/// Используется HTTP-инструментами: `Parts` кладёт в расширения только
-/// streamable-HTTP транспорт. В stdio запроса нет, поэтому сервер использует
-/// заранее собранную идентичность профиля (см. `WinrigServer`).
+/// Used by the HTTP tools: only the streamable-HTTP transport puts `Parts` into
+/// the extensions. stdio has no request, so the server uses the identity collected
+/// from the profile (see `WinrigServer`).
 ///
 /// # Errors
 ///
-/// [`ErrorData`] с `INVALID_PARAMS`, если запрос не несёт `X-AD-User`.
+/// [`ErrorData`] with `INVALID_PARAMS` when the request carries no `X-AD-User`.
 pub fn identity_from_context(
     ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
 ) -> Result<RequestIdentity, ErrorData> {
@@ -92,15 +93,16 @@ pub fn identity_from_context(
     identity_from_parts(parts)
 }
 
-/// Возвращает идентичность из расширений запроса или заголовков.///
-/// Если middleware отметила запрос идентичностью профиля, она имеет приоритет,
-/// а заголовки `X-AD-*` игнорируются с предупреждением (без кэширования и
-/// логирования пароля из заголовка). Иначе читается `X-AD-User`; отсутствие
-/// заголовков (нет HTTP-запроса) — ошибка MCP.
+/// Returns the identity from the request extensions or headers.
+///
+/// When the middleware marked the request with the profile identity, that takes
+/// priority and the `X-AD-*` headers are ignored with a warning (the header
+/// password is neither cached nor logged). Otherwise `X-AD-User` is read; missing
+/// headers (no HTTP request) are an MCP error.
 ///
 /// # Errors
 ///
-/// [`ErrorData`] с `INVALID_PARAMS`, если запрос не несёт идентичности.
+/// [`ErrorData`] with `INVALID_PARAMS` when the request carries no identity.
 pub fn identity_from_parts(parts: &Parts) -> Result<RequestIdentity, ErrorData> {
     if let Some(profile) = parts.extensions.get::<ProfileIdentity>() {
         if parts.headers.contains_key("x-ad-user") || parts.headers.contains_key("x-ad-password") {
@@ -161,8 +163,8 @@ mod tests {
         assert_eq!(canonical_username("DOMAIN\\Alice"), "domain\\alice");
     }
 
-    /// AC-PRF-51: при токене профиля заголовки игнорируются, пароль из
-    /// заголовка не попадает в идентичность.
+    /// AC-PRF-51: with a profile token the headers are ignored, and the header
+    /// password never reaches the identity.
     #[test]
     fn profile_identity_wins_over_headers() {
         let mut parts = parts_with(&[("X-AD-User", "bob"), ("X-AD-Password", "other")]);

@@ -150,14 +150,16 @@ pub fn write_chunk(temp_path: &str, chunk_base64: &str, first: bool) -> String {
     let safe_chunk = escape(chunk_base64);
     if first {
         format!(
-            "$bytes = [Convert]::FromBase64String('{safe_chunk}'); \
+            "$ErrorActionPreference = 'Stop'; \
+             $bytes = [Convert]::FromBase64String('{safe_chunk}'); \
              [IO.File]::WriteAllBytes('{safe}', $bytes)"
         )
     } else {
         format!(
-            "$bytes = [Convert]::FromBase64String('{safe_chunk}'); \
+            "$ErrorActionPreference = 'Stop'; \
+             $bytes = [Convert]::FromBase64String('{safe_chunk}'); \
              $f = [IO.File]::Open('{safe}', 'Append'); \
-             $f.Write($bytes, 0, $bytes.Length); $f.Close()"
+             try {{ $f.Write($bytes, 0, $bytes.Length) }} finally {{ $f.Close() }}"
         )
     }
 }
@@ -186,7 +188,7 @@ pub fn write_commit(temp_path: &str, path: &str, encoding: &str) -> Result<Strin
     let Some(dotnet) = dotnet_encoding(&key) else {
         let replace = replace_target_command(temp_path, path);
         return Ok(format!(
-            "{replace}; Write-Output 'File written successfully'"
+            "$ErrorActionPreference = 'Stop'; {replace}; Write-Output 'File written successfully'"
         ));
     };
     // The conversion goes into a second temporary file, and only then the
@@ -197,7 +199,8 @@ pub fn write_commit(temp_path: &str, path: &str, encoding: &str) -> Result<Strin
     let safe_staged = escape(&staged);
     let replace = replace_target_command(&staged, path);
     Ok(format!(
-        "$text = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes('{safe_temp}')); \
+        "$ErrorActionPreference = 'Stop'; \
+         $text = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes('{safe_temp}')); \
          [IO.File]::WriteAllText('{safe_staged}', $text, {dotnet}); \
          {replace}; \
          Remove-Item -LiteralPath '{safe_temp}' -Force -ErrorAction SilentlyContinue; \
@@ -335,9 +338,10 @@ pub fn script_chunk_create(path: &str, chunk_base64: &str) -> String {
     let safe = escape(path);
     let safe_chunk = escape(chunk_base64);
     format!(
-        "$bytes=[Convert]::FromBase64String('{safe_chunk}'); \
+        "$ErrorActionPreference = 'Stop'; \
+         $bytes=[Convert]::FromBase64String('{safe_chunk}'); \
          $f=[IO.File]::Open('{safe}','CreateNew'); \
-         $f.Write($bytes,0,$bytes.Length); $f.Close()"
+         try {{ $f.Write($bytes,0,$bytes.Length) }} finally {{ $f.Close() }}"
     )
 }
 
@@ -5601,6 +5605,8 @@ mod tests {
             move_rename_command(text, text, true, true).expect("valid"),
             move_copy_delete_command(text, text, false).expect("valid"),
             rename_command(text, text, false, false).expect("valid"),
+            move_case_command(text, text, false, false).expect("valid"),
+            move_case_command(text, text, true, true).expect("valid"),
             create_directory_scan(text),
             create_directory_command(text).expect("valid"),
             run_command(text).expect("valid"),
@@ -5615,6 +5621,66 @@ mod tests {
         commands.extend(write_plan(text, text, text, "utf8", 1_000_000).expect("valid"));
         commands.extend(script_plan(text, text, 1_000_000).expect("valid"));
         commands
+    }
+
+    /// TR-FS-05, DR-5: a .NET exception ends only its own statement, so a
+    /// modifying command without `Stop` can print success and exit 0 after a
+    /// failed write. Every modifying generator starts with the preference or is
+    /// listed as exempt with its reason.
+    #[test]
+    fn every_modifying_command_stops_on_the_first_error() {
+        const STOP: &str = "$ErrorActionPreference = 'Stop'";
+        let mut modifying = vec![
+            write_chunk("p", "AA==", true),
+            write_chunk("p", "AA==", false),
+            script_chunk_create("p", "AA=="),
+            upload_chunk("p", 0, 1).expect("valid"),
+            upload_chunk("p", 5, 1).expect("valid"),
+            upload_commit("p", "t", 1, &"ab".repeat(32), false).expect("valid"),
+            upload_commit("p", "t", 1, &"ab".repeat(32), true).expect("valid"),
+            copy_command("s", "t", false, false).expect("valid"),
+            copy_command("s", "t", true, true).expect("valid"),
+            move_rename_command("s", "t", false, false).expect("valid"),
+            move_rename_command("s", "t", true, true).expect("valid"),
+            move_copy_delete_command("s", "t", false).expect("valid"),
+            rename_command("s", "t", false, false).expect("valid"),
+            move_case_command("s", "T", false, false).expect("valid"),
+            move_case_command("s", "T", true, true).expect("valid"),
+            create_directory_command("d").expect("valid"),
+        ];
+        for encoding in VALID_ENCODINGS {
+            modifying.push(write_commit("p", "t", encoding).expect("valid"));
+            modifying.extend(write_plan("t", "p", "x", encoding, 1000).expect("valid"));
+        }
+        modifying.extend(script_plan("p", "x", 1000).expect("valid"));
+        for command in &modifying {
+            assert!(command.starts_with(STOP), "{command}");
+        }
+        // Exempt, each with its reason:
+        // - `run_command` and `run_script_file` run user code under the default
+        //   preference, and their wrappers exit with the code of that code.
+        // - `write_abort` and `script_cleanup` are cleanup; the first is quiet by
+        //   design and the second has its own `-ErrorAction Stop` on the removal.
+        // - `upload_remove_temp` proves the removal with its exit code.
+        // - The service commands use `-ErrorAction Stop` and `throw` per step.
+        let exempt = [
+            run_command("x").expect("valid"),
+            run_script_file("p", &script_sha256("x")).expect("valid"),
+            write_abort("p"),
+            script_cleanup("p"),
+            upload_remove_temp("p").expect("valid"),
+        ];
+        for command in &exempt {
+            assert!(!command.starts_with(STOP), "{command}");
+        }
+    }
+
+    /// A failed `Write` must not be hidden by the `Close` after it.
+    #[test]
+    fn append_closes_the_file_in_a_finally_block() {
+        let append = write_chunk("p", "AA==", false);
+        assert!(append.contains("try {"), "{append}");
+        assert!(append.contains("finally { $f.Close() }"), "{append}");
     }
 
     /// Injection: free text that enters a PowerShell single-quoted string must

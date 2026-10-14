@@ -48,6 +48,8 @@ struct RecordingTransport {
     staging_dir: Mutex<Option<String>>,
     /// The standard input of each call that carried one (upload windows).
     stdin: Mutex<Vec<Vec<u8>>>,
+    /// Scripts that contain one of these substrings exit with code 1.
+    failures: Mutex<Vec<String>>,
 }
 
 #[async_trait::async_trait]
@@ -86,10 +88,16 @@ impl WinRmTransport for RecordingTransport {
             .find(|(needle, _)| script.contains(needle))
             .map(|(_, stdout)| stdout.clone())
             .unwrap_or_else(|| HOST_STDOUT.to_owned());
+        let failed = self
+            .failures
+            .lock()
+            .expect("lock")
+            .iter()
+            .any(|needle| script.contains(needle));
         Ok(RemoteOutput {
             stdout: stdout.into_bytes(),
             stderr: Vec::new(),
-            exit_code: 0,
+            exit_code: i32::from(failed),
         })
     }
 }
@@ -118,6 +126,11 @@ impl RecordingTransport {
             .lock()
             .expect("lock")
             .push((needle.to_owned(), stdout.to_owned()));
+    }
+
+    /// Exit with code 1 for every script that contains `needle`.
+    fn fail_on(&self, needle: &str) {
+        self.failures.lock().expect("lock").push(needle.to_owned());
     }
 }
 
@@ -277,6 +290,7 @@ async fn started(answer: Answer, overrides: &[(&str, &str)]) -> Harness {
         responses: Mutex::new(Vec::new()),
         staging_dir: Mutex::new(None),
         stdin: Mutex::new(Vec::new()),
+        failures: Mutex::new(Vec::new()),
     });
     let registry = Arc::new(SessionRegistry::new(
         Arc::clone(&transport) as Arc<dyn WinRmTransport>,
@@ -2209,6 +2223,34 @@ async fn write_file_effect_depends_on_existence() {
     assert!(
         message.contains("This replaces the whole file. You cannot undo it"),
         "{message}"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// TR-FS-05: a failed replace ends the write with an error and removes the
+/// temporary files, so the host never reports a success it did not reach.
+#[tokio::test]
+async fn write_file_runs_the_abort_when_the_replace_fails() {
+    let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_FILE_WRITE", "true")]).await;
+    harness.transport.respond(
+        "GetUnresolvedProviderPathFromPSPath",
+        r#"{"FullName":"C:\\App\\old.json","DotNetFullName":"C:\\App\\old.json","Exists":true,"IsDirectory":false,"LinkType":null,"Roots":{"SystemRoot":"C:\\Windows"}}"#,
+    );
+    harness.transport.fail_on("File written successfully");
+    let result = harness
+        .call(write_file_call("C:\\App\\old.json", "x", true))
+        .await;
+    assert!(
+        error_of(&result).is_some(),
+        "{:?}",
+        result.structured_content
+    );
+    assert_ne!(status_of(&result).as_deref(), Some("written"));
+    assert!(
+        harness
+            .transport
+            .saw("-Force -ErrorAction SilentlyContinue"),
+        "the abort must remove the temporary file"
     );
     harness.client.cancel().await.ok();
 }

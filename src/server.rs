@@ -5062,7 +5062,8 @@ struct UploadState {
 /// placement was in flight, because the replace may have happened. The removal runs
 /// as a task, because `drop` cannot wait. The transport terminates a stalled host
 /// command from its own task, so the removal retries on a schedule until the host
-/// proves that the file is gone.
+/// proves that the file is gone. A task spawned while the runtime shuts down is
+/// dropped, so the removal may not run; the audit entry is written before the task.
 struct UploadGuard {
     registry: Arc<SessionRegistry>,
     username: String,
@@ -7511,6 +7512,7 @@ mod tests {
             "start_service",
             "stop_service",
             "upload_file",
+            "write_file",
         ] {
             assert!(
                 names.binary_search(&expected).is_ok(),

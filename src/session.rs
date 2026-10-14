@@ -410,6 +410,9 @@ impl ShellCleanup for ClientCleanup {
 /// The host command blocks on its standard input and holds the temp file open until
 /// then. `drop` cannot wait, so a task sends the signal first and then deletes the
 /// shell.
+///
+/// A task spawned while the runtime shuts down is dropped, so the host cleanup may not
+/// run; the audit still records the call as cancelled or unknown.
 struct CallGuard {
     cleanup: Arc<dyn ShellCleanup>,
     command_id: Option<String>,

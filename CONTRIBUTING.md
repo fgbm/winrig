@@ -31,7 +31,7 @@ They follow from `AGENTS.md` §3 and `docs/REQUIREMENTS.md`. A pull request that
 1. **Test first.** Add a failing test, then the code that makes it green.
 2. **A secret does not go to the disk or to the reply.** Not to the log, not to the audit, not to the tool reply, not to the configuration, not to the commit (`DR-4`).
 3. **Check the secret before you trust anything.** The identity is set on each request and never inherited from the MCP session (`DR-1`, `DR-2`).
-4. **A modification is confirmed or it does not run.** When the client cannot ask, the call refuses (fail-closed) (`DR-5`).
+4. **A modification is confirmed or it does not run.** When the client cannot ask, the call refuses (fail-closed), unless the operator sets `WINRIG_CONFIRM_FALLBACK=proceed` (`DR-5`, ADR-0013 §21–22).
 5. **No injection into the command line.** A value from an argument goes as data and never concatenates with PowerShell.
 6. **Independence from the locale.** A PowerShell command must not depend on the language of the host; format in the code, not in the shell.
 7. **One paragraph, one line.** The documents do not wrap by column width: a soft wrap of a paragraph is diff noise (`AGENTS.md` §9).

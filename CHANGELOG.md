@@ -4,7 +4,7 @@ All notable changes of the project are listed here. The format is [Keep a Change
 
 A release goes out under the tag `vX.Y.Z`; the tag starts `.github/workflows/release.yml`. That workflow builds archives for five platforms, publishes a GitHub Release and attaches the binaries with checksums. The version in `Cargo.toml` and the entry here go up in one commit — see `docs/IMPLEMENTATION_CYCLE.md`.
 
-## Unreleased
+## [0.3.0] - 2026-10-14
 
 ### Added
 

@@ -17,7 +17,8 @@ use rmcp::ServiceExt;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ClientCapabilities, ClientConfig, ElicitRequestParams,
-    ElicitResult, ElicitationAction, ErrorData as McpError, JsonObject,
+    ElicitResult, ElicitationAction, ElicitationCapability, ErrorData as McpError, JsonObject,
+    UrlElicitationCapability,
 };
 use rmcp::service::{RequestContext, RoleClient, RunningService};
 use winrig::config::{AppConfig, load_config_from};
@@ -95,6 +96,11 @@ enum Answer {
     Silent,
     /// The client does not declare elicitation; the confirmation channel is absent.
     NoChannel,
+    /// The client declares elicitation in URL mode only; a form request has no
+    /// channel.
+    UrlOnly,
+    /// The channel is present but the request fails; the state is unknown.
+    Error,
 }
 
 /// An MCP client whose only job is to answer a confirmation in a given way and
@@ -125,15 +131,23 @@ impl ClientHandler for TestClient {
             // answer ever comes.
             Answer::Silent => std::future::pending().await,
             Answer::NoChannel => unreachable!("server must not elicit without the capability"),
+            // A URL-only client has no form channel, so the server never asks.
+            Answer::UrlOnly => unreachable!("server must not elicit without a form channel"),
+            Answer::Error => Err(McpError::internal_error("channel failure", None)),
         }
     }
 
     fn get_info(&self) -> ClientConfig {
         let mut info = ClientConfig::default();
-        info.capabilities = if self.answer == Answer::NoChannel {
-            ClientCapabilities::default()
-        } else {
-            ClientCapabilities::builder().enable_elicitation().build()
+        info.capabilities = match self.answer {
+            Answer::NoChannel => ClientCapabilities::default(),
+            Answer::UrlOnly => {
+                let mut capabilities = ClientCapabilities::default();
+                capabilities.elicitation =
+                    Some(ElicitationCapability::new().with_url(UrlElicitationCapability::new()));
+                capabilities
+            }
+            _ => ClientCapabilities::builder().enable_elicitation().build(),
         };
         info
     }
@@ -2324,4 +2338,419 @@ async fn unknown_session_is_refused_before_the_prompt() {
         result.structured_content
     );
     harness.client.cancel().await.ok();
+}
+
+// ---------------------------------------------------------------------------
+// run_command
+// ---------------------------------------------------------------------------
+
+/// A call to `run_command` in an open session.
+fn run_command_call(command: &str) -> CallToolRequestParams {
+    CallToolRequestParams::new("run_command").with_arguments(args(&serde_json::json!({
+        "session_id": HOST,
+        "command": command
+    })))
+}
+
+/// Returns what the server advertises over the MCP channel.
+async fn tool_names(harness: &Harness) -> Vec<String> {
+    harness
+        .client
+        .list_tools(None)
+        .await
+        .expect("tools/list")
+        .tools
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .collect()
+}
+
+/// The base64 of the UTF-16LE form of `text`, as the `run_command` wrapper
+/// carries it.
+fn utf16_base64(text: &str) -> String {
+    let mut bytes = Vec::new();
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    winrig::ps::encode_base64(&bytes)
+}
+
+/// TR-EXE-01, AC-EXE-01: `run_command` is absent by default and appears when the
+/// operator enables it.
+#[tokio::test]
+async fn run_command_appears_only_when_enabled() {
+    let off = started(Answer::Accept, &[]).await;
+    assert!(
+        !tool_names(&off)
+            .await
+            .iter()
+            .any(|name| name == "run_command"),
+        "run_command must not be advertised while disabled"
+    );
+    off.client.cancel().await.ok();
+
+    let on = started(Answer::Accept, &[("WINRIG_ALLOW_COMMAND_EXEC", "true")]).await;
+    assert!(
+        tool_names(&on)
+            .await
+            .iter()
+            .any(|name| name == "run_command"),
+        "run_command must appear once enabled"
+    );
+    on.client.cancel().await.ok();
+}
+
+/// TR-EXE-03, AC-EXE-03: without a confirmation channel the command is refused
+/// and never reaches the host (DR-5, fail-closed).
+#[tokio::test]
+async fn run_command_without_channel_is_refused() {
+    let harness = connected(Answer::NoChannel, &[("WINRIG_ALLOW_COMMAND_EXEC", "true")]).await;
+    let result = harness.call(run_command_call("Get-Service")).await;
+
+    assert!(
+        !harness.transport.saw("[ScriptBlock]::Create"),
+        "the command ran without a confirmation channel"
+    );
+    assert_eq!(
+        harness.elicitations(),
+        0,
+        "the server asked a client that never declared elicitation"
+    );
+    assert!(
+        error_of(&result).is_some_and(|error| error.contains("cannot ask for confirmation")),
+        "{:?}",
+        result.structured_content
+    );
+    // TR-EXE-03: the refusal points to the documentation section, and it never
+    // tells the agent to set the fallback itself.
+    let error = error_of(&result).expect("an error");
+    assert!(error.contains("documentation"), "{error}");
+    assert!(!error.contains("WINRIG_CONFIRM_FALLBACK"), "{error}");
+    harness.client.cancel().await.ok();
+}
+
+/// TR-SEC-11, AC-EXE-03: with `WINRIG_CONFIRM_FALLBACK=proceed` a client without
+/// elicitation runs the command, and the audit marks the absent confirmation.
+#[tokio::test]
+async fn run_command_runs_with_proceed_and_no_channel() {
+    let buffer = capture();
+    let harness = connected(
+        Answer::NoChannel,
+        &[
+            ("WINRIG_ALLOW_COMMAND_EXEC", "true"),
+            ("WINRIG_CONFIRM_FALLBACK", "proceed"),
+        ],
+    )
+    .await;
+    let result = harness.call(run_command_call("Get-Service")).await;
+
+    assert!(
+        harness.transport.saw("[ScriptBlock]::Create"),
+        "the command did not run under proceed"
+    );
+    assert_eq!(
+        number(&result, "status_code"),
+        Some(0),
+        "{:?}",
+        result.structured_content
+    );
+    harness.client.cancel().await.ok();
+
+    let text = take_audit(&buffer);
+    assert!(
+        text.contains("CONFIRMATION UNSUPPORTED") && text.contains("unsupported"),
+        "the fallback run is not marked in the audit: {text}"
+    );
+    // ADR-0013 §22: the event names the session and the host of the fallback run.
+    assert!(
+        text.contains("session") && text.contains("host") && text.contains(HOST),
+        "the fallback event must carry the session and the host: {text}"
+    );
+}
+
+/// TR-SEC-11: `proceed` never bypasses a failure of the channel itself, where the
+/// state of the channel is unknown.
+#[tokio::test]
+async fn proceed_does_not_bypass_a_channel_error() {
+    let harness = connected(
+        Answer::Error,
+        &[
+            ("WINRIG_ALLOW_COMMAND_EXEC", "true"),
+            ("WINRIG_CONFIRM_FALLBACK", "proceed"),
+        ],
+    )
+    .await;
+    let result = harness.call(run_command_call("Get-Service")).await;
+
+    assert!(
+        !harness.transport.saw("[ScriptBlock]::Create"),
+        "a command ran after a channel error"
+    );
+    assert!(
+        error_of(&result).is_some(),
+        "{:?}",
+        result.structured_content
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// TR-SEC-11: `proceed` never bypasses a refusal of the user.
+#[tokio::test]
+async fn proceed_does_not_bypass_a_user_decline() {
+    let harness = connected(
+        Answer::Decline,
+        &[
+            ("WINRIG_ALLOW_COMMAND_EXEC", "true"),
+            ("WINRIG_CONFIRM_FALLBACK", "proceed"),
+        ],
+    )
+    .await;
+    let result = harness.call(run_command_call("Get-Service")).await;
+
+    assert!(
+        !harness.transport.saw("[ScriptBlock]::Create"),
+        "a declined command still ran"
+    );
+    assert_eq!(status_of(&result).as_deref(), Some("cancelled"));
+    harness.client.cancel().await.ok();
+}
+
+/// TR-SEC-11, TR-REL-08: `proceed` never bypasses a timeout.
+#[tokio::test]
+async fn proceed_does_not_bypass_a_timeout() {
+    let harness = connected(
+        Answer::Silent,
+        &[
+            ("WINRIG_ALLOW_COMMAND_EXEC", "true"),
+            ("WINRIG_CONFIRM_FALLBACK", "proceed"),
+            ("WINRIG_CONFIRM_TIMEOUT_SECONDS", "1"),
+        ],
+    )
+    .await;
+    let result = harness.call(run_command_call("Get-Service")).await;
+
+    assert!(
+        !harness.transport.saw("[ScriptBlock]::Create"),
+        "a command ran after the confirmation timed out"
+    );
+    assert_eq!(status_of(&result).as_deref(), Some("timeout"));
+    harness.client.cancel().await.ok();
+}
+
+/// TR-EXE-02, AC-EXE-02: a command that the list does not cover is refused
+/// before the network.
+#[tokio::test]
+async fn command_outside_the_allowlist_is_refused_before_the_network() {
+    let harness = connected(
+        Answer::Accept,
+        &[
+            ("WINRIG_ALLOW_COMMAND_EXEC", "true"),
+            ("WINRIG_ALLOWED_COMMANDS", "Get-Service"),
+        ],
+    )
+    .await;
+    let before = harness.transport.calls.lock().expect("lock").len();
+    let result = harness
+        .call(run_command_call("Remove-Item C:\\ -Recurse"))
+        .await;
+
+    assert!(
+        error_of(&result).is_some(),
+        "{:?}",
+        result.structured_content
+    );
+    assert_eq!(
+        harness.transport.calls.lock().expect("lock").len(),
+        before,
+        "the refused command reached the host"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// TR-EXE-04, TR-SEC-22, AC-EXE-04, AC-SEC22-1: the confirmation shows the full
+/// command text, without the 200-character cap.
+#[tokio::test]
+async fn run_command_confirmation_shows_the_full_text() {
+    let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_COMMAND_EXEC", "true")]).await;
+    let command = format!(
+        "Get-ChildItem C:\\Logs | Where-Object {{ $_.Length -gt 0 }} # {}",
+        "x".repeat(300)
+    );
+    harness.call(run_command_call(&command)).await;
+    let message = harness.last_confirmation();
+
+    assert_header(&message, "run_command");
+    assert!(
+        message.contains(&format!("Command:\n  | {command}")),
+        "the full command must appear: {message}"
+    );
+    assert!(
+        !message.contains("..."),
+        "the body must not be cut: {message}"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// AC-SEC21-1: a new modifying tool of ADR-0017 names the host, the identity and
+/// the tool, and carries the plain effect line.
+#[tokio::test]
+async fn new_tool_confirmations_hold_the_w32_fields() {
+    let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_COMMAND_EXEC", "true")]).await;
+    harness.call(run_command_call("Get-Service")).await;
+    let message = harness.last_confirmation();
+
+    assert_header(&message, "run_command");
+    assert!(message.contains("Command:\n  | Get-Service"), "{message}");
+    assert!(
+        message
+            .contains("This runs an arbitrary PowerShell command on the host. You cannot undo it."),
+        "{message}"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// DR-4, ADR-0013 §3–4: the audit holds the command text the operator confirmed,
+/// not its reversible base64 wrapper.
+#[tokio::test]
+async fn run_command_does_not_leak_the_encoded_command_to_the_audit() {
+    let buffer = capture();
+    let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_COMMAND_EXEC", "true")]).await;
+    harness.call(run_command_call("Get-Service")).await;
+    harness.client.cancel().await.ok();
+
+    let text = take_audit(&buffer);
+    assert!(
+        text.contains("Get-Service"),
+        "the audit must hold the command text: {text}"
+    );
+    assert!(
+        !text.contains(&utf16_base64("Get-Service")),
+        "the encoded command leaked into the audit: {text}"
+    );
+}
+
+/// DR-4: a secret in the command stays masked in the audit, because the session
+/// password is always redacted (TR-SEC-02).
+#[tokio::test]
+async fn run_command_masks_a_secret_in_the_audit() {
+    let buffer = capture();
+    let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_COMMAND_EXEC", "true")]).await;
+    harness
+        .call(run_command_call("Write-Output 's3cret'"))
+        .await;
+    harness.client.cancel().await.ok();
+
+    let text = take_audit(&buffer);
+    assert!(
+        !text.contains("s3cret"),
+        "the secret leaked into the audit: {text}"
+    );
+    assert!(
+        text.contains("***"),
+        "the audit must mask the secret: {text}"
+    );
+}
+
+/// TR-EXE-02, AC-EXE-02: a command inside the allowlist reaches the host through
+/// the real handler as the encoded ScriptBlock wrapper.
+#[tokio::test]
+async fn allowed_command_through_the_handler_reaches_the_transport() {
+    let harness = connected(
+        Answer::Accept,
+        &[
+            ("WINRIG_ALLOW_COMMAND_EXEC", "true"),
+            ("WINRIG_ALLOWED_COMMANDS", "Get-Service"),
+        ],
+    )
+    .await;
+    let result = harness
+        .call(run_command_call("Get-Service -Name Spooler"))
+        .await;
+
+    assert_eq!(error_of(&result), None, "{:?}", result.structured_content);
+    assert!(
+        harness.transport.saw("[ScriptBlock]::Create"),
+        "the allowed command never reached the host"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// TR-SEC-11: `proceed` refuses a client that declared elicitation in URL mode
+/// only, because it has a channel the server cannot use for a form.
+#[tokio::test]
+async fn proceed_refuses_a_url_only_elicitation_client() {
+    let harness = connected(
+        Answer::UrlOnly,
+        &[
+            ("WINRIG_ALLOW_COMMAND_EXEC", "true"),
+            ("WINRIG_CONFIRM_FALLBACK", "proceed"),
+        ],
+    )
+    .await;
+    let result = harness.call(run_command_call("Get-Service")).await;
+
+    assert!(
+        !harness.transport.saw("[ScriptBlock]::Create"),
+        "a url-only client ran a command"
+    );
+    assert!(
+        error_of(&result).is_some(),
+        "{:?}",
+        result.structured_content
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// TR-EXE-04: a command above the limit is refused before the network, and the
+/// refusal reaches the audit through `audit_refusal`.
+#[tokio::test]
+async fn command_above_the_limit_is_audited_as_a_policy_refusal() {
+    let buffer = capture();
+    let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_COMMAND_EXEC", "true")]).await;
+    let before = harness.transport.calls.lock().expect("lock").len();
+    let result = harness.call(run_command_call(&"a".repeat(1000))).await;
+
+    assert!(
+        error_of(&result).is_some_and(|error| error.contains("UTF-16 units")),
+        "{:?}",
+        result.structured_content
+    );
+    assert_eq!(
+        harness.transport.calls.lock().expect("lock").len(),
+        before,
+        "the over-long command reached the host"
+    );
+    harness.client.cancel().await.ok();
+
+    let text = take_audit(&buffer);
+    assert!(
+        text.contains("POLICY REFUSED") && text.contains("COMMAND_TOO_LONG"),
+        "the length refusal is not audited: {text}"
+    );
+}
+
+/// TR-SEC-11, ADR-0013 §21: `proceed` lifts fail-closed for every modifying tool,
+/// deletion included, and the audit marks the run.
+#[tokio::test]
+async fn proceed_runs_a_deleting_tool_and_marks_the_audit() {
+    let buffer = capture();
+    let harness = connected(Answer::NoChannel, &[("WINRIG_CONFIRM_FALLBACK", "proceed")]).await;
+    harness.transport.respond(
+        "PSIsContainer",
+        r#"{"FullName":"C:\\App\\old.log","IsDirectory":false,"SizeBytes":123,"Modified":"2026-01-01 00:00:00","Roots":{"SystemRoot":"C:\\Windows"}}"#,
+    );
+    let result = harness.call(delete_file_call("C:\\App\\old.log")).await;
+
+    assert_eq!(error_of(&result), None, "{:?}", result.structured_content);
+    assert!(
+        harness.transport.saw("Remove-Item -LiteralPath"),
+        "the deletion did not run under proceed"
+    );
+    harness.client.cancel().await.ok();
+
+    let text = take_audit(&buffer);
+    assert!(
+        text.contains("CONFIRMATION UNSUPPORTED"),
+        "the fallback deletion is not marked in the audit: {text}"
+    );
 }

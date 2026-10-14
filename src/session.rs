@@ -703,6 +703,26 @@ impl SessionRegistry {
         tool_name: &str,
         redactions: &[String],
     ) -> Value {
+        self.run_ps_displayed(
+            username, session_id, command, command, tool_name, redactions,
+        )
+        .await
+    }
+
+    /// Runs a command and audits a separate display text (ADR-0013 §4).
+    ///
+    /// The executed script can be an encoded wrapper; the audit shows `display`, so
+    /// the log holds the command the operator confirmed, not its encoding. Both go
+    /// through `redact`, and the body obeys `WINRIG_AUDIT_LOG_BODY`.
+    pub async fn run_ps_displayed(
+        &self,
+        username: &str,
+        session_id: &str,
+        command: &str,
+        display: &str,
+        tool_name: &str,
+        redactions: &[String],
+    ) -> Value {
         let (target, command_number) = {
             let mut sessions = lock(&self.sessions);
             let Some(session) = sessions.get_mut(&(username.to_owned(), session_id.to_owned()))
@@ -784,7 +804,7 @@ impl SessionRegistry {
                 );
                 let truncated_stdout = truncate(&stdout, crate::executor::MAX_OUTPUT_CHARS);
                 let body = command_audit_body(
-                    command,
+                    display,
                     &stdout,
                     &stderr,
                     redactions,
@@ -840,7 +860,7 @@ impl SessionRegistry {
                             },
                         ),
                     ],
-                    &format!("  PS> {}", audit(command)),
+                    &format!("  PS> {}", indent(&audit(display))),
                 );
                 json!({ "error": message, "session_id": session_id })
             }
@@ -992,6 +1012,30 @@ impl SessionRegistry {
         );
     }
 
+    /// Records that a modifying operation ran through the permanent operator
+    /// agreement instead of an answer (TR-SEC-11, ADR-0013 §22).
+    ///
+    /// The entry exists so the log shows that no person answered at the moment.
+    pub fn audit_confirmation_unsupported(
+        &self,
+        username: &str,
+        tool: &str,
+        session: &str,
+        host: &str,
+    ) {
+        self.audit(
+            "CONFIRMATION UNSUPPORTED",
+            &[
+                ("user", username.to_owned()),
+                ("session", session.to_owned()),
+                ("host", host.to_owned()),
+                ("tool", tool.to_owned()),
+                ("confirmation", "unsupported".to_owned()),
+            ],
+            "",
+        );
+    }
+
     fn audit(&self, header: &str, fields: &[(&str, String)], body: &str) {
         let body = if self.config.audit_log_body { body } else { "" };
         let mut lines = vec![
@@ -1029,7 +1073,7 @@ fn command_audit_body(
     );
     let audit_stderr = truncate(&audit(stderr), max_output_chars);
 
-    let mut body = format!("  PS> {}\n", audit(command));
+    let mut body = format!("  PS> {}\n", indent(&audit(command)));
     body.push_str("\n  ── stdout ──\n");
     body.push_str(&indent(&audit_stdout));
     if !audit_stderr.is_empty() {
@@ -1973,6 +2017,16 @@ At line:1 char:2940_x000D__x000A_\
     fn command_audit_body_respects_output_cap() {
         let body = command_audit_body("cmd", &"x".repeat(100), "", &[], 10);
         assert!(body.contains("truncated"));
+    }
+
+    /// TR-SEC-09: a multi-line command indents every line, so a continuation line
+    /// cannot look like an audit field line.
+    #[test]
+    fn command_audit_body_indents_a_multi_line_command() {
+        let body = command_audit_body("Get-Service\nRemove-Item C:\\x", "", "", &[], 2000);
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(lines[0].contains("Get-Service"), "{body}");
+        assert_eq!(lines[1], "  Remove-Item C:\\x", "{body}");
     }
 
     #[tokio::test]

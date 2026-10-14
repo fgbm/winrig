@@ -538,6 +538,91 @@ pub fn decide_tls(verify_cert: bool, allow_insecure_tls: bool) -> PolicyDecision
     }
 }
 
+/// Form of the command allowlist for the refusal text.
+pub const ALLOWED_COMMANDS_FORM: &str = "a comma-separated list of command prefixes";
+
+/// One grammar for `WINRIG_ALLOWED_COMMANDS` (ADR-0013 §13).
+///
+/// Comma-separated entries, empty ones skipped. An entry that holds a control
+/// character can never match one command line, so the parser refuses it.
+///
+/// # Errors
+///
+/// The first entry that holds a control character; the caller names the variable.
+pub fn parse_allowed_commands(raw: &str) -> Result<Vec<String>, String> {
+    let mut entries = Vec::new();
+    for item in raw.split(',') {
+        let entry = item.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if entry.chars().any(char::is_control) {
+            return Err(entry.to_owned());
+        }
+        entries.push(entry.to_owned());
+    }
+    Ok(entries)
+}
+
+/// Allowlist verdict for one command (TR-EXE-02, ADR-0013 §13).
+///
+/// An empty list admits any command. A non-empty list admits a command that
+/// begins with one entry, after a trim and an ASCII case fold, because PowerShell
+/// resolves a command name without case. The list is not a boundary: a leading
+/// `&`, `.` or `powershell -c`, an alias, a call operator and an encoded command
+/// all start with text the list need not contain, and a script written with
+/// `write_file` and then started defeats it (ADR-0013 §18). It protects against an
+/// accidental command, not against intent.
+#[must_use]
+pub fn command_allowed(command: &str, allowed_commands: &[String]) -> bool {
+    if allowed_commands.is_empty() {
+        return true;
+    }
+    let candidate = command.trim().to_ascii_lowercase();
+    allowed_commands.iter().any(|entry| {
+        let entry = entry.trim().to_ascii_lowercase();
+        !entry.is_empty() && candidate.starts_with(&entry)
+    })
+}
+
+/// The refusal never echoes the command text, because a command can carry a secret
+/// and the reason reaches the audit (DR-4).
+#[must_use]
+pub fn decide_command(command: &str, allowed_commands: &[String]) -> PolicyDecision {
+    if command_allowed(command, allowed_commands) {
+        PolicyDecision::allow("command is allowed")
+    } else {
+        PolicyDecision::deny(
+            "the command is not in WINRIG_ALLOWED_COMMANDS; add a prefix, or leave the list \
+             empty to allow any command"
+                .to_owned(),
+            "COMMAND_NOT_ALLOWED",
+        )
+    }
+}
+
+/// Length verdict for one command, in UTF-16 units, against the WinRS budget
+/// (TR-REL-10, TR-EXE-04).
+///
+/// The unit count matches `ps::command_line_chars`, which encodes the script as
+/// UTF-16LE, so the limit and the check count the same units.
+#[must_use]
+pub fn decide_command_length(command: &str, max_units: usize) -> PolicyDecision {
+    let units = command.encode_utf16().count();
+    if units > max_units {
+        PolicyDecision::deny(
+            format!(
+                "the command is {units} UTF-16 units, above the limit of {max_units}; the encoded \
+                 wrapper must fit one WinRS command line. Shorten the command, or write it with \
+                 write_file and run it by path"
+            ),
+            "COMMAND_TOO_LONG",
+        )
+    } else {
+        PolicyDecision::allow("command fits one WinRS command line")
+    }
+}
+
 #[must_use]
 pub fn decide_delete_path(path: &str) -> PolicyDecision {
     if let Some(refusal) = refuse_short_name(path, path, "delete") {
@@ -1229,6 +1314,88 @@ mod tests {
         assert!(host_allowed("example.com", &hosts(&[".example.com"])));
         assert!(!host_allowed("notexample.com", &hosts(&[".example.com"])));
         assert!(host_allowed("  host1  ", &hosts(&["host1"])));
+    }
+
+    fn commands(list: &[&str]) -> Vec<String> {
+        list.iter().map(|entry| (*entry).to_owned()).collect()
+    }
+
+    /// TR-EXE-02, AC-EXE-02: an empty list admits any command, and a non-empty
+    /// list refuses a command that does not begin with an entry.
+    #[test]
+    fn command_outside_the_allowlist_is_refused() {
+        let allowed = commands(&["Get-Service", "ipconfig"]);
+        assert!(command_allowed("Get-Service -Name Spooler", &allowed));
+        assert!(command_allowed("ipconfig /all", &allowed));
+        // A prefix matches without case and without leading spaces.
+        assert!(command_allowed("  get-service", &allowed));
+        assert!(!command_allowed("Remove-Item C:\\ -Recurse", &allowed));
+        assert!(!command_allowed("Write-Output Get-Service", &allowed));
+        assert!(!decide_command("whoami", &allowed).allow);
+        assert!(decide_command("ipconfig", &allowed).allow);
+        assert_eq!(
+            decide_command("whoami", &allowed).code,
+            "COMMAND_NOT_ALLOWED"
+        );
+        // An empty list admits any command, including a long one.
+        assert!(command_allowed("anything at all", &[]));
+        assert!(decide_command("anything at all", &[]).allow);
+    }
+
+    /// TR-EXE-02: the list is a prefix, not a boundary. Any text after an allowed
+    /// prefix runs, so the list protects against an accidental command, not against
+    /// intent (ADR-0013 §18). This is a documented property, not a defect.
+    #[test]
+    fn text_after_an_allowed_prefix_still_runs() {
+        let allowed = commands(&["Get-Service"]);
+        assert!(command_allowed("Get-Service; Remove-Item C:\\x", &allowed));
+        assert!(command_allowed("Get-Service | Out-File C:\\x", &allowed));
+        assert!(command_allowed("Get-Service\nRemove-Item C:\\x", &allowed));
+        assert!(command_allowed("Get-Service$(Remove-Item C:\\x)", &allowed));
+        // An entry of `&` or `.` alone admits everything.
+        assert!(command_allowed("& 'C:\\evil.ps1'", &commands(&["&"])));
+        assert!(command_allowed(". C:\\evil.ps1", &commands(&["."])));
+    }
+
+    /// TR-EXE-04: the length verdict counts UTF-16 units and names the limit.
+    #[test]
+    fn command_length_is_counted_in_utf16_units() {
+        assert!(decide_command_length("whoami", 10).allow);
+        let decision = decide_command_length("whoami", 5);
+        assert!(!decision.allow);
+        assert_eq!(decision.code, "COMMAND_TOO_LONG");
+        assert!(
+            decision.reason.contains("UTF-16 units"),
+            "{}",
+            decision.reason
+        );
+        // A non-ASCII character is one UTF-16 unit, so it counts like an ASCII one.
+        assert!(decide_command_length("ыыыыы", 5).allow);
+        assert!(!decide_command_length("ыыыыыы", 5).allow);
+    }
+
+    /// TR-EXE-02: the refusal does not echo the command, so a secret in a refused
+    /// command cannot reach the audit (DR-4).
+    #[test]
+    fn command_refusal_does_not_echo_the_command() {
+        let secret = "P@ssw0rd-in-the-command";
+        let decision = decide_command(&format!("run {secret}"), &commands(&["ipconfig"]));
+        assert!(!decision.allow);
+        assert!(!decision.reason.contains(secret), "{}", decision.reason);
+    }
+
+    /// The command grammar trims empty entries and refuses a control character.
+    #[test]
+    fn allowed_commands_grammar() {
+        assert_eq!(
+            parse_allowed_commands(" Get-Service ,, ipconfig ").expect("valid"),
+            ["Get-Service", "ipconfig"]
+        );
+        assert!(parse_allowed_commands(" , ").expect("valid").is_empty());
+        assert_eq!(
+            parse_allowed_commands("ok,bad\nentry"),
+            Err("bad\nentry".to_owned())
+        );
     }
 
     #[test]

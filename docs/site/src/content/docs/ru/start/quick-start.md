@@ -69,7 +69,7 @@ WINRIG_TOKEN='<токен из setup>' ./target/release/winrig serve --profile c
 Вызовите модифицирующий инструмент, например `restart_service`. Инструмент запрашивает у оператора подтверждение через MCP elicitation. Он запускается только после явного «да». Без канала подтверждения инструмент отказывает (fail-closed).
 
 :::note
-`write_file` выключен по умолчанию. Задайте `WINRIG_ALLOW_FILE_WRITE=true`, чтобы сервер объявил его. См. [справочник по инструментам](/winrig/ru/reference/tools/).
+`write_file` выключен по умолчанию. Задайте `WINRIG_ALLOW_FILE_WRITE=true`, чтобы сервер объявил его. `run_command` тоже выключен по умолчанию: задайте `WINRIG_ALLOW_COMMAND_EXEC=true`, чтобы сервер объявил его. См. [справочник по инструментам](/winrig/ru/reference/tools/).
 :::
 
 Полный список переменных окружения — в [справочнике по конфигурации](/winrig/ru/reference/configuration/).

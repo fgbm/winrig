@@ -23,7 +23,15 @@ The profile file is `corp.json` in the profile directory. It holds the format ve
 
 ## Confirmation, fail-closed
 
-Each modifying operation requires the explicit confirmation of the operator; without a confirmation channel the operation does not run. The modifying tools get confirmation through MCP elicitation, and they fail closed when the client cannot ask ([ADR-0006](https://github.com/fgbm/winrig/blob/main/docs/adr/0006-password-header-and-confirmation.md)). The confirmation names the host, the user and the tool, and it names the target and the effect. A hidden value appears only as `hidden`. The old and new values of `set_registry`, the content of `write_file` and the command line of `kill_process` stay hidden. The server sanitizes each field and caps it at 200 characters.
+Each modifying operation requires the explicit confirmation of the operator; without a confirmation channel the operation does not run. The modifying tools get confirmation through MCP elicitation, and they fail closed when the client cannot ask ([ADR-0006](https://github.com/fgbm/winrig/blob/main/docs/adr/0006-password-header-and-confirmation.md)). The confirmation names the host, the user and the tool, and it names the target and the effect. A hidden value appears only as `hidden`. The old and new values of `set_registry`, the content of `write_file` and the command line of `kill_process` stay hidden. The text of a command and the text of a script appear in full, without the 200-character cap, because the operator confirms what will run. The server sanitizes each field and caps the other fields at 200 characters.
+
+An operator can set `WINRIG_CONFIRM_FALLBACK=proceed` to run a modifying operation even when the client declared no elicitation channel. The relaxation attaches to the absent channel only: a user refusal, a cancel, a timeout and a transport error are never bypassed. The audit marks a run that happened without a confirmation ([ADR-0013](https://github.com/fgbm/winrig/blob/main/docs/adr/0013-file-write-and-command-execution.md), TR-SEC-11).
+
+The setting removes fail-closed from every modifying tool at once, deletion included. It applies to every client that lacks elicitation, and in HTTP mode that means each request that declares no channel.
+
+:::danger
+Some clients apply their own permission to a tool call and replace the confirmation. With `permission: "*": "allow"` nobody confirms. The combination `proceed` + `WINRIG_ALLOW_COMMAND_EXEC=true` + an empty `WINRIG_ALLOWED_COMMANDS` + `permission: allow` runs arbitrary commands on the host. No person takes part in that run. None of the four settings is on by default ([ADR-0013](https://github.com/fgbm/winrig/blob/main/docs/adr/0013-file-write-and-command-execution.md) §23, Consequences).
+:::
 
 :::caution
 The password comes in a header, not in a dialog. winrig does not ask for passwords through elicitation. The MCP specification excludes secrets from elicitation, and the protocol revision `2026-07-28` removes elicitation completely.
@@ -34,6 +42,16 @@ The password comes in a header, not in a dialog. winrig does not ask for passwor
 A recursive deletion refuses the roots of volumes and the system directories, in any form of the path. It also refuses reparse points (junction or symlink). `write_file` rejects protected paths with the same list that guards deletion ([ADR-0002](https://github.com/fgbm/winrig/blob/main/docs/adr/0002-secrets-confirmation-deletion.md), [ADR-0015](https://github.com/fgbm/winrig/blob/main/docs/adr/0015-security-defaults-and-host-resolved-paths.md)).
 
 Before confirmation, the host reports where the file will really land and where the system directories are. Therefore Windows on a volume other than `C:` is equally protected. The tool checks the administrative share `\\host\C$\...` as `C:\...`, and it protects the shares `ADMIN$`, `PRINT$`, `SYSVOL` and `NETLOGON` in full.
+
+## Arbitrary command execution
+
+`run_command` runs one PowerShell command on the host. It is off by default (`WINRIG_ALLOW_COMMAND_EXEC`) and it obeys the confirmation of DR-5. The server encodes the command text as a base64 UTF-16 string. It decodes the string into a script block on the host. A quote or a terminator in the text therefore cannot break out of the generated wrapper. The command must fit one WinRS command line, so the text holds at most 976 characters.
+
+`WINRIG_ALLOWED_COMMANDS` is a prefix list, matched without case after a trim. An empty list admits any command. The list is not a boundary ([ADR-0013](https://github.com/fgbm/winrig/blob/main/docs/adr/0013-file-write-and-command-execution.md) §18). A leading `&`, `.`, `powershell -c`, an alias, a call operator and an encoded command all start with text the list need not contain. Any text after an allowed prefix runs. So `;`, a newline, `|` and `$(...)` do not return control to the list. An entry of `&` or `.` alone admits every command. A script written with `write_file` and then started also goes around it. The list protects against an accidental command, not against intent.
+
+:::danger
+With `run_command` on and an empty `WINRIG_ALLOWED_COMMANDS`, the path protection of the other tools stops being a guarantee of the product. The same holds for the confirmation of the other modifying operations. They stay properties of their own tools. One line of PowerShell goes around both. This is a deliberate choice of the operator ([ADR-0013](https://github.com/fgbm/winrig/blob/main/docs/adr/0013-file-write-and-command-execution.md), Q-14).
+:::
 
 ## Host allowlist and TLS defaults
 

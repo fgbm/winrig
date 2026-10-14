@@ -99,6 +99,43 @@ impl fmt::Display for LogLevel {
     }
 }
 
+/// What the server does when the client declared no elicitation channel (TR-SEC-11).
+///
+/// The relaxation attaches to the absent channel only. A user refusal, a cancel,
+/// a timeout and a transport error are never bypassed (ADR-0013 §20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmFallback {
+    /// Fail-closed: the operation does not run (default).
+    Refuse,
+    /// The operation runs, and the audit marks the absent confirmation.
+    Proceed,
+}
+
+impl ConfirmFallback {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.to_ascii_lowercase().as_str() {
+            "refuse" => Some(Self::Refuse),
+            "proceed" => Some(Self::Proceed),
+            _ => None,
+        }
+    }
+
+    /// Canonical spelling for the environment check (TR-PRF-18).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Refuse => "refuse",
+            Self::Proceed => "proceed",
+        }
+    }
+}
+
+impl fmt::Display for ConfirmFallback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Validated environment parameters.
 ///
 /// `Debug` is implemented by hand: the secrets (`mcp_auth_token`,
@@ -148,6 +185,12 @@ pub struct AppConfig {
     pub allow_file_write: bool,
     /// Size limit of the written content, in bytes (TR-FS-04).
     pub max_write_bytes: usize,
+    /// Whether running arbitrary commands is allowed (TR-EXE-01, ADR-0013).
+    pub allow_command_exec: bool,
+    /// Command prefixes the server admits; empty means any command (TR-EXE-02).
+    pub allowed_commands: Vec<String>,
+    /// What happens when the client declared no confirmation channel (TR-SEC-11).
+    pub confirm_fallback: ConfirmFallback,
 }
 
 impl fmt::Debug for AppConfig {
@@ -182,6 +225,9 @@ impl fmt::Debug for AppConfig {
             .field("confirm_timeout_seconds", &self.confirm_timeout_seconds)
             .field("allow_file_write", &self.allow_file_write)
             .field("max_write_bytes", &self.max_write_bytes)
+            .field("allow_command_exec", &self.allow_command_exec)
+            .field("allowed_commands", &self.allowed_commands)
+            .field("confirm_fallback", &self.confirm_fallback)
             .field(
                 "sftp_cred_idle_ttl_seconds",
                 &self.sftp_cred_idle_ttl_seconds,
@@ -273,6 +319,34 @@ fn read_allowed_hosts(env: &Env) -> Result<Vec<String>, ConfigError> {
         ConfigError::new(format!(
             "WINRIG_ALLOWED_HOSTS entry {entry:?} is not valid; expected {}",
             crate::policy::ALLOWED_HOSTS_FORM
+        ))
+    })
+}
+
+/// The command allowlist by the grammar of `policy::parse_allowed_commands`.
+///
+/// A bad element refuses the start (DR-8): a prefix with a control character can
+/// never match, so the operator must see why.
+fn read_allowed_commands(env: &Env) -> Result<Vec<String>, ConfigError> {
+    let Some(raw) = read(env, "WINRIG_ALLOWED_COMMANDS") else {
+        return Ok(Vec::new());
+    };
+    crate::policy::parse_allowed_commands(&raw).map_err(|entry| {
+        ConfigError::new(format!(
+            "WINRIG_ALLOWED_COMMANDS entry {entry:?} is not valid; expected {}",
+            crate::policy::ALLOWED_COMMANDS_FORM
+        ))
+    })
+}
+
+/// The fallback for a client without a confirmation channel (TR-SEC-11).
+fn read_confirm_fallback(env: &Env) -> Result<ConfirmFallback, ConfigError> {
+    let Some(raw) = read(env, "WINRIG_CONFIRM_FALLBACK") else {
+        return Ok(ConfirmFallback::Refuse);
+    };
+    ConfirmFallback::parse(&raw).ok_or_else(|| {
+        ConfigError::new(format!(
+            "WINRIG_CONFIRM_FALLBACK={raw:?} is not valid; expected one of refuse, proceed"
         ))
     })
 }
@@ -458,6 +532,9 @@ pub fn load_config_from(env: &Env) -> Result<AppConfig, ConfigError> {
             Some(crate::ps::WRITE_CHUNK_BYTES as i64),
             None,
         )?,
+        allow_command_exec: read_bool(env, "WINRIG_ALLOW_COMMAND_EXEC", false)?,
+        allowed_commands: read_allowed_commands(env)?,
+        confirm_fallback: read_confirm_fallback(env)?,
     })
 }
 
@@ -539,7 +616,26 @@ pub fn setting_pairs(config: &AppConfig) -> Vec<(&'static str, Option<String>)> 
             "WINRIG_MAX_WRITE_BYTES",
             Some(config.max_write_bytes.to_string()),
         ),
+        (
+            "WINRIG_ALLOW_COMMAND_EXEC",
+            Some(config.allow_command_exec.to_string()),
+        ),
+        (
+            "WINRIG_ALLOWED_COMMANDS",
+            Some(canonical_command_list(&config.allowed_commands)),
+        ),
+        (
+            "WINRIG_CONFIRM_FALLBACK",
+            Some(config.confirm_fallback.as_str().to_owned()),
+        ),
     ]
+}
+
+/// The list is a set, so the canonical form is sorted.
+fn canonical_command_list(commands: &[String]) -> String {
+    let mut sorted = commands.to_vec();
+    sorted.sort();
+    sorted.join(",")
 }
 
 /// Order does not matter for a membership list, so the canonical form is sorted.
@@ -618,6 +714,58 @@ mod tests {
         assert!(!config.allow_file_write);
         // TR-FS-04: a patience limit, not a protocol limit (ADR-0013 §11).
         assert_eq!(config.max_write_bytes, 64 * 1024);
+        // TR-EXE-01: arbitrary execution is off until the operator turns it on.
+        assert!(!config.allow_command_exec);
+        // TR-EXE-02: an empty command list admits any command.
+        assert!(config.allowed_commands.is_empty());
+        // TR-SEC-11: a missing confirmation channel is a refusal by default.
+        assert_eq!(config.confirm_fallback, ConfirmFallback::Refuse);
+    }
+
+    /// TR-EXE-01: the setting is switched by the usual boolean values.
+    #[test]
+    fn command_exec_is_switched_by_the_operator() {
+        let env = source(&with(&[("WINRIG_ALLOW_COMMAND_EXEC", "true")]));
+        assert!(load_config_from(&env).expect("valid").allow_command_exec);
+        let env = source(&with(&[("WINRIG_ALLOW_COMMAND_EXEC", "0")]));
+        assert!(!load_config_from(&env).expect("valid").allow_command_exec);
+    }
+
+    /// TR-EXE-02: the command list is read and trimmed.
+    #[test]
+    fn allowed_commands_are_read() {
+        let env = source(&with(&[(
+            "WINRIG_ALLOWED_COMMANDS",
+            " Get-Service ,, ipconfig ",
+        )]));
+        assert_eq!(
+            load_config_from(&env).expect("valid").allowed_commands,
+            ["Get-Service", "ipconfig"]
+        );
+    }
+
+    /// DR-8: a bad command entry refuses the start with the variable name.
+    #[test]
+    fn invalid_allowed_commands_entry_refuses_startup() {
+        let env = source(&with(&[("WINRIG_ALLOWED_COMMANDS", "ok,bad\nentry")]));
+        let error = load_config_from(&env).expect_err("must fail").to_string();
+        assert!(error.contains("WINRIG_ALLOWED_COMMANDS"), "{error}");
+        assert!(error.contains("prefixes"), "{error}");
+    }
+
+    /// TR-SEC-11: the fallback reads `proceed`, defaults to `refuse`, and refuses
+    /// an unknown value with the variable name (DR-8).
+    #[test]
+    fn confirm_fallback_reads_and_refuses_a_bad_value() {
+        let env = source(&with(&[("WINRIG_CONFIRM_FALLBACK", "proceed")]));
+        assert_eq!(
+            load_config_from(&env).expect("valid").confirm_fallback,
+            ConfirmFallback::Proceed
+        );
+        let env = source(&with(&[("WINRIG_CONFIRM_FALLBACK", "maybe")]));
+        let error = load_config_from(&env).expect_err("must fail").to_string();
+        assert!(error.contains("WINRIG_CONFIRM_FALLBACK"), "{error}");
+        assert!(error.contains("proceed"), "{error}");
     }
 
     /// TR-FS-01: the setting is switched by the usual boolean values.

@@ -3,7 +3,7 @@ title: Tools
 description: The read-only tools and the modifying tools of winrig, with the switches that enable the modifying tools.
 ---
 
-The binary declares 43 tools, plus `write_file` when the operator enables it. The read-only tools need no confirmation. The modifying tools require the explicit confirmation of the operator (DR-5).
+The binary declares 43 tools, plus `write_file` and `run_command` when the operator enables them. The read-only tools need no confirmation. The modifying tools require the explicit confirmation of the operator (DR-5).
 
 ## Session
 
@@ -87,7 +87,7 @@ The directory write (slices W20–W21) stays intentionally outside the first wav
 
 These tools change the host and they require confirmation.
 
-Each confirmation names the host of the session, the user of the request and the tool. It names the target and the operation with the details that are available before the call. It holds one plain line that states the effect. The line states whether the operator can undo it. A hidden value appears only as `hidden`: the old and new values of `set_registry` and the content of `write_file` are hidden values. `kill_process` does not read the command line at all. The server sanitizes each field and caps it at 200 characters. A cut path keeps its tail, and a cut field carries the marker `...` inside the cap. The text is English and does not depend on the language of the host.
+Each confirmation names the host of the session, the user of the request and the tool. It names the target and the operation with the details that are available before the call. It holds one plain line that states the effect. The line states whether the operator can undo it. A hidden value appears only as `hidden`: the old and new values of `set_registry` and the content of `write_file` are hidden values. The text of a command and the text of a script appear in full, without the 200-character cap, because the operator confirms what will run. `kill_process` does not read the command line at all. The server sanitizes each field and caps the other fields at 200 characters. A cut path keeps its tail, and a cut field carries the marker `...` inside the cap. The text is English and does not depend on the language of the host.
 
 | Tool | Description |
 |------|-------------|
@@ -98,6 +98,7 @@ Each confirmation names the host of the session, the user of the request and the
 | `delete_file` / `delete_directory` | Delete with a confirmation prompt; the tool rejects protected paths, including by the actual location of the system on the host |
 | `flush_dns` | Clear the DNS client cache |
 | `write_file` | Write a file with a full replacement. **Off by default**: set `WINRIG_ALLOW_FILE_WRITE=true`, or the server does not declare the tool and no call can reach it |
+| `run_command` | Run an arbitrary PowerShell command. **Off by default**: set `WINRIG_ALLOW_COMMAND_EXEC=true`, or the server does not declare the tool and no call can reach it. The confirmation shows the full command text. The server refuses a command outside a non-empty `WINRIG_ALLOWED_COMMANDS` before any network activity |
 
 ## Switches that enable the modifying tools
 
@@ -105,10 +106,15 @@ Each confirmation names the host of the session, the user of the request and the
 |--------|--------|
 | `WINRIG_ALLOW_FILE_WRITE=true` | Declares the tool `write_file`. While the value is `false`, the server removes the tool from the router |
 | `WINRIG_MAX_WRITE_BYTES` | The largest content that `write_file` accepts, in bytes (64 KiB by default) |
+| `WINRIG_ALLOW_COMMAND_EXEC=true` | Declares the tool `run_command`. While the value is `false`, the server removes the tool from the router |
+| `WINRIG_ALLOWED_COMMANDS` | The command allowlist, comma-separated. An empty value admits any command. A prefix is not a boundary (ADR-0013 §18) |
+| `WINRIG_CONFIRM_FALLBACK` | `refuse` (default) or `proceed`. With `proceed` a client without elicitation runs a modifying operation, and the audit marks the run (TR-SEC-11) |
 | `WINRIG_ALLOW_INSECURE_TLS=true` | Permits `verify_cert=false` on `connect`. By default the server rejects it |
 
+`run_command` runs one PowerShell command that the operator confirms. The server encodes the command text as a base64 UTF-16 string. It decodes the string into a script block, so the text cannot break out of the generated wrapper. The command must fit one WinRS command line, so the text holds at most 976 characters. `WINRIG_ALLOWED_COMMANDS` is a prefix list, matched without case after a trim. An empty list admits any command. The list is not a boundary. A leading `&`, `.`, `powershell -c`, an alias, a call operator and an encoded command all go around it. Any text after an allowed prefix runs. So `;`, a newline, `|` and `$(...)` do not return control to the list. An entry of `&` or `.` alone admits every command. A script written with `write_file` and then started also goes around it. With `run_command` on and an empty list, the path protection of the other tools stops being a guarantee of the product (ADR-0013 §18).
+
 :::danger
-`delete_file`, `delete_directory` and `write_file` reject protected paths and reparse points. Do not call them on a volume root or a system directory. Data loss can occur.
+`delete_file`, `delete_directory` and `write_file` reject protected paths and reparse points. Do not call them on a volume root or a system directory. Data loss can occur. `run_command` has no path protection at all: one command can delete or rewrite anything the account can reach.
 :::
 
 :::note

@@ -154,6 +154,52 @@ fn write_file_appears_only_when_enabled() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// TR-EXE-01: the wire shows exactly the set the operator allowed.
+/// `run_command` is absent by default and appears with the setting on. The two
+/// flags are independent, so both on gives 45.
+#[test]
+fn run_command_appears_only_when_enabled() {
+    let dir = temp_dir("commandexec");
+    let path = dir.join("corp.json");
+    let token =
+        profile::create(&path, "corp", "domain\\alice", "s3cret-pass", false).expect("profile");
+
+    let names = |extra: &[(&str, &str)]| -> Vec<String> {
+        let (out_lines, _) = run_stdio_with(&dir, &token, extra);
+        let line = out_lines
+            .iter()
+            .find(|line| line.contains("\"id\":2"))
+            .expect("tools/list response");
+        let value: serde_json::Value = serde_json::from_str(line).expect("json");
+        value["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    };
+
+    let off = names(&[]);
+    assert_eq!(off.len(), 43, "expected 43 tools by default");
+    assert!(!off.iter().any(|name| name == "run_command"));
+
+    let on = names(&[("WINRIG_ALLOW_COMMAND_EXEC", "true")]);
+    assert_eq!(
+        on.len(),
+        44,
+        "expected 44 tools once command execution is allowed"
+    );
+    assert!(on.iter().any(|name| name == "run_command"));
+
+    let both = names(&[
+        ("WINRIG_ALLOW_COMMAND_EXEC", "true"),
+        ("WINRIG_ALLOW_FILE_WRITE", "true"),
+    ]);
+    assert_eq!(both.len(), 45, "expected 45 tools with both flags on");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// AC-PRF-42: without WINRIG_TOKEN the process refuses and writes nothing to stdout.
 #[test]
 fn stdio_without_token_refuses() {

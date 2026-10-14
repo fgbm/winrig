@@ -151,6 +151,35 @@ pub fn sanitize_prompt_value(value: &str) -> String {
     format!("{head}...")
 }
 
+/// Normalizes a confirmation body (a command or a script) to LF, without the
+/// 200-character cap (TR-SEC-22, Q-31).
+///
+/// The body keeps its line structure: the operator confirms what will run, and a
+/// multi-line body is easier to read line by line. `\r\n` and `\r` become `\n`.
+/// Every other control, format or bidi character collapses to a space and the `═`
+/// separator becomes `-`, so a line cannot forge a header line, reorder the text
+/// or break the consent (TR-SEC-09, ADR-0008 §11).
+#[must_use]
+pub fn sanitize_body_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\n');
+            }
+            '\n' => out.push('\n'),
+            '═' => out.push('-'),
+            other if is_prompt_control(other) => out.push(' '),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Caps a path-like field in the middle: the head and the tail stay visible, so a
 /// long path still shows its file name. The marker `...` counts inside the cap
 /// (TR-SEC-19, Q-24).
@@ -316,6 +345,30 @@ mod tests {
                 c as u32
             );
         }
+    }
+
+    /// TR-SEC-22: the body keeps its lines and is not capped, so the operator sees
+    /// the whole command.
+    #[test]
+    fn sanitize_body_value_keeps_the_lines_without_the_cap() {
+        let long = format!("a\r\nb\rc═d{}", "x".repeat(500));
+        let result = sanitize_body_value(&long);
+        assert_eq!(result.lines().count(), 3, "{result}");
+        assert!(!result.contains('\r'), "{result}");
+        assert!(!result.contains('═'), "{result}");
+        assert_eq!(result.matches('\n').count(), 2, "{result}");
+        assert!(result.contains("c-d"), "{result}");
+        assert_eq!(
+            result.chars().count(),
+            long.chars().count() - 1,
+            "CRLF collapses to one LF and the body must not be cut"
+        );
+    }
+
+    /// TR-SEC-22: every other control character collapses, but a newline stays.
+    #[test]
+    fn sanitize_body_value_replaces_other_controls_and_keeps_newlines() {
+        assert_eq!(sanitize_body_value("a\u{200B}b\nc\u{001B}d"), "a b\nc d");
     }
 
     /// TR-SEC-19: a path field is cut in the middle, so the tail stays visible.

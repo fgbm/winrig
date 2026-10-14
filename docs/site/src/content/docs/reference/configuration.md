@@ -53,6 +53,7 @@ A value with the wrong format stops the start with a message that names the vari
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `WINRIG_CONFIRM_TIMEOUT_SECONDS` | `300` | How long a modifying tool waits for the confirmation answer before it refuses (fail-closed) |
+| `WINRIG_CONFIRM_FALLBACK` | `refuse` | What a modifying tool does when the client declared no elicitation channel. `refuse` is fail-closed. `proceed` runs the operation and marks the run in the audit. A user refusal, a cancel, a timeout and a transport error are never bypassed (TR-SEC-11) |
 | `WINRIG_SECRET_REDACT_MIN_LENGTH` | `4` | The shortest secret that the server removes from the **agent response**. The audit and the log files always remove secrets of any length |
 
 ## Host allowlist and TLS
@@ -62,12 +63,14 @@ A value with the wrong format stops the start with a message that names the vari
 | `WINRIG_ALLOWED_HOSTS` | *(empty)* | The host allowlist, comma-separated. An empty value permits only the loopback literals: `localhost`, `127.0.0.0/8`, `::1`; the server does not resolve DNS. A separate item `*` permits any host. Other entries are an exact host name or IP (case-insensitive), or a suffix if the entry starts with `.`. A wrong item (for example `*.corp.example`) makes the start fail. The server rejects a host with a port, a path or `@` in `connect` with any list. `setup --allowed-hosts` writes the value into the client entry |
 | `WINRIG_ALLOW_INSECURE_TLS` | `false` | Whether the server accepts `verify_cert=false`. By default it rejects such a call before any network activity; `true` permits self-signed certificates |
 
-## File write
+## File write and command execution
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `WINRIG_ALLOW_FILE_WRITE` | `false` | Whether the tool `write_file` exists. While the value is `false`, the server removes the tool from the router: it does not declare the tool and no call reaches it |
 | `WINRIG_MAX_WRITE_BYTES` | `65536` | The largest content that `write_file` accepts, in bytes. The server rejects it before any network activity. The value cannot be smaller than one 1536-byte chunk. The tool also refuses a path so long that its commands would not fit the WinRS command line of about 8191 characters. The limit is about 760 characters for UTF-8 and about 460 characters for the other encodings, for a path with no quote character |
+| `WINRIG_ALLOW_COMMAND_EXEC` | `false` | Whether the tool `run_command` exists. While the value is `false`, the server removes the tool from the router: it does not declare the tool and no call reaches it |
+| `WINRIG_ALLOWED_COMMANDS` | *(empty)* | The command allowlist, comma-separated. An empty value admits any command. A non-empty value admits only a command that begins with one entry, matched without case after a trim. A prefix is not a boundary: a leading `&`, `.`, `powershell -c`, an alias and a script started by path all go around it. A bad entry refuses the start |
 
 ## Reserved
 

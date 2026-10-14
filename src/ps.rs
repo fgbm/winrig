@@ -265,6 +265,92 @@ pub fn write_abort(temp_path: &str) -> String {
     )
 }
 
+/// The generated wrapper that decodes the base64 command text, runs it as a script
+/// block and returns its exit code (TR-EXE-04).
+///
+/// A native command sets `$LASTEXITCODE`; the wrapper exits with it. Otherwise a
+/// failed command (`$?` false) exits with 1, so `status_code` shows the failure.
+/// `$global:LASTEXITCODE` is cleared first, so a value from the preamble cannot leak.
+fn run_command_wrapper(encoded: &str) -> String {
+    format!(
+        "$global:LASTEXITCODE=$null; \
+         $c=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{encoded}')); \
+         &([ScriptBlock]::Create($c)); $ok=$?; \
+         if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; if (-not $ok) {{ exit 1 }}"
+    )
+}
+
+/// Base64 length of `units` UTF-16 code units: four characters for each three
+/// bytes, rounded up.
+fn encoded_len_for_units(units: usize) -> usize {
+    4 * (units * 2).div_ceil(3)
+}
+
+/// The largest command text, in UTF-16 units, whose encoded wrapper still fits
+/// one WinRS command line. The search uses the real wrapper, so a change of the
+/// wrapper moves the limit with it.
+fn max_command_units() -> usize {
+    let mut lo = 0usize;
+    let mut hi = WINRS_COMMAND_LINE_LIMIT;
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        let probe = run_command_wrapper(&"A".repeat(encoded_len_for_units(mid)));
+        if fits_command_line(&probe) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
+/// The largest command text that [`run_command`] accepts, in UTF-16 units. The
+/// tool description states it, so the agent does not build a command that cannot
+/// run.
+#[must_use]
+pub fn max_command_chars() -> usize {
+    max_command_units()
+}
+
+/// Runs arbitrary PowerShell that the operator confirmed (ADR-0013 §12–15).
+///
+/// The command text is base64-encoded and decoded into a script block, so the
+/// text never touches the generated wrapper: a quote, a `;` or a `}` in the
+/// command cannot break out of it. The wrapper rides one WinRS command line, and a
+/// command that does not fit is refused before the transport (TR-REL-10).
+///
+/// # Errors
+///
+/// An empty command, or a command whose encoded wrapper is above the WinRS
+/// command line.
+pub fn run_command(command: &str) -> Result<String, String> {
+    if command.trim().is_empty() {
+        return Err("the command is empty".to_owned());
+    }
+    let encoded = encode_utf16_base64(command);
+    let script = run_command_wrapper(&encoded);
+    if !fits_command_line(&script) {
+        return Err(format!(
+            "the command is {} UTF-16 units; the encoded wrapper must fit one WinRS command line \
+             of {WINRS_COMMAND_LINE_LIMIT} characters, which holds at most {} units of command \
+             text; shorten the command, or write it with write_file and run it by path",
+            command.encode_utf16().count(),
+            max_command_units()
+        ));
+    }
+    Ok(script)
+}
+
+/// UTF-16LE bytes of the text as base64, the form `-EncodedCommand` and the
+/// script block both take.
+fn encode_utf16_base64(text: &str) -> String {
+    let mut bytes = Vec::with_capacity(text.len() * 2);
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    encode_base64(&bytes)
+}
+
 /// The `Roots` property of the scans: protected roots from the host system
 /// variables (TR-FS-06, ADR-0015 §10–12).
 ///
@@ -4127,6 +4213,67 @@ mod tests {
         }
     }
 
+    /// TR-EXE-04: the command text reaches the host as a decoded script block, so
+    /// a quote or a terminator in the text cannot break out of the wrapper.
+    #[test]
+    fn run_command_encodes_the_text_instead_of_splicing_it() {
+        let evil = "x'; Remove-Item C:\\ -Recurse; '";
+        let script = run_command(evil).expect("fits");
+        assert!(!script.contains(evil), "the raw text reached the wrapper");
+        assert!(
+            script.contains("[ScriptBlock]::Create"),
+            "the wrapper must run a script block: {script}"
+        );
+        let encoded = encode_utf16_base64(evil);
+        assert!(script.contains(&encoded), "{script}");
+        assert!(fits_command_line(&script), "{script}");
+    }
+
+    /// TR-EXE-04: the wrapper returns the exit code of the command, so a failure
+    /// is visible in `status_code`.
+    #[test]
+    fn run_command_wrapper_reports_the_exit_code() {
+        let script = run_command("cmd /c exit 3").expect("fits");
+        assert!(script.contains("$global:LASTEXITCODE=$null"), "{script}");
+        assert!(script.contains("exit $LASTEXITCODE"), "{script}");
+        assert!(script.contains("if (-not $ok) { exit 1 }"), "{script}");
+        assert!(fits_command_line(&script), "{script}");
+    }
+
+    /// The encoded command is UTF-16LE base64, so it round-trips byte for byte.
+    #[test]
+    fn run_command_encodes_utf16le_base64() {
+        // "AB" in UTF-16LE is 41 00 42 00, which base64 is "QQBCAA==".
+        assert_eq!(encode_utf16_base64("AB"), "QQBCAA==");
+    }
+
+    /// An empty command is refused before the network.
+    #[test]
+    fn run_command_refuses_an_empty_command() {
+        assert!(run_command("   ").is_err());
+    }
+
+    /// TR-EXE-04: a command above the computed limit is refused, and the error
+    /// names the limit. The largest accepted command still fits one command line.
+    #[test]
+    fn run_command_refuses_a_command_above_the_limit() {
+        let max = max_command_chars();
+        assert!(run_command(&"a".repeat(max)).is_ok(), "{max}");
+        let error = run_command(&"a".repeat(max + 1)).expect_err("too long");
+        assert!(error.contains("WinRS command line"), "{error}");
+        assert!(fits_command_line(
+            &run_command(&"a".repeat(max)).expect("fits")
+        ));
+    }
+
+    /// TR-EXE-04: the tool description, the README and the site state the limit,
+    /// so the computed value is pinned. A change of the wrapper moves the limit
+    /// and fails this test on purpose, and the docs must move with it.
+    #[test]
+    fn max_command_length_is_the_stated_limit() {
+        assert_eq!(max_command_chars(), 976);
+    }
+
     /// TR-FS-05: for a short path the full chunk fits one command line, measured
     /// on the real encoding (script UTF-16LE, then base64), not on an estimate.
     #[test]
@@ -4447,6 +4594,7 @@ mod tests {
             write_scan(text),
             delete_file_scan(text),
             delete_directory_scan(text, 10),
+            run_command(text).expect("valid"),
         ];
         // write_plan returns every command of a whole plan, so the plan is
         // flattened into the list.

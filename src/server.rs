@@ -16,13 +16,13 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::config::AppConfig;
-use crate::executor::{sanitize_path_value, sanitize_prompt_value};
+use crate::config::{AppConfig, ConfirmFallback};
+use crate::executor::{sanitize_body_value, sanitize_path_value, sanitize_prompt_value};
 use crate::identity::RequestIdentity;
 use crate::policy::{
-    DeleteScan, FileScan, PolicyDecision, WriteScan, decide_delete_path, decide_delete_scan,
-    decide_file_delete, decide_host, decide_port, decide_service_target, decide_tls,
-    decide_write_path, decide_write_scan,
+    DeleteScan, FileScan, PolicyDecision, WriteScan, decide_command, decide_command_length,
+    decide_delete_path, decide_delete_scan, decide_file_delete, decide_host, decide_port,
+    decide_service_target, decide_tls, decide_write_path, decide_write_scan,
 };
 use crate::ps;
 use crate::session::{SessionRegistry, UserIdentity};
@@ -61,7 +61,11 @@ struct Confirmation {
     action: String,
     host: String,
     user: String,
+    /// The id that the audit of an absent confirmation records.
+    session: String,
     fields: Vec<(String, String)>,
+    /// A command or a script, shown in full (TR-SEC-22).
+    body: Option<(String, String)>,
     effect: String,
 }
 
@@ -72,7 +76,9 @@ impl Confirmation {
             action: action.to_owned(),
             host: host.to_owned(),
             user: user.to_owned(),
+            session: String::new(),
             fields: Vec::new(),
+            body: None,
             effect: String::new(),
         }
     }
@@ -80,6 +86,15 @@ impl Confirmation {
     /// Adds one target or operation line as `label: value`.
     fn field(mut self, label: &str, value: &str) -> Self {
         self.fields.push((label.to_owned(), value.to_owned()));
+        self
+    }
+
+    /// Adds the full text of a command or a script: the operator confirms what will
+    /// run, so the 200-character cap of TR-SEC-19 does not apply. Each line is
+    /// rendered with a fixed prefix, so a line cannot forge a header line
+    /// (TR-SEC-22, Q-31).
+    fn body(mut self, label: &str, value: &str) -> Self {
+        self.body = Some((label.to_owned(), sanitize_body_value(value)));
         self
     }
 
@@ -105,6 +120,12 @@ impl Confirmation {
         message.push_str(&format!("User: {}", sanitize_prompt_value(&self.user)));
         for (label, value) in &self.fields {
             message.push_str(&format!("\n{label}: {}", sanitize_prompt_value(value)));
+        }
+        if let Some((label, value)) = &self.body {
+            message.push_str(&format!("\n{label}:"));
+            for line in value.split('\n') {
+                message.push_str(&format!("\n  | {line}"));
+            }
         }
         if !self.effect.is_empty() {
             message.push_str(&format!("\n\n{}", sanitize_prompt_value(&self.effect)));
@@ -136,6 +157,8 @@ const EFFECT_DELETE_DIRECTORY: &str = "This deletes the directory and all its co
 const EFFECT_SET_START_TYPE: &str = "This changes the start type. The service stays in its \
                                      current state; the change applies at the next start. To undo \
                                      it, set the start type again.";
+const EFFECT_RUN_COMMAND: &str =
+    "This runs an arbitrary PowerShell command on the host. You cannot undo it.";
 
 impl WinrigServer {
     #[must_use]
@@ -158,6 +181,9 @@ impl WinrigServer {
         let mut router = Self::tool_router();
         if !config.allow_file_write {
             router.remove_route("write_file");
+        }
+        if !config.allow_command_exec {
+            router.remove_route("run_command");
         }
         router
     }
@@ -359,15 +385,14 @@ impl WinrigServer {
             .unwrap_or_else(|| json!({ "Name": "process not found" }))
     }
 
-    /// `Ok(())` means the user agreed explicitly. `Err(result)` means the
-    /// operation does not run: refusal, cancellation, timeout, or no
-    /// confirmation channel (DR-5, fail-closed); `result` is a ready tool
-    /// reply.
+    /// The user agreed explicitly, the channel is absent and the operator chose to
+    /// proceed, or the operation does not run with a ready tool reply (DR-5).
     async fn confirm(
         ctx: &RequestContext<RoleServer>,
         confirmation: Confirmation,
         timeout: Duration,
-    ) -> Result<(), CallToolResult> {
+        fallback: ConfirmFallback,
+    ) -> ConfirmationOutcome {
         let action = sanitize_prompt_value(&confirmation.action);
         let message = confirmation.render();
         match ctx
@@ -375,13 +400,13 @@ impl WinrigServer {
             .elicit_with_timeout::<ConfirmResponse>(message, Some(timeout))
             .await
         {
-            Ok(Some(response)) if response.confirm => Ok(()),
-            Ok(Some(_)) | Ok(None) => Err(cancelled(&action)),
+            Ok(Some(response)) if response.confirm => ConfirmationOutcome::Confirmed,
+            Ok(Some(_)) | Ok(None) => ConfirmationOutcome::Refused(cancelled(&action)),
             Err(ElicitationError::UserDeclined | ElicitationError::UserCancelled) => {
-                Err(cancelled(&action))
+                ConfirmationOutcome::Refused(cancelled(&action))
             }
             Err(ElicitationError::Service(rmcp::service::ServiceError::Timeout { .. })) => {
-                Err(CallToolResult::structured(json!({
+                ConfirmationOutcome::Refused(CallToolResult::structured(json!({
                     "error": format!(
                         "Confirmation for {action} timed out after {}s. The operation did not run.",
                         timeout.as_secs()
@@ -389,7 +414,28 @@ impl WinrigServer {
                     "status": "timeout",
                 })))
             }
-            Err(error) => Err(CallToolResult::structured(json!({
+            // TR-SEC-11: only the absent channel can be bypassed, and only by the
+            // operator's explicit setting. "Nobody to ask" is not "the user said no".
+            // A client that declared elicitation but only in URL mode is refused:
+            // it has a channel, the server just cannot use it for a form.
+            Err(ElicitationError::CapabilityNotSupported) => {
+                let declared = ctx
+                    .peer
+                    .peer_info()
+                    .is_some_and(|info| info.capabilities.elicitation.is_some());
+                if fallback == ConfirmFallback::Proceed && !declared {
+                    ConfirmationOutcome::Unsupported
+                } else {
+                    ConfirmationOutcome::Refused(CallToolResult::structured(json!({
+                        "error": format!(
+                            "The server cannot ask for confirmation. It did not run {action}: the \
+                             client has no usable elicitation channel. See the confirmation section \
+                             of the documentation."
+                        ),
+                    })))
+                }
+            }
+            Err(error) => ConfirmationOutcome::Refused(CallToolResult::structured(json!({
                 "error": format!(
                     "The server cannot ask for confirmation. It did not run {action}: {error}"
                 ),
@@ -410,7 +456,9 @@ impl WinrigServer {
             .registry
             .session_host(&identity.username, session_id)
             .unwrap_or_else(|| "(unknown)".to_owned());
-        Confirmation::new(tool, action, &host, &identity.username)
+        let mut confirmation = Confirmation::new(tool, action, &host, &identity.username);
+        confirmation.session = session_id.to_owned();
+        confirmation
     }
 
     /// The refusal that `run_ps` gives for an unknown session, before any prompt:
@@ -470,19 +518,44 @@ fn cancelled(action: &str) -> CallToolResult {
     }))
 }
 
-/// Returns a ready tool reply when confirmation is not obtained.
+/// The result of one confirmation attempt (TR-SEC-11).
+enum ConfirmationOutcome {
+    /// Explicit operator agreement.
+    Confirmed,
+    /// The client declared no channel and the operator set
+    /// `WINRIG_CONFIRM_FALLBACK=proceed`; the audit marks the run.
+    Unsupported,
+    /// The operation does not run; the value is a ready tool reply.
+    Refused(CallToolResult),
+}
+
+/// Runs the operation on an explicit agreement. An absent channel refuses by
+/// default, or runs through the permanent operator agreement, which the audit
+/// marks (TR-SEC-11, DR-5).
 macro_rules! require_confirmation {
-    ($self:expr, $ctx:expr, $confirmation:expr) => {
-        if let Err(result) = WinrigServer::confirm(
+    ($self:expr, $ctx:expr, $confirmation:expr) => {{
+        let confirmation = $confirmation;
+        let tool = confirmation.tool.clone();
+        let user = confirmation.user.clone();
+        let host = confirmation.host.clone();
+        let session = confirmation.session.clone();
+        match WinrigServer::confirm(
             $ctx,
-            $confirmation,
+            confirmation,
             std::time::Duration::from_secs($self.config.confirm_timeout_seconds),
+            $self.config.confirm_fallback,
         )
         .await
         {
-            return Ok(result);
+            ConfirmationOutcome::Confirmed => {}
+            ConfirmationOutcome::Unsupported => {
+                $self
+                    .registry
+                    .audit_confirmation_unsupported(&user, &tool, &session, &host);
+            }
+            ConfirmationOutcome::Refused(result) => return Ok(result),
         }
-    };
+    }};
 }
 
 // ---------------------------------------------------------------------------
@@ -1055,6 +1128,16 @@ struct WriteFileParams {
 
 fn default_write_encoding() -> String {
     "utf8".to_owned()
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RunCommandParams {
+    #[schemars(description = "Session ID that connect returns.")]
+    session_id: String,
+    #[schemars(
+        description = "PowerShell command to run on the host. The confirmation shows the full text. The encoded wrapper must fit one WinRS command line, so the command holds at most 976 UTF-16 units; a longer script goes through write_file and then runs by path."
+    )]
+    command: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2442,6 +2525,70 @@ impl WinrigServer {
     }
 
     #[tool(
+        name = "run_command",
+        description = "Run an arbitrary PowerShell command on the host. This modifying operation prompts for confirmation and shows the full command text. The server refuses a command outside a non-empty WINRIG_ALLOWED_COMMANDS before the call. The encoded wrapper must fit one WinRS command line, so the command holds at most 976 UTF-16 units. For a longer script, write it with write_file and then run it by path. The status code is the exit code of the last native command when it is set, even if the script handled the failure."
+    )]
+    async fn run_command(
+        &self,
+        Parameters(params): Parameters<RunCommandParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let identity = self.identity(&ctx)?;
+        // TR-EXE-02: the allowlist refusal is before any network access. The
+        // reason never echoes the command, so a secret in it stays out of the
+        // audit (DR-4).
+        let decision = decide_command(&params.command, &self.config.allowed_commands);
+        if !decision.allow {
+            self.audit_refusal(&identity, "run_command", &decision);
+            return Ok(CallToolResult::structured(
+                json!({ "error": decision.reason }),
+            ));
+        }
+        // TR-EXE-04: the length refusal is a policy refusal too, so it reaches the
+        // audit before the network and names the limit in UTF-16 units.
+        let length = decide_command_length(&params.command, ps::max_command_chars());
+        if !length.allow {
+            self.audit_refusal(&identity, "run_command", &length);
+            return Ok(CallToolResult::structured(
+                json!({ "error": length.reason }),
+            ));
+        }
+        if let Some(result) = self.missing_session(&identity, &params.session_id) {
+            return Ok(result);
+        }
+        // The encoded wrapper is built before the prompt: a command that cannot
+        // fit one WinRS command line is refused without asking the operator to
+        // confirm an operation that cannot run (TR-EXE-04).
+        let command = match ps::run_command(&params.command) {
+            Ok(command) => command,
+            Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
+        };
+        require_confirmation!(
+            &self,
+            &ctx,
+            self.confirmation(&identity, &params.session_id, "run_command", "RUN COMMAND")
+                // TR-EXE-04, TR-SEC-22: the full command text, without the cap.
+                .body("Command", &params.command)
+                .effect(EFFECT_RUN_COMMAND)
+        );
+        // DR-4, ADR-0013 §3: the audit redacts the session password and the
+        // wrapper's base64, and records the rest of the command text as it is.
+        let secrets = base64_payloads(&command);
+        Ok(CallToolResult::structured(
+            self.registry
+                .run_ps_displayed(
+                    &identity.username,
+                    &params.session_id,
+                    &command,
+                    &params.command,
+                    "run_command",
+                    &secrets,
+                )
+                .await,
+        ))
+    }
+
+    #[tool(
         name = "delete_file",
         description = "Delete one file permanently. The tool scans first and refuses protected paths and directories. The confirmation prompt shows the resolved path and the metadata."
     )]
@@ -2675,11 +2822,26 @@ fn scan_metadata(stdout: &str) -> (String, String) {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for WinrigServer {
     fn get_info(&self) -> ServerConfig {
+        let confirmation = match self.config.confirm_fallback {
+            ConfirmFallback::Refuse => {
+                "Modifying tools require explicit confirmation and refuse to run when the client \
+                 has no elicitation channel."
+            }
+            ConfirmFallback::Proceed => {
+                "Modifying tools require explicit confirmation. WINRIG_CONFIRM_FALLBACK=proceed is \
+                 set, so when the client declares no elicitation channel at all a modifying tool \
+                 runs and the audit marks the absent confirmation. This lifts fail-closed for every \
+                 modifying tool, deletion included. A client that declares elicitation only in URL \
+                 mode is still refused. See the confirmation section of the documentation."
+            }
+        };
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Remote Windows administration over WinRM/NTLM. Call connect first. In HTTP mode the \
-             request carries X-AD-User (and optionally X-AD-Password) with the shared secret, or a \
-             profile token. In stdio mode the identity comes from the profile. Modifying tools \
-             require explicit confirmation and refuse to run when the client has no elicitation.",
+            format!(
+                "Remote Windows administration over WinRM/NTLM. Call connect first. In HTTP mode \
+                 the request carries X-AD-User (and optionally X-AD-Password) with the shared \
+                 secret, or a profile token. In stdio mode the identity comes from the profile. \
+                 {confirmation}"
+            ),
         )
     }
 }
@@ -2786,6 +2948,152 @@ mod tests {
         assert_eq!(names.len(), 44, "expected 44 tools with write_file");
     }
 
+    /// TR-EXE-01, AC-EXE-01: a disabled `run_command` is not advertised and has
+    /// no route. Enabling it adds exactly one tool.
+    #[test]
+    fn run_command_is_absent_until_the_operator_enables_it() {
+        let off = server_with(&[]);
+        let names: Vec<String> = off
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert!(
+            !names.iter().any(|name| name == "run_command"),
+            "run_command must not be advertised while disabled"
+        );
+        assert_eq!(names.len(), 43, "expected 43 tools without run_command");
+        assert!(!off.tool_router.has_route("run_command"));
+
+        let on = server_with(&[("WINRIG_ALLOW_COMMAND_EXEC", "true")]);
+        let names: Vec<String> = on
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert!(names.iter().any(|name| name == "run_command"));
+        assert_eq!(names.len(), 44, "expected 44 tools with run_command");
+        assert!(on.tool_router.has_route("run_command"));
+    }
+
+    /// TR-EXE-02, AC-EXE-02: a command inside a non-empty allowlist reaches the
+    /// transport; a command outside it is refused by the policy before the
+    /// network. The confirmation branch is covered through the MCP harness in
+    /// `tests/tool_calls.rs`, which builds a `RequestContext`.
+    #[tokio::test]
+    async fn allowed_command_reaches_the_transport() {
+        let transport = Arc::new(FakeTransport {
+            calls: Mutex::new(Vec::new()),
+        });
+        let registry = Arc::new(SessionRegistry::new(
+            Arc::clone(&transport) as Arc<dyn WinRmTransport>,
+            RegistryConfig::default(),
+        ));
+        let lookup: Box<crate::config::Env> = Box::new(|name: &str| match name {
+            "WINRIG_AUTH_TOKEN" => Some("token".to_owned()),
+            "WINRIG_ALLOWED_HOSTS" => Some("host1".to_owned()),
+            "WINRIG_ALLOWED_COMMANDS" => Some("Get-Service".to_owned()),
+            _ => None,
+        });
+        let config = crate::config::load_config_from(lookup.as_ref()).expect("config");
+        let server = WinrigServer::new(registry, Arc::new(config));
+        let identity = RequestIdentity {
+            username: "contoso\\alice".to_owned(),
+            password: Some("s3cret".to_owned().into()),
+            source: crate::identity::IdentitySource::Headers,
+        };
+        let user = WinrigServer::user(&identity);
+        server
+            .registry
+            .connect(&user, "host1", None, None, true)
+            .await;
+
+        // Inside the list: the wrapper reaches the host.
+        let command = ps::run_command("Get-Service").expect("fits");
+        server
+            .run(&identity, "host1", &command, "run_command")
+            .await;
+        assert!(
+            transport
+                .calls
+                .lock()
+                .expect("lock")
+                .iter()
+                .any(|call| call.contains("[ScriptBlock]::Create")),
+            "the allowed command never reached the host"
+        );
+
+        // Outside the list: the decision refuses, so the tool never calls the
+        // host with it.
+        assert!(!decide_command("whoami", &server.config.allowed_commands).allow);
+        assert!(decide_command("Get-Service -Name Spooler", &server.config.allowed_commands).allow);
+    }
+
+    /// TR-SEC-22, AC-SEC22-1: the body of a command is shown in full, while a
+    /// metadata field obeys the 200-character cap.
+    #[test]
+    fn metadata_fields_obey_the_prompt_cap() {
+        let long = "a".repeat(500);
+        let prompt = Confirmation::new("run_command", "RUN COMMAND", "host1", "contoso\\alice")
+            .field("Session", &long)
+            .body("Command", &long)
+            .render();
+        let session = prompt
+            .lines()
+            .find(|line| line.starts_with("Session: "))
+            .expect("a session line");
+        assert_eq!(
+            session.trim_start_matches("Session: ").chars().count(),
+            200,
+            "a metadata field must obey the cap"
+        );
+        // The body renders on its own lines with the `  | ` prefix, so the long
+        // command must not be cut.
+        let command = prompt
+            .lines()
+            .find(|line| line.starts_with("  | "))
+            .expect("a command body line");
+        assert_eq!(
+            command.trim_start_matches("  | ").chars().count(),
+            500,
+            "the body must stay in full"
+        );
+    }
+
+    /// TR-SEC-22, AC-SEC22-1: a multi-line body renders line by line with a fixed
+    /// prefix, so CRLF collapses to LF and an injected line cannot forge a header
+    /// line or a field line.
+    #[test]
+    fn body_renders_line_by_line_without_forging_a_header() {
+        let body = "Get-Service\r\nWrite-Output '#'\nTool: run_command";
+        let prompt = Confirmation::new("run_command", "RUN COMMAND", "host1", "contoso\\alice")
+            .field("Session", "host1")
+            .body("Command", body)
+            .render();
+        let body_lines: Vec<&str> = prompt
+            .lines()
+            .skip_while(|line| *line != "Command:")
+            .skip(1)
+            .take_while(|line| line.starts_with("  | "))
+            .collect();
+        assert_eq!(body_lines.len(), 3, "{prompt}");
+        assert_eq!(body_lines[0], "  | Get-Service", "{prompt}");
+        assert_eq!(body_lines[1], "  | Write-Output '#'", "{prompt}");
+        assert_eq!(body_lines[2], "  | Tool: run_command", "{prompt}");
+        // The injected `Tool:` line carries the prefix, so the genuine header stays
+        // the only line that reads as a header.
+        assert_eq!(
+            prompt
+                .lines()
+                .filter(|line| *line == "Tool: run_command")
+                .count(),
+            1,
+            "{prompt}"
+        );
+    }
+
     /// TR-FS-01: a removed route is not only hidden from the list but also uncallable.
     #[test]
     fn disabled_write_file_has_no_route() {
@@ -2843,15 +3151,17 @@ mod tests {
                 .any(|tool| tool.name == "set_service_start_type")
         );
         assert!(tools.iter().any(|tool| tool.name == "delete_directory"));
+        assert!(tools.iter().any(|tool| tool.name == "run_command"));
         // An exact count: "at least 30" would catch neither a lost tool nor a
         // duplicate. These are all declared tools; the configuration decides
-        // how many the agent sees (TR-FS-01), and
-        // `write_file_is_absent_until_the_operator_enables_it` checks that.
-        assert_eq!(tools.len(), 44, "expected 44 declared tools");
+        // how many the agent sees (TR-FS-01, TR-EXE-01), and
+        // `write_file_is_absent_until_the_operator_enables_it` and
+        // `run_command_is_absent_until_the_operator_enables_it` check that.
+        assert_eq!(tools.len(), 45, "expected 45 declared tools");
         let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 44, "tool names must be unique");
+        assert_eq!(names.len(), 45, "tool names must be unique");
     }
 
     #[test]
@@ -2868,6 +3178,7 @@ mod tests {
             "flush_dns",
             "kill_process",
             "restart_service",
+            "run_command",
             "set_registry",
             "set_service_start_type",
             "start_service",
@@ -2903,6 +3214,7 @@ mod tests {
             EFFECT_DELETE_FILE,
             EFFECT_DELETE_DIRECTORY,
             EFFECT_SET_START_TYPE,
+            EFFECT_RUN_COMMAND,
         ] {
             assert!(!effect.is_empty(), "an effect line is empty");
             assert!(

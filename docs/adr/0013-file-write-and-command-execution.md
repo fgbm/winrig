@@ -71,3 +71,11 @@ A separate practical circumstance exists. The code implements the confirmation t
 - The ADR admits it directly. With `WINRIG_ALLOW_COMMAND_EXEC=true` and an empty `WINRIG_ALLOWED_COMMANDS` the path policy guarantees and the deletion protection guarantees stop being guarantees. They stay only for their own tools. This is a conscious choice of the operator, not a property that winrig keeps.
 - `WINRIG_CONFIRM_FALLBACK=proceed` removes the fail-closed state from **all** modifying tools at once, including deletion. The combination is `proceed` + `WINRIG_ALLOW_COMMAND_EXEC=true` + an empty allowlist + `permission: allow` at the client. That combination means arbitrary execution on the host by the decision of the agent, without a single participation of a person. None of the four settings is on by default. The ADR names their joint meaning here, so that it does not collect in pieces from four places.
 - Q-10 stops being blocking for operation: before the clients move to `input_required` the operator can work under their own responsibility instead of waiting. The move itself does not cancel this — with the appearance of the channel the server asks for the confirmation again, because `CapabilityNotSupported` stops occurring.
+
+## Clarification (ADR-0017)
+
+§5: `write_file` consults the operator allowlist `WINRIG_WRITE_ALLOW_PATHS` (ADR-0017 §9). An entry lifts the protected-prefix refusal for the write-side file tools, and `write_file` is one of them. DR-6 does not change.
+
+§16 names the composition of `write_file` and `run_command`. The tool `run_script` now does this composition as one confirmed operation, and ADR-0017 decides it.
+
+§17 names the absence of a download tool. ADR-0017 adds `download_file` and `upload_file`, with a local endpoint on the computer that runs winrig.

@@ -129,3 +129,43 @@ Decided: `doctor` is a read-only subcommand (TR-PRF-18, AC-PRF-69, slice W31, Gi
 Decided (slice W32): the server shows a hidden value as the literal `hidden` beside its label, for example `new value: hidden` (TR-SEC-18). The old value of `set_registry` is hidden too. The server caps a field of the confirmation at 200 characters. The marker of a cut is `...`, and it counts inside the cap. The server cuts the value to 197 characters and appends `...`, so the field holds at most 200 characters. The host is the host of the session of the call. The identity is the user of the current request (DR-2). The tool is the MCP tool name; the plain line of the action may hold the action label of today next to it. `kill_process` shows the executable path and the start time, never the command line (DR-4). `write_file` shows the size and the resolved path.
 
 The exact sentences of the effect and undo lines of each tool are fixed in `src/server.rs` as the `EFFECT_*` constants (TR-SEC-16, TR-SEC-20). A test checks that each sentence fits the 200-character cap. The requirement fixes that one line exists and states the operation and whether the operator can undo it.
+
+## Q-25. The write allowlist and the hard ban on the system directories
+
+Decided (ADR-0017 §11): the operator allowlist `WINRIG_WRITE_ALLOW_PATHS` may cover a system directory or a volume root. Issue #13 proposed the opposite: "The system directories (`C:\Windows`, `C:\Windows\System32`) cannot be in the list." The operator asked for freedom of action, and the confirmation carries an explicit warning line for the class. Two bypass protections stay, and the allowlist does not lift them. The first is a path with an 8.3 component (AC-SEC04-6). The second is a target whose final component is a reparse point.
+
+## Q-26. The scope of the allowlist on a delete
+
+Decided (ADR-0017 §9): the allowlist lifts the protected-prefix refusal for the write-side file tools, and it includes `delete_file`. Issue #13 named `delete_file` as one of the tools, and the field case was the delete of an empty database file under `C:\ProgramData`. `delete_directory` does not consult the allowlist: DR-6 keeps its refusals of a volume root, a system directory and a reparse point.
+
+## Q-27. One flag for each new capability
+
+Decided (ADR-0017 §3): each new capability has its own flag: `WINRIG_ALLOW_SCRIPT_EXEC`, `WINRIG_ALLOW_FILE_OPS`, `WINRIG_ALLOW_FILE_DOWNLOAD` and `WINRIG_ALLOW_FILE_UPLOAD`. The pattern of `write_file` and `WINRIG_ALLOW_FILE_WRITE` (ADR-0013 §2) continues. A distinct capability has a distinct risk, and the operator enables one at a time. `write_file` keeps its own flag.
+
+## Q-28. Where `run_script` is decided
+
+Decided: in ADR-0017, not as an amendment to ADR-0013. The composition writes a file, runs it and deletes it, and ADR-0017 owns the write mechanism and the write boundary. ADR-0013 receives a pointer.
+
+## Q-29. The staging file of `run_script`
+
+Decided (ADR-0017 §31–32): the temporary `.ps1` is the staging of the tool, not a target of the operator. The write boundary and the protected-root refusal do not apply to it. The session temp directory (`$env:TEMP`) is under a protected root, and a tool that needs an allowlist entry to start would be useless. The confirmation names the path, and the audit records it.
+
+## Q-30. `run_script` and the command allowlist
+
+Decided (ADR-0017 §34): `run_script` is enabled by `WINRIG_ALLOW_SCRIPT_EXEC` alone. The prefix list `WINRIG_ALLOWED_COMMANDS` does not filter the script, because the server cannot prefix-check the text of a script in a meaningful way. The confirmation states this. The composition of `write_file` and `run_command` already broke the allowlist (ADR-0013 §18); `run_script` makes the composition one tool.
+
+## Q-31. The body in the confirmation text
+
+Decided (ADR-0017 §37): the text of a command and the text of a script appear in full in the confirmation, without truncation. The 200-character cap of TR-SEC-19 applies to the other fields. A cut script would confirm a different operation. The server sanitizes the field (ADR-0008 §11), so the body cannot forge the dialogue.
+
+## Q-32. Every download needs a confirmation
+
+Decided (ADR-0017 §28): a download moves data off the host, and the data may be personal. The confirmation is mandatory for every download, not only for a file under a protected or a system path. Issue #11 proposed the flag `WINRIG_ALLOW_FILE_DOWNLOAD`, and the flag stays.
+
+## Q-33. The transfer defaults and the raw channel
+
+Decided (ADR-0017 §21–27): the local endpoint is `WINRIG_TRANSFER_DIR`, with a per-user subdirectory in HTTP mode (DR-3). The size ceiling `WINRIG_MAX_TRANSFER_BYTES` defaults to 256 MiB. A download uses a raw chunked channel outside the 60 000-character reply truncation, and it verifies the SHA-256 on both sides. A resume is not required. A small file does not go into the reply as base64; the reply carries the name, the size and the hash.
+
+## Q-34. The fine points of `move_file`, `rename_file` and `create_directory`
+
+Decided (ADR-0017 §18–20): a move on one volume is a rename. A cross-volume move of a file is a copy and a delete, and the prompt shows the implied delete. A cross-volume move of a directory is refused, because the implied recursive delete falls under DR-6 and a partial move leaves two trees. An overwrite of an existing directory is refused in all cases. `create_directory` makes the missing parents, and the prompt shows the count.

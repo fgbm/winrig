@@ -41,6 +41,7 @@ The product is multi-user: several operators at the same time in the HTTP mode. 
 ## 4. External systems and writes
 
 - The Windows host is an external system. A write is permitted only through the tools that the README lists as modifying, and only after confirmation (DR-5). The only exception outside the tools is the write of the MCP server definition into the configuration of the selected client. The explicit flag `setup --write-config` with the level `--scope global|project` permits this write (ADR-0009, ADR-0012). The code makes no other write to an external system.
+- The file transfer tools write a downloaded file into `WINRIG_TRANSFER_DIR` on the computer that runs winrig (ADR-0017). This is the only local write outside the profile, the state and the logs. It obeys DR-5 and the private modes of `src/private_fs.rs`.
 - There is no test Windows host in the environment. The automatic tests run on a fake transport that implements `WinRmTransport` and records the commands that it gets. They do not touch the network (see `src/session.rs::tests`).
 
 ## 5. Configuration

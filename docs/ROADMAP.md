@@ -19,7 +19,7 @@ Product: `winrig`. Canon: `AGENTS.md`. Cycle: `docs/IMPLEMENTATION_CYCLE.md`. St
 | W13 | The level of the client configuration write: global or project | TR-PRF-13, ADR-0012 | no | accepted |
 | W14 | A field incident: the client configuration write, the state directory, the account form, the classification of transport errors | TR-SEC-10, TR-PRF-14/15/16 | yes | in progress |
 | W15 | A file write to the host | TR-FS-01..05, ADR-0013 | yes | accepted |
-| W16 | Execution of arbitrary commands | TR-EXE-01..04, ADR-0013 | yes | pending |
+| W16 | Execution of arbitrary commands | TR-EXE-01..04, ADR-0013 | yes | in progress (W33) |
 | W17 | Executable coverage of the tools and the confirmation channel | TR-REL-09 | no | accepted |
 | W18 | Removal of the `winrm-rs` pin and a toolchain upgrade | Q-07 | yes | pending |
 | W19 | Active Directory read and domain maintenance | TR-AD-01..05/16, ADR-0014 | no | pending |
@@ -36,6 +36,12 @@ Product: `winrig`. Canon: `AGENTS.md`. Cycle: `docs/IMPLEMENTATION_CYCLE.md`. St
 | W30 | Service configuration, the start type and a verified stop (GitHub #10) | TR-REL-17/18, TR-SEC-15, AC-REL17-1, AC-REL18-1/2, AC-SEC15-1/2/3 | yes | accepted |
 | W31 | Check that the environment agrees across project servers (`doctor`, GitHub #24) | TR-PRF-18, AC-PRF-69 | no | accepted |
 | W32 | Clear confirmation text (the wording of the prompts, no issue) | TR-SEC-16..20, AC-SEC16-1, AC-SEC17-1/2, AC-SEC18-1, AC-SEC19-1, AC-SEC20-1 | no | accepted |
+| W33 | W16 `run_command` (GitHub #14) | TR-EXE-01..04, TR-SEC-21/22, AC-EXE-01..04, AC-SEC21-1, AC-SEC22-1, ADR-0013 | yes | pending |
+| W34 | `run_script` (GitHub #14) | TR-EXE-05..07, TR-SEC-22, AC-EXE-05..07, AC-SEC22-1, ADR-0017 | yes | pending |
+| W35 | The write allowlist under the protected roots (GitHub #13) | TR-FS-07, AC-FS-08/09, ADR-0017 | yes | pending |
+| W36 | Copy, move, rename and create a directory (GitHub #12) | TR-FS-08..11, TR-SEC-21, AC-FS-10..13, AC-SEC21-1, ADR-0017 | yes | pending |
+| W37 | Download a file from the host (GitHub #11) | TR-XFER-01/02/03/05, TR-SEC-21, AC-XFER-01/02/03/05, AC-SEC21-1, ADR-0017 | yes | pending |
+| W38 | Upload a file to the host (GitHub #11) | TR-XFER-04, TR-SEC-21, AC-XFER-04, AC-SEC21-1, ADR-0017 | yes | pending |
 
 ## Phase criteria
 
@@ -359,11 +365,65 @@ The tools of slice W30 extend the same rule: `set_service_start_type` and `stop_
 
 The slice changes no operation, only the text before the confirmation, so the risk is low and the tool count does not change. The slice brings in no new entity, channel or role, so a new ADR is not necessary: the slice clarifies DR-5 and ADR-0006 §2. The open choices are in Q-24.
 
+## W33. `run_command` (W16, GitHub #14)
+
+Goal: implement slice W16 (the section above) and answer the field request of GitHub #14.
+
+The content: the tool `run_command`, as the W16 section describes (ADR-0013). The requirements are TR-EXE-01..04 and the ACs AC-EXE-01..04. The confirmation takes the W32 fields of TR-SEC-21 and the full body of TR-SEC-22.
+
+The decision of GitHub #14: the slice keeps the prefix form of `WINRIG_ALLOWED_COMMANDS` (ADR-0013 §13). The issue asks for a match of an executable path and an argument pattern, and for a read-only mode. A pattern of arguments is a new parsing surface. The prefix form already covers the four field cases: a short call of a known executable. A read-only mode would remove the confirmation from an arbitrary run, and the operator cannot verify "read-only" from the text. The operator still decides the list, and an empty list means any command. Q-14 and ADR-0013 §13 stand.
+
+The slice also brings `WINRIG_CONFIRM_FALLBACK` (ADR-0013 §19–23, TR-SEC-11). The check must cover all five branches of a channel error separately. Today `confirm()` tells four cases apart and puts the rest into a common `Err`, so the code must select `CapabilityNotSupported` explicitly.
+
+The slice breaks the W9 invariant "the exact tool count". The number of declared tools depends on the flags, and the test must check each branch.
+
+## W34. `run_script` (GitHub #14)
+
+Goal: run a PowerShell script that is longer than one WinRS command line, as one confirmed operation. GitHub #14.
+
+The content (ADR-0017 §29–34): the tool `run_script`, off by default through `WINRIG_ALLOW_SCRIPT_EXEC`. The server writes the script into a temporary `.ps1` in the session temp directory in chunks, runs it by name, and deletes the file. The server deletes the file on every failure and timeout too. One confirmation covers the whole operation and shows the whole script. The prefix list `WINRIG_ALLOWED_COMMANDS` does not filter the script, because the server cannot prefix-check the text of a script. The script obeys `WINRIG_MAX_WRITE_BYTES`, and the output obeys the limits of `run_command`.
+
+The subject of the check: TR-EXE-05 keeps the tool off by default and outside the prefix list. TR-EXE-06 covers the temporary file and the cleanup. TR-EXE-07 covers the one confirmation and the whole script. TR-SEC-22 shows the body in full. The ACs are AC-EXE-05..07.
+
+## W35. The write allowlist under the protected roots (GitHub #13)
+
+Goal: let the operator permit a write under a protected root, without a hard ban on a system directory. GitHub #13.
+
+The content (ADR-0017 §7–13): the variable `WINRIG_WRITE_ALLOW_PATHS`, empty by default and set only by the operator. An entry lifts the lexical refusal and the host-root refusal for the write-side file tools. The match is a prefix at a component boundary on the normalized and case-folded resolved path, and it checks both resolutions. An 8.3 component and a reparse-point target stay refused. A system directory and a volume root are permitted in the list, and the confirmation warns each time (TR-SEC-21). `delete_directory` and DR-6 do not change.
+
+The issue #13 proposal said that the system directories cannot be in the list. The operator's decision removes that ban. The operator takes the risk, and the confirmation names the class. Q-25 records this.
+
+The subject of the check: TR-FS-07 and AC-FS-08/09.
+
+## W36. Copy, move, rename and create a directory (GitHub #12)
+
+Goal: back up, move and rename a file without RDP. GitHub #12.
+
+The content (ADR-0017 §14–20): the tools `copy_file`, `move_file`, `rename_file` and `create_directory`, off by default through `WINRIG_ALLOW_FILE_OPS`. All four are modifying and obey DR-5. Without `overwrite: true` the server refuses an existing target. The target obeys the write allowlist and the protected roots. A directory copy is recursive with the counts in the prompt. A move on one volume is a rename. A cross-volume move of a file is a copy and a delete. A cross-volume move of a directory is refused (DR-6). `create_directory` makes the missing parents.
+
+The subject of the check: TR-FS-08..11, TR-SEC-21 and AC-FS-10..13.
+
+## W37. Download a file from the host (GitHub #11)
+
+Goal: let the agent read a binary file from the host, for example a database snapshot. GitHub #11.
+
+The content (ADR-0017 §21–28): the tool `download_file`, off by default through `WINRIG_ALLOW_FILE_DOWNLOAD`. The local endpoint is `WINRIG_TRANSFER_DIR`, with a per-user subdirectory in HTTP mode (DR-3). The server reads the file on the host in chunks through a raw channel. It writes into the transfer directory and compares the SHA-256 of the two sides. The reply carries the name, the size and the hash. `WINRIG_MAX_TRANSFER_BYTES` (default 256 MiB) refuses a larger file. Every download needs a confirmation, because it moves data off the host.
+
+The subject of the check: TR-XFER-01/02/03/05, TR-SEC-21 and AC-XFER-01/02/03/05.
+
+## W38. Upload a file to the host (GitHub #11)
+
+Goal: let the operator put a file on the host from the local transfer directory. GitHub #11.
+
+The content (ADR-0017 §26): the tool `upload_file`, off by default through `WINRIG_ALLOW_FILE_UPLOAD`. The server reads the file from the transfer directory and writes it to the host in chunks with a temporary file and a rename (TR-FS-05). The server checks the SHA-256 of the two sides. The write allowlist, the protected-root refusal and the confirmation apply.
+
+The subject of the check: TR-XFER-04, TR-SEC-21 and AC-XFER-04.
+
 ## The next iteration
 
 These issues wait for a later iteration. They have no slice and no requirement yet, because each one needs a foundation that does not exist.
 
-- GitHub #13 (an operator allowlist for writes under the protected roots) and GitHub #11 (file transfer in both directions) come together. GitHub #12 (copy, move and rename) joins them. They need one new ADR about the write boundary under the protected paths. The ADR states where an operator may permit a write, and how the confirmation and the audit show the exception. TR-FS-02, TR-FS-06 and DR-6 are the base (ADR-0015).
-- GitHub #14 (the `run_command` allowlist from the field) continues W16 on top of ADR-0013. It may change the form of `WINRIG_ALLOWED_COMMANDS` and add a read-only mode for a command.
 - GitHub #23 (a clear result when the host restarts during a session) continues inside W14, which owns the classification of the transport errors (TR-SEC-10).
 - GitHub #15 (a read-only HTTP request to a loopback port) needs the secret redaction design of TR-SEC-08, which has no coverage yet.
+
+GitHub #13 (the write allowlist), #12 (copy, move and rename), #11 (file transfer) and #14 (`run_command` from the field) left this list. ADR-0017 and the slices W33 to W38 own them.

@@ -120,7 +120,8 @@ pub fn loose_file_mode(path: &Path) -> Option<u32> {
     }
 }
 
-#[cfg(test)]
+// The tests exercise the Unix modes, so they exist only where the modes do.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

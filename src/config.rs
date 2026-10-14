@@ -185,6 +185,9 @@ pub struct AppConfig {
     pub allow_file_write: bool,
     /// Size limit of the written content, in bytes (TR-FS-04).
     pub max_write_bytes: usize,
+    /// Operator allowlist of write paths; empty keeps the protected roots closed
+    /// (TR-FS-07, ADR-0017 §7).
+    pub write_allow_paths: Vec<String>,
     /// Whether running arbitrary commands is allowed (TR-EXE-01, ADR-0013).
     pub allow_command_exec: bool,
     /// Command prefixes the server admits; empty means any command (TR-EXE-02).
@@ -227,6 +230,7 @@ impl fmt::Debug for AppConfig {
             .field("confirm_timeout_seconds", &self.confirm_timeout_seconds)
             .field("allow_file_write", &self.allow_file_write)
             .field("max_write_bytes", &self.max_write_bytes)
+            .field("write_allow_paths", &self.write_allow_paths)
             .field("allow_command_exec", &self.allow_command_exec)
             .field("allowed_commands", &self.allowed_commands)
             .field("allow_script_exec", &self.allow_script_exec)
@@ -338,6 +342,22 @@ fn read_allowed_commands(env: &Env) -> Result<Vec<String>, ConfigError> {
         ConfigError::new(format!(
             "WINRIG_ALLOWED_COMMANDS entry {entry:?} is not valid; expected {}",
             crate::policy::ALLOWED_COMMANDS_FORM
+        ))
+    })
+}
+
+/// The write allowlist by the grammar of `policy::parse_write_allow_paths`.
+///
+/// A bad element refuses the start (DR-8): a relative path or a wildcard would
+/// silently allow nothing, and the operator would not see why.
+fn read_write_allow_paths(env: &Env) -> Result<Vec<String>, ConfigError> {
+    let Some(raw) = read(env, "WINRIG_WRITE_ALLOW_PATHS") else {
+        return Ok(Vec::new());
+    };
+    crate::policy::parse_write_allow_paths(&raw).map_err(|entry| {
+        ConfigError::new(format!(
+            "WINRIG_WRITE_ALLOW_PATHS entry {entry:?} is not valid; expected {}",
+            crate::policy::WRITE_ALLOW_PATHS_FORM
         ))
     })
 }
@@ -535,6 +555,7 @@ pub fn load_config_from(env: &Env) -> Result<AppConfig, ConfigError> {
             Some(crate::ps::WRITE_CHUNK_BYTES as i64),
             None,
         )?,
+        write_allow_paths: read_write_allow_paths(env)?,
         allow_command_exec: read_bool(env, "WINRIG_ALLOW_COMMAND_EXEC", false)?,
         allowed_commands: read_allowed_commands(env)?,
         allow_script_exec: read_bool(env, "WINRIG_ALLOW_SCRIPT_EXEC", false)?,
@@ -621,6 +642,10 @@ pub fn setting_pairs(config: &AppConfig) -> Vec<(&'static str, Option<String>)> 
             Some(config.max_write_bytes.to_string()),
         ),
         (
+            "WINRIG_WRITE_ALLOW_PATHS",
+            Some(canonical_path_list(&config.write_allow_paths)),
+        ),
+        (
             "WINRIG_ALLOW_COMMAND_EXEC",
             Some(config.allow_command_exec.to_string()),
         ),
@@ -649,6 +674,17 @@ fn canonical_command_list(commands: &[String]) -> String {
 /// Order does not matter for a membership list, so the canonical form is sorted.
 fn canonical_host_list(hosts: &[String]) -> String {
     let mut sorted = hosts.to_vec();
+    sorted.sort();
+    sorted.join(",")
+}
+
+/// Order does not matter for a set of directories, so the canonical form is the
+/// normalized paths, sorted (TR-PRF-18).
+fn canonical_path_list(paths: &[String]) -> String {
+    let mut sorted: Vec<String> = paths
+        .iter()
+        .map(|path| crate::policy::normalize_windows_path(path))
+        .collect();
     sorted.sort();
     sorted.join(",")
 }
@@ -722,6 +758,8 @@ mod tests {
         assert!(!config.allow_file_write);
         // TR-FS-04: a patience limit, not a protocol limit (ADR-0013 §11).
         assert_eq!(config.max_write_bytes, 64 * 1024);
+        // TR-FS-07: the write allowlist is empty until the operator sets it.
+        assert!(config.write_allow_paths.is_empty());
         // TR-EXE-01: arbitrary execution is off until the operator turns it on.
         assert!(!config.allow_command_exec);
         // TR-EXE-02: an empty command list admits any command.
@@ -813,6 +851,37 @@ mod tests {
         );
         let env = source(&with(&[("WINRIG_MAX_WRITE_BYTES", "2000")]));
         assert_eq!(load_config_from(&env).expect("valid").max_write_bytes, 2000);
+    }
+
+    /// TR-FS-07: the write allowlist is empty by default and read with the parser
+    /// grammar; a bad entry refuses the start with the variable name (DR-8). A
+    /// system directory and a volume root are lawful entries (ADR-0017 §11).
+    #[test]
+    fn write_allow_paths_read_and_refuse_a_bad_entry() {
+        let env = source(&base());
+        assert!(
+            load_config_from(&env)
+                .expect("valid")
+                .write_allow_paths
+                .is_empty()
+        );
+        let env = source(&with(&[(
+            "WINRIG_WRITE_ALLOW_PATHS",
+            "C:\\ProgramData\\Vendor,\\\\server\\share",
+        )]));
+        assert_eq!(
+            load_config_from(&env).expect("valid").write_allow_paths,
+            ["C:\\ProgramData\\Vendor", "\\\\server\\share"]
+        );
+        let env = source(&with(&[("WINRIG_WRITE_ALLOW_PATHS", "C:\\Windows,C:\\")]));
+        assert_eq!(
+            load_config_from(&env).expect("valid").write_allow_paths,
+            ["C:\\Windows", "C:\\"]
+        );
+        let env = source(&with(&[("WINRIG_WRITE_ALLOW_PATHS", "relative\\path")]));
+        let error = load_config_from(&env).expect_err("must fail").to_string();
+        assert!(error.contains("WINRIG_WRITE_ALLOW_PATHS"), "{error}");
+        assert!(error.contains("absolute"), "{error}");
     }
 
     /// AC-PRF-47: without a profile and without a token the config still reads,
@@ -1129,12 +1198,17 @@ mod tests {
             ("WINRIG_ALLOW_INSECURE_TLS", "1"),
             ("WINRIG_ALLOWED_HOSTS", "Host1,.Corp.Example"),
             ("WINRIG_PASSWORD_TTL_SECONDS", "0300"),
+            ("WINRIG_WRITE_ALLOW_PATHS", "d:/b,C:\\a"),
         ]));
         let pairs: BTreeMap<&str, Option<String>> =
             setting_pairs(&load_config_from(&env).expect("valid"))
                 .into_iter()
                 .collect();
         assert_eq!(pairs["WINRIG_ALLOW_INSECURE_TLS"].as_deref(), Some("true"));
+        assert_eq!(
+            pairs["WINRIG_WRITE_ALLOW_PATHS"].as_deref(),
+            Some("C:\\A,D:\\B")
+        );
         assert_eq!(
             pairs["WINRIG_ALLOWED_HOSTS"].as_deref(),
             Some(".corp.example,host1")

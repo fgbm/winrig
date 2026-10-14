@@ -1150,6 +1150,24 @@ impl SessionRegistry {
         );
     }
 
+    /// Records that the operator write allowlist permitted a write into a protected
+    /// location, and names the entry that permitted it (TR-FS-07, ADR-0017 §39).
+    ///
+    /// The record makes the log show why a protected path was permitted. The path
+    /// and the entry are not secrets.
+    pub fn audit_write_allow(&self, username: &str, tool: &str, path: &str, entry: &str) {
+        self.audit(
+            "WRITE ALLOWED BY ALLOWLIST",
+            &[
+                ("user", username.to_owned()),
+                ("tool", tool.to_owned()),
+                ("path", path.to_owned()),
+                ("entry", entry.to_owned()),
+            ],
+            "",
+        );
+    }
+
     /// Records that a modifying operation ran through the permanent operator
     /// agreement instead of an answer (TR-SEC-11, ADR-0013 §22).
     ///

@@ -2102,7 +2102,7 @@ async fn write_file_confirmation_hides_the_content() {
     let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_FILE_WRITE", "true")]).await;
     harness.transport.respond(
         "GetUnresolvedProviderPathFromPSPath",
-        r#"{"FullName":"C:\\App\\config.json","DotNetFullName":"C:\\App\\config.json","Exists":false,"Roots":{"SystemRoot":"C:\\Windows"}}"#,
+        r#"{"FullName":"C:\\App\\config.json","DotNetFullName":"C:\\App\\config.json","Exists":false,"IsDirectory":false,"LinkType":null,"Roots":{"SystemRoot":"C:\\Windows"}}"#,
     );
     let secret = "TOPSECRET";
     harness
@@ -2132,7 +2132,7 @@ async fn write_file_effect_depends_on_existence() {
     let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_FILE_WRITE", "true")]).await;
     harness.transport.respond(
         "GetUnresolvedProviderPathFromPSPath",
-        r#"{"FullName":"C:\\App\\new.json","DotNetFullName":"C:\\App\\new.json","Exists":false,"Roots":{"SystemRoot":"C:\\Windows"}}"#,
+        r#"{"FullName":"C:\\App\\new.json","DotNetFullName":"C:\\App\\new.json","Exists":false,"IsDirectory":false,"LinkType":null,"Roots":{"SystemRoot":"C:\\Windows"}}"#,
     );
     harness
         .call(write_file_call("C:\\App\\new.json", "x", false))
@@ -2148,7 +2148,7 @@ async fn write_file_effect_depends_on_existence() {
     let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_FILE_WRITE", "true")]).await;
     harness.transport.respond(
         "GetUnresolvedProviderPathFromPSPath",
-        r#"{"FullName":"C:\\App\\old.json","DotNetFullName":"C:\\App\\old.json","Exists":true,"Roots":{"SystemRoot":"C:\\Windows"}}"#,
+        r#"{"FullName":"C:\\App\\old.json","DotNetFullName":"C:\\App\\old.json","Exists":true,"IsDirectory":false,"LinkType":null,"Roots":{"SystemRoot":"C:\\Windows"}}"#,
     );
     harness
         .call(write_file_call("C:\\App\\old.json", "x", true))
@@ -2169,7 +2169,7 @@ async fn delete_file_confirmation_shows_the_path_and_the_metadata() {
     let harness = connected(Answer::Accept, &[]).await;
     harness.transport.respond(
         "PSIsContainer",
-        r#"{"FullName":"C:\\App\\old.log","IsDirectory":false,"SizeBytes":123,"Modified":"2026-01-01 00:00:00","Roots":{"SystemRoot":"C:\\Windows"}}"#,
+        r#"{"FullName":"C:\\App\\old.log","IsDirectory":false,"LinkType":null,"SizeBytes":123,"Modified":"2026-01-01 00:00:00","Roots":{"SystemRoot":"C:\\Windows"}}"#,
     );
     harness.call(delete_file_call("C:\\App\\old.log")).await;
     let message = harness.last_confirmation();
@@ -2253,7 +2253,7 @@ async fn a_long_path_keeps_its_tail_visible() {
     harness.transport.respond(
         "PSIsContainer",
         &format!(
-            r#"{{"FullName":"{}","IsDirectory":false,"SizeBytes":1,"Modified":"2026-01-01 00:00:00","Roots":{{"SystemRoot":"C:\\Windows"}}}}"#,
+            r#"{{"FullName":"{}","IsDirectory":false,"LinkType":null,"SizeBytes":1,"Modified":"2026-01-01 00:00:00","Roots":{{"SystemRoot":"C:\\Windows"}}}}"#,
             long.replace('\\', "\\\\")
         ),
     );
@@ -2632,6 +2632,163 @@ async fn new_tool_confirmations_hold_the_w32_fields() {
     harness.client.cancel().await.ok();
 }
 
+/// AC-SEC21-1, AC-FS-08: a write into a system directory that the operator
+/// allowlist covers prompts with the warning line. Without the entry the same
+/// write is refused before the network.
+#[tokio::test]
+async fn system_directory_target_adds_the_warning_line() {
+    let path = "C:\\Windows\\System32\\drivers\\etc\\hosts";
+    let scan = r#"{"FullName":"C:\\Windows\\System32\\drivers\\etc\\hosts","DotNetFullName":"C:\\Windows\\System32\\drivers\\etc\\hosts","Exists":true,"IsDirectory":false,"LinkType":null,"Roots":{"SystemRoot":"C:\\Windows"}}"#;
+
+    let buffer = capture();
+    let harness = connected(
+        Answer::Accept,
+        &[
+            ("WINRIG_ALLOW_FILE_WRITE", "true"),
+            (
+                "WINRIG_WRITE_ALLOW_PATHS",
+                "C:\\Windows\\System32\\drivers\\etc",
+            ),
+        ],
+    )
+    .await;
+    harness
+        .transport
+        .respond("GetUnresolvedProviderPathFromPSPath", scan);
+    let result = harness
+        .call(write_file_call(path, "127.0.0.1 localhost", true))
+        .await;
+
+    let message = harness.last_confirmation();
+    assert_header(&message, "write_file");
+    assert!(
+        message.contains("Warning: the target lies in a system directory"),
+        "{message}"
+    );
+    assert!(message.contains(&format!("Resolved: {path}")), "{message}");
+    assert!(
+        harness.transport.saw("WriteAllBytes"),
+        "the confirmed allowlisted write never reached the host"
+    );
+    assert_eq!(error_of(&result), None, "{:?}", result.structured_content);
+    let audit = take_audit(&buffer);
+    harness.client.cancel().await.ok();
+    // ADR-0017 §39: the audit entry names the entry that permitted the protected path.
+    assert!(
+        audit.contains("WRITE ALLOWED BY ALLOWLIST"),
+        "the allowlist exception is not recorded: {audit}"
+    );
+    assert!(
+        audit.contains("entry         : C:\\Windows\\System32\\drivers\\etc"),
+        "the audit does not name the matching entry on its own line: {audit}"
+    );
+
+    let refused = connected(Answer::Accept, &[("WINRIG_ALLOW_FILE_WRITE", "true")]).await;
+    refused
+        .transport
+        .respond("GetUnresolvedProviderPathFromPSPath", scan);
+    let result = refused.call(write_file_call(path, "x", true)).await;
+    assert!(
+        !refused.transport.saw("WriteAllBytes"),
+        "a write without the allowlist entry reached the host"
+    );
+    assert_eq!(
+        refused.elicitations(),
+        0,
+        "the server asked about a refused write"
+    );
+    assert!(
+        error_of(&result).is_some_and(|error| error.contains("protected")),
+        "{:?}",
+        result.structured_content
+    );
+    refused.client.cancel().await.ok();
+}
+
+/// AC-FS-08, AC-SEC21-1, item 5: `delete_file` with an allowlist entry warns for a
+/// system directory and records the matching entry in the audit.
+#[tokio::test]
+async fn delete_file_allowlisted_target_warns_and_is_audited() {
+    let path = "C:\\ProgramData\\Vendor\\db.sqlite";
+    let scan = r#"{"FullName":"C:\\ProgramData\\Vendor\\db.sqlite","IsDirectory":false,"LinkType":null,"SizeBytes":10,"Modified":"2026-01-01 00:00:00","Roots":{"SystemRoot":"C:\\Windows","ProgramData":"C:\\ProgramData"}}"#;
+
+    let buffer = capture();
+    let harness = connected(
+        Answer::Accept,
+        &[("WINRIG_WRITE_ALLOW_PATHS", "C:\\ProgramData\\Vendor")],
+    )
+    .await;
+    harness.transport.respond("PSIsContainer", scan);
+    let result = harness.call(delete_file_call(path)).await;
+
+    let message = harness.last_confirmation();
+    assert_header(&message, "delete_file");
+    assert!(
+        message.contains("Warning: the target lies in a system directory"),
+        "{message}"
+    );
+    assert!(
+        harness.transport.saw("Remove-Item -LiteralPath"),
+        "the confirmed allowlisted delete never reached the host"
+    );
+    assert_eq!(error_of(&result), None, "{:?}", result.structured_content);
+    let audit = take_audit(&buffer);
+    harness.client.cancel().await.ok();
+    assert!(audit.contains("WRITE ALLOWED BY ALLOWLIST"), "{audit}");
+    assert!(
+        audit.contains("entry         : C:\\ProgramData\\Vendor"),
+        "the audit does not name the matching entry on its own line: {audit}"
+    );
+}
+
+/// Item 5, item 1: a name-surrogate target through a real scan is refused before the
+/// transport for both write-side tools.
+#[tokio::test]
+async fn name_surrogate_targets_are_refused_before_the_transport() {
+    let path = "C:\\App\\link.txt";
+    let write_scan = r#"{"FullName":"C:\\App\\link.txt","DotNetFullName":"C:\\App\\link.txt","Exists":true,"IsDirectory":false,"LinkType":"SymbolicLink","Roots":{"SystemRoot":"C:\\Windows"}}"#;
+    let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_FILE_WRITE", "true")]).await;
+    harness
+        .transport
+        .respond("GetUnresolvedProviderPathFromPSPath", write_scan);
+    let result = harness.call(write_file_call(path, "x", true)).await;
+    assert!(
+        !harness.transport.saw("WriteAllBytes"),
+        "a symlink write target reached the host"
+    );
+    assert_eq!(
+        harness.elicitations(),
+        0,
+        "the server asked about a refused write"
+    );
+    assert!(
+        error_of(&result).is_some_and(|error| error.contains("symbolic link or a junction")),
+        "{:?}",
+        result.structured_content
+    );
+    harness.client.cancel().await.ok();
+
+    let delete_scan = r#"{"FullName":"C:\\App\\link.txt","IsDirectory":false,"LinkType":"Junction","SizeBytes":1,"Modified":"2026-01-01 00:00:00","Roots":{"SystemRoot":"C:\\Windows"}}"#;
+    let harness = connected(Answer::Accept, &[]).await;
+    harness.transport.respond("PSIsContainer", delete_scan);
+    let result = harness.call(delete_file_call(path)).await;
+    assert!(
+        !harness.transport.saw("Remove-Item -LiteralPath"),
+        "a junction delete target reached the host"
+    );
+    assert_eq!(
+        harness.elicitations(),
+        0,
+        "the server asked about a refused delete"
+    );
+    assert!(
+        error_of(&result).is_some_and(|error| error.contains("symbolic link or a junction")),
+        "{:?}",
+        result.structured_content
+    );
+    harness.client.cancel().await.ok();
+}
+
 /// DR-4, ADR-0013 §3–4: the audit holds the command text the operator confirmed,
 /// not its reversible base64 wrapper.
 #[tokio::test]
@@ -2760,7 +2917,7 @@ async fn proceed_runs_a_deleting_tool_and_marks_the_audit() {
     let harness = connected(Answer::NoChannel, &[("WINRIG_CONFIRM_FALLBACK", "proceed")]).await;
     harness.transport.respond(
         "PSIsContainer",
-        r#"{"FullName":"C:\\App\\old.log","IsDirectory":false,"SizeBytes":123,"Modified":"2026-01-01 00:00:00","Roots":{"SystemRoot":"C:\\Windows"}}"#,
+        r#"{"FullName":"C:\\App\\old.log","IsDirectory":false,"LinkType":null,"SizeBytes":123,"Modified":"2026-01-01 00:00:00","Roots":{"SystemRoot":"C:\\Windows"}}"#,
     );
     let result = harness.call(delete_file_call("C:\\App\\old.log")).await;
 

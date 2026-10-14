@@ -21,8 +21,9 @@ use crate::executor::{sanitize_body_value, sanitize_path_value, sanitize_prompt_
 use crate::identity::RequestIdentity;
 use crate::policy::{
     DeleteScan, FileScan, PolicyDecision, WriteScan, decide_command, decide_command_length,
-    decide_delete_path, decide_delete_scan, decide_file_delete, decide_host, decide_port,
-    decide_script_size, decide_service_target, decide_tls, decide_write_path, decide_write_scan,
+    decide_delete_file_path, decide_delete_path, decide_delete_scan, decide_file_delete,
+    decide_host, decide_port, decide_script_size, decide_service_target, decide_tls,
+    decide_write_path, decide_write_scan,
 };
 use crate::ps;
 use crate::session::{ScriptRun, SessionRegistry, UserIdentity};
@@ -2390,7 +2391,7 @@ impl WinrigServer {
 
     #[tool(
         name = "write_file",
-        description = "Write a file on the host and replace it as a whole. The tool refuses protected paths. It refuses an existing file unless overwrite is set. The content travels in chunks of about 1.5 KB, because the WinRS command line is limited. The tool refuses a path so long that its commands would not fit that line: about 760 characters for UTF-8 and about 460 characters for the other encodings, for a path with no quote character. Use this tool for configuration files and scripts, not for large payloads. To run a script that is too long for one command, write it here and then execute it by path."
+        description = "Write a file on the host and replace it as a whole. The tool refuses a device volume path, an 8.3 name, a symbolic link or a junction, and an existing directory. An operator allowlist entry in WINRIG_WRITE_ALLOW_PATHS can permit a protected path; the confirmation then warns for a system directory, a volume root or a share root. It refuses an existing file unless overwrite is set. The content travels in chunks of about 1.5 KB, because the WinRS command line is limited. The tool refuses a path so long that its commands would not fit that line: about 530 characters for UTF-8 and about 470 characters for the other encodings, for a path with no quote character. Use this tool for configuration files and scripts, not for large payloads. To run a script that is too long for one command, write it here and then execute it by path."
     )]
     async fn write_file(
         &self,
@@ -2398,8 +2399,9 @@ impl WinrigServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let identity = self.identity(&ctx)?;
-        // DR-6: lexical refusal before any network access.
-        let decision = decide_write_path(&params.path);
+        // DR-6: lexical refusal before any network access. ADR-0017 §9: an
+        // operator allowlist entry that covers the path lifts the refusal.
+        let decision = decide_write_path(&params.path, &self.config.write_allow_paths);
         if !decision.allow {
             self.audit_refusal(&identity, "write_file", &decision);
             return Ok(CallToolResult::structured(
@@ -2460,7 +2462,12 @@ impl WinrigServer {
                 })));
             }
         };
-        let scan_decision = decide_write_scan(&scan, &params.path, params.overwrite);
+        let scan_decision = decide_write_scan(
+            &scan,
+            &params.path,
+            params.overwrite,
+            &self.config.write_allow_paths,
+        );
         if !scan_decision.allow {
             self.audit_refusal(&identity, "write_file", &scan_decision);
             return Ok(CallToolResult::structured(json!({
@@ -2471,10 +2478,8 @@ impl WinrigServer {
         let exists = scan.exists;
 
         let bytes = params.content.len();
-        require_confirmation!(
-            &self,
-            &ctx,
-            self.confirmation(
+        let mut confirmation = self
+            .confirmation(
                 &identity,
                 &params.session_id,
                 "write_file",
@@ -2482,7 +2487,7 @@ impl WinrigServer {
                     "OVERWRITE FILE"
                 } else {
                     "WRITE FILE"
-                }
+                },
             )
             .path("Path", &params.path)
             .path("Resolved", &scan.full_name)
@@ -2491,13 +2496,31 @@ impl WinrigServer {
             .field("Existing file", if exists { "yes" } else { "no" })
             // DR-4, TR-SEC-18: the content may be a secret, so the prompt shows
             // the marker only. The size is a property of the call, not the value.
-            .field("Content", "hidden")
-            .effect(if exists {
+            .field("Content", "hidden");
+        // ADR-0017 §36: a protected target the allowlist permits warns each time.
+        if let Some(class) = scan_decision.class {
+            confirmation = confirmation.field("Warning", class);
+        }
+        require_confirmation!(
+            &self,
+            &ctx,
+            confirmation.effect(if exists {
                 EFFECT_WRITE_REPLACE
             } else {
                 EFFECT_WRITE_NEW
             })
         );
+
+        // ADR-0017 §39: the audit names the entry that permitted a protected path,
+        // once the operator confirmed the write.
+        if let Some(entry) = &scan_decision.matched {
+            self.registry.audit_write_allow(
+                &identity.username,
+                "write_file",
+                &scan.full_name,
+                entry,
+            );
+        }
 
         // Chunks and the rename run as one sequence: a failure in the middle
         // removes the temporary file and the target stays unchanged (TR-FS-05).
@@ -2715,7 +2738,7 @@ impl WinrigServer {
 
     #[tool(
         name = "delete_file",
-        description = "Delete one file permanently. The tool scans first and refuses protected paths and directories. The confirmation prompt shows the resolved path and the metadata."
+        description = "Delete one file permanently. The tool scans first and refuses a protected path, an 8.3 name, a directory, and a symbolic link or a junction. An operator allowlist entry in WINRIG_WRITE_ALLOW_PATHS can permit a protected path; the confirmation then warns for a system directory, a volume root or a share root. The confirmation prompt shows the resolved path and the metadata."
     )]
     async fn delete_file(
         &self,
@@ -2723,8 +2746,9 @@ impl WinrigServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let identity = self.identity(&ctx)?;
-        // DR-6: lexical refusal before any network access.
-        let decision = decide_delete_path(&params.path);
+        // DR-6: lexical refusal before any network access. ADR-0017 §9: an
+        // operator allowlist entry that covers the path lifts the refusal.
+        let decision = decide_delete_file_path(&params.path, &self.config.write_allow_paths);
         if !decision.allow {
             self.audit_refusal(&identity, "delete_file", &decision);
             return Ok(CallToolResult::structured(
@@ -2761,7 +2785,7 @@ impl WinrigServer {
                 })));
             }
         };
-        let scan_decision = decide_file_delete(&scan, &params.path);
+        let scan_decision = decide_file_delete(&scan, &params.path, &self.config.write_allow_paths);
         if !scan_decision.allow {
             self.audit_refusal(&identity, "delete_file", &scan_decision);
             return Ok(CallToolResult::structured(json!({
@@ -2769,18 +2793,28 @@ impl WinrigServer {
                 "scan": stdout,
             })));
         }
-
         let (size, modified) = scan_metadata(&stdout);
-        require_confirmation!(
-            &self,
-            &ctx,
-            self.confirmation(&identity, &params.session_id, "delete_file", "DELETE FILE")
-                .path("Path", &params.path)
-                .path("Resolved", &scan.full_name)
-                .field("Size", &size)
-                .field("Modified", &modified)
-                .effect(EFFECT_DELETE_FILE)
-        );
+        let mut confirmation = self
+            .confirmation(&identity, &params.session_id, "delete_file", "DELETE FILE")
+            .path("Path", &params.path)
+            .path("Resolved", &scan.full_name)
+            .field("Size", &size)
+            .field("Modified", &modified);
+        // ADR-0017 §36: a protected target the allowlist permits warns each time.
+        if let Some(class) = scan_decision.class {
+            confirmation = confirmation.field("Warning", class);
+        }
+        require_confirmation!(&self, &ctx, confirmation.effect(EFFECT_DELETE_FILE));
+        // ADR-0017 §39: the audit names the entry that permitted a protected path,
+        // once the operator confirmed the delete.
+        if let Some(entry) = &scan_decision.matched {
+            self.registry.audit_write_allow(
+                &identity.username,
+                "delete_file",
+                &scan.full_name,
+                entry,
+            );
+        }
         let command = format!(
             "Remove-Item -LiteralPath '{safe}' -Force -ErrorAction Stop; \
              if (Test-Path -LiteralPath '{safe}') {{ Write-Output 'WARNING: file still exists' }} \
@@ -3325,8 +3359,40 @@ mod tests {
     /// TR-FS-02: a write to a protected path is refused by the policy before the network.
     #[test]
     fn policy_refuses_protected_write_before_transport() {
-        assert!(!decide_write_path("C:\\Windows\\System32\\config").allow);
-        assert!(decide_write_path("C:\\App\\config.json").allow);
+        assert!(!decide_write_path("C:\\Windows\\System32\\config", &[]).allow);
+        assert!(decide_write_path("C:\\App\\config.json", &[]).allow);
+    }
+
+    /// AC-FS-08, TR-SEC-21: a protected write that the operator allowlist covers
+    /// passes the policy with the warning sentence, and the confirmation line names
+    /// the class.
+    #[test]
+    fn allowed_write_path_carries_the_warning_line() {
+        let allowed = vec!["C:\\ProgramData\\Vendor".to_owned()];
+        let target = "C:\\ProgramData\\Vendor\\db.sqlite";
+        let scan = WriteScan {
+            full_name: target.to_owned(),
+            dotnet_full_name: target.to_owned(),
+            exists: false,
+            is_directory: false,
+            link_type: None,
+            roots: crate::policy::HostRoots::default(),
+        };
+        let decision = decide_write_scan(&scan, target, false, &allowed);
+        assert!(decision.allow, "{}", decision.reason);
+        assert_eq!(
+            decision.class,
+            Some("the target lies in a system directory")
+        );
+        assert_eq!(decision.matched.as_deref(), Some("C:\\ProgramData\\Vendor"));
+
+        let prompt = Confirmation::new("write_file", "WRITE FILE", "host1", "contoso\\alice")
+            .field("Warning", decision.class.expect("a class"))
+            .render();
+        assert!(
+            prompt.contains("Warning: the target lies in a system directory"),
+            "{prompt}"
+        );
     }
 
     #[test]

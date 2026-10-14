@@ -548,11 +548,15 @@ pub const HOST_ROOTS: &str = "Roots=[PSCustomObject]@{ SystemRoot=$env:SystemRoo
      ProgramData=$env:ProgramData; \
      Users=$(if ($env:PUBLIC) { Split-Path -Parent $env:PUBLIC } else { $null }) }";
 
-/// Both path resolutions, existence and the host roots (TR-FS-03, TR-FS-06).
+/// Both path resolutions, existence, the directory flag, the link type and the host
+/// roots (TR-FS-03, TR-FS-06).
 ///
-/// .NET writes the chunks and `Move-Item` replaces the target, and they resolve
-/// a relative path from different directories, so the host returns both
-/// resolutions. Any error stops the script and the tool refuses (fail-closed).
+/// .NET writes the chunks and `Move-Item` replaces the target, and they resolve a
+/// relative path from different directories, so the host returns both resolutions.
+/// When the target exists, `Get-Item` reads it with `-ErrorAction Stop`: a failed read
+/// refuses, it does not read as "no link". `LinkType` is `SymbolicLink` or `Junction`
+/// for a name surrogate and `null` for any other reparse point. Any error stops the
+/// script and the tool refuses (fail-closed).
 #[must_use]
 pub fn write_scan(path: &str) -> String {
     let safe = escape(path);
@@ -560,20 +564,24 @@ pub fn write_scan(path: &str) -> String {
         "$ErrorActionPreference = 'Stop'; \
          $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath('{safe}'); \
          $net = [IO.Path]::GetFullPath('{safe}'); \
-         [PSCustomObject]@{{ FullName=$full; DotNetFullName=$net; \
-         Exists=[bool](Test-Path -LiteralPath '{safe}'); {HOST_ROOTS} }} \
+         $exists = [bool](Test-Path -LiteralPath '{safe}'); \
+         $it = if ($exists) {{ Get-Item -LiteralPath '{safe}' -Force -ErrorAction Stop }} else {{ $null }}; \
+         [PSCustomObject]@{{ FullName=$full; DotNetFullName=$net; Exists=$exists; \
+         IsDirectory=[bool]($it -and $it.PSIsContainer); \
+         LinkType=if ($it) {{ $it.LinkType }} else {{ $null }}; {HOST_ROOTS} }} \
          | ConvertTo-Json -Compress"
     )
 }
 
-/// The scan of a file to delete: the host-resolved path, the directory flag and
-/// the host roots (DR-6, TR-SEC-04).
+/// The scan of a file to delete: the host-resolved path, the directory flag, the link
+/// type and the host roots (DR-6, TR-SEC-04, ADR-0017 §10).
 #[must_use]
 pub fn delete_file_scan(path: &str) -> String {
     let safe = escape(path);
     format!(
         "$item = Get-Item -LiteralPath '{safe}' -Force -ErrorAction Stop; \
          [PSCustomObject]@{{ FullName=$item.FullName; IsDirectory=[bool]$item.PSIsContainer; \
+         LinkType=$item.LinkType; \
          SizeBytes=if($item.PSIsContainer){{$null}}else{{$item.Length}}; \
          Modified=$item.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss',[Globalization.CultureInfo]::InvariantCulture); {HOST_ROOTS} }} \
          | ConvertTo-Json -Compress"
@@ -4494,9 +4502,10 @@ mod tests {
     /// as long as the whole plan fits one command line (TR-FS-04, ADR-0015).
     #[test]
     fn a_long_path_with_small_content_is_accepted() {
-        let path = format!("\\\\?\\C:\\{}", "a".repeat(700));
+        let path = format!("\\\\?\\C:\\{}", "a".repeat(450));
         let temp = temp_for(&path);
         let plan = write_plan(&path, &temp, "hello", "utf8", 64 * 1024).expect("fits");
+        assert!(path.chars().count() > 260, "the path must exceed MAX_PATH");
         assert_plan_fits(&path, &temp, &plan);
     }
 
@@ -5015,6 +5024,22 @@ mod tests {
             command.contains("Test-Path -LiteralPath 'x.ps1'"),
             "{command}"
         );
+        // ADR-0017 §10, item 6: the target is read with `-ErrorAction Stop`, and the
+        // scan reports the link type and the directory flag. A reparse point that is
+        // not a link reports a null `LinkType`.
+        assert!(command.contains("LinkType="), "{command}");
+        assert!(command.contains("IsDirectory="), "{command}");
+        assert!(
+            !command.contains("IsReparsePoint"),
+            "the reparse attribute bit is not the refusal key: {command}"
+        );
+        assert!(
+            command.contains("Get-Item -LiteralPath 'x.ps1' -Force -ErrorAction Stop"),
+            "{command}"
+        );
+        let delete = delete_file_scan("x");
+        assert!(delete.contains("LinkType="), "{delete}");
+        assert!(!delete.contains("IsReparsePoint"), "{delete}");
     }
 
     /// AC-REL17-1: `get_service_config` reads the start type, the account, the binary

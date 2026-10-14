@@ -95,7 +95,7 @@ Each confirmation names the host of the session, the user of the request and the
 | `set_service_start_type` | Set the start type (Automatic, AutomaticDelayed, Manual or Disabled). The confirmation shows the current and the new start type. The tool refuses a service that is critical for the remote session |
 | `kill_process` | Terminate a process by PID. The confirmation shows the name, the executable path (with no arguments) and the start time. The command line is never read, so a secret in it cannot leak (DR-4) |
 | `set_registry` | Write a registry value. The old value and the new value appear only as `hidden`; the prompt shows whether the old value is present and its type |
-| `delete_file` / `delete_directory` | Delete with a confirmation prompt; the tool rejects protected paths, including by the actual location of the system on the host |
+| `delete_file` / `delete_directory` | Delete with a confirmation prompt; the tool rejects protected paths, including by the actual location of the system on the host. `delete_file` accepts the operator allowlist `WINRIG_WRITE_ALLOW_PATHS`; the recursive `delete_directory` does not (DR-6) |
 | `flush_dns` | Clear the DNS client cache |
 | `write_file` | Write a file with a full replacement. **Off by default**: set `WINRIG_ALLOW_FILE_WRITE=true`, or the server does not declare the tool and no call can reach it |
 | `run_command` | Run an arbitrary PowerShell command. **Off by default**: set `WINRIG_ALLOW_COMMAND_EXEC=true`, or the server does not declare the tool and no call can reach it. The confirmation shows the full command text. The server refuses a command outside a non-empty `WINRIG_ALLOWED_COMMANDS` before any network activity |
@@ -107,6 +107,7 @@ Each confirmation names the host of the session, the user of the request and the
 |--------|--------|
 | `WINRIG_ALLOW_FILE_WRITE=true` | Declares the tool `write_file`. While the value is `false`, the server removes the tool from the router |
 | `WINRIG_MAX_WRITE_BYTES` | The largest content that `write_file` and the uploaded `run_script` script accept, in bytes (64 KiB by default) |
+| `WINRIG_WRITE_ALLOW_PATHS` | The operator allowlist of write paths, comma-separated. An entry lifts the protected-path refusal for `write_file` and `delete_file`; the confirmation then warns for a system directory, a volume root or a share root. An 8.3 component and a symbolic link or a junction stay refused (ADR-0017 §7–13) |
 | `WINRIG_ALLOW_COMMAND_EXEC=true` | Declares the tool `run_command`. While the value is `false`, the server removes the tool from the router |
 | `WINRIG_ALLOW_SCRIPT_EXEC=true` | Declares the tool `run_script`. While the value is `false`, the server removes the tool from the router |
 | `WINRIG_ALLOWED_COMMANDS` | The command allowlist, comma-separated. An empty value admits any command. A prefix is not a boundary (ADR-0013 §18) |
@@ -118,7 +119,7 @@ Each confirmation names the host of the session, the user of the request and the
 `run_script` runs a PowerShell script that is longer than one WinRS command line. It is off by default (`WINRIG_ALLOW_SCRIPT_EXEC`). The server writes the script into a temporary `.ps1` in the session temp directory in chunks. It reads the file and runs its text as a script block, then tries to delete the file. The script has no `$PSScriptRoot`, no `$PSCommandPath` and no arguments. The tool shows the SHA-256 of the script in the confirmation and records it in the audit, and it verifies the hash before the run. One confirmation covers the whole operation and shows the whole script, line by line and without the 200-character cap. `WINRIG_ALLOWED_COMMANDS` does not filter a script, because the server cannot prefix-check the text of a script in a meaningful way; the confirmation states this. The script obeys `WINRIG_MAX_WRITE_BYTES`, and the output obeys the same limits as `run_command`. The result carries `temp_file` with the cleanup outcome, and a `warning` when the temporary file may remain. The tool can fail if the script produces no output for 60 seconds (ADR-0017 §29–34).
 
 :::danger
-`delete_file`, `delete_directory` and `write_file` reject protected paths and reparse points. Do not call them on a volume root or a system directory. Data loss can occur. `run_command` and `run_script` have no path protection at all: one command or script can delete or rewrite anything the account can reach.
+`delete_file`, `delete_directory` and `write_file` reject protected paths and reparse points. Do not call them on a volume root or a system directory. Data loss can occur. The allowlist `WINRIG_WRITE_ALLOW_PATHS` lifts the refusal for `write_file` and `delete_file` when an entry covers the target. The confirmation then warns for a system directory, a volume root or a share root. The entry never lifts an 8.3 component or a symbolic link or a junction. `run_command` and `run_script` have no path protection at all: one command or script can delete or rewrite anything the account can reach.
 :::
 
 :::note

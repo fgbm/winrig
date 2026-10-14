@@ -24,7 +24,7 @@ Enter the AD password one time through `winrig setup`. The server keeps the pass
 - **One process for each profile.** `winrig setup` creates an encrypted profile and prints the profile token one time. A second process on the same profile refuses to start and points to the HTTP mode.
 - **Two secrets.** A request authenticates with the shared secret (the header path with `X-AD-User`) or with a profile token.
 - **Confirmation for each modification.** A modifying tool requires the explicit confirmation of the operator. Without a confirmation channel, the tool refuses to run.
-- **Protected operations.** Deletion and `write_file` reject protected paths and reparse points.
+- **Protected operations.** Deletion and `write_file` reject protected paths and a symbolic link or a junction. The allowlist `WINRIG_WRITE_ALLOW_PATHS` can permit a write under a protected root. The confirmation then warns for a system directory, a volume root or a share root.
 - **No secrets on disk.** The profile file holds only authenticated ciphertext. The profile token stays at the client.
 - **43 tools**, plus `write_file`, `run_command` and `run_script` when the operator enables them. The tools cover the file system, services, the registry, event logs, certificates, processes, the network and scheduled tasks.
 

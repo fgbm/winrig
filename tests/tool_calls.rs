@@ -1746,6 +1746,44 @@ fn delete_file_call(path: &str) -> CallToolRequestParams {
     })))
 }
 
+/// One `copy_file` call in an open session.
+fn copy_file_call(source: &str, target: &str, overwrite: bool) -> CallToolRequestParams {
+    CallToolRequestParams::new("copy_file").with_arguments(args(&serde_json::json!({
+        "session_id": HOST,
+        "source": source,
+        "target": target,
+        "overwrite": overwrite
+    })))
+}
+
+/// One `move_file` call in an open session.
+fn move_file_call(source: &str, target: &str, overwrite: bool) -> CallToolRequestParams {
+    CallToolRequestParams::new("move_file").with_arguments(args(&serde_json::json!({
+        "session_id": HOST,
+        "source": source,
+        "target": target,
+        "overwrite": overwrite
+    })))
+}
+
+/// One `rename_file` call in an open session.
+fn rename_file_call(path: &str, new_name: &str, overwrite: bool) -> CallToolRequestParams {
+    CallToolRequestParams::new("rename_file").with_arguments(args(&serde_json::json!({
+        "session_id": HOST,
+        "path": path,
+        "new_name": new_name,
+        "overwrite": overwrite
+    })))
+}
+
+/// One `create_directory` call in an open session.
+fn create_directory_call(path: &str) -> CallToolRequestParams {
+    CallToolRequestParams::new("create_directory").with_arguments(args(&serde_json::json!({
+        "session_id": HOST,
+        "path": path
+    })))
+}
+
 /// Every confirmation carries the header lines (TR-SEC-16, AC-SEC16-1).
 fn assert_header(message: &str, tool: &str) {
     assert!(message.contains(&format!("Tool: {tool}")), "{message}");
@@ -2703,6 +2741,285 @@ async fn system_directory_target_adds_the_warning_line() {
         result.structured_content
     );
     refused.client.cancel().await.ok();
+}
+
+/// AC-FS-13, AC-SEC21-1: a confirmed `copy_file` of a directory names the host, the
+/// user, the tool, the resolved source and target, the counts and the overwrite
+/// state, and the copy reaches the host. A protected target that the allowlist
+/// covers adds the warning line.
+#[tokio::test]
+async fn file_ops_confirmation_shows_the_details() {
+    let source = "D:\\Data\\logs";
+    let target = "D:\\Backup\\logs";
+    let source_scan = r#"{"FullName":"D:\\Data\\logs","IsDirectory":true,"LinkType":null,"FileCount":3,"DirCount":2,"ByteCount":4096,"NestedLink":false,"Truncated":false,"Unreadable":false,"Roots":{"SystemRoot":"C:\\Windows"}}"#;
+    let target_scan = r#"{"FullName":"D:\\Backup\\logs","DotNetFullName":"D:\\Backup\\logs","Exists":false,"IsDirectory":false,"LinkType":null,"Roots":{"SystemRoot":"C:\\Windows"}}"#;
+
+    let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_FILE_OPS", "true")]).await;
+    harness.transport.respond("NestedLink", source_scan);
+    harness
+        .transport
+        .respond("GetUnresolvedProviderPathFromPSPath", target_scan);
+    let result = harness.call(copy_file_call(source, target, false)).await;
+
+    let message = harness.last_confirmation();
+    assert_header(&message, "copy_file");
+    assert!(message.contains(&format!("Source: {source}")), "{message}");
+    assert!(
+        message.contains(&format!("Resolved source: {source}")),
+        "{message}"
+    );
+    assert!(message.contains(&format!("Target: {target}")), "{message}");
+    assert!(
+        message.contains(&format!("Resolved target: {target}")),
+        "{message}"
+    );
+    assert!(message.contains("Files: 3"), "{message}");
+    assert!(message.contains("Directories: 2"), "{message}");
+    assert!(message.contains("Bytes: 4096"), "{message}");
+    assert!(message.contains("Overwrite: no"), "{message}");
+    assert!(
+        message.contains("This copies the directory and its whole content."),
+        "{message}"
+    );
+    assert!(
+        harness.transport.saw("[IO.File]::Copy"),
+        "the confirmed copy never reached the host"
+    );
+    assert_eq!(error_of(&result), None, "{:?}", result.structured_content);
+    harness.client.cancel().await.ok();
+
+    // AC-SEC21-1, AC-FS-08: a file-op target that the allowlist covers warns each
+    // time for a system directory.
+    let src = "D:\\Data\\db.sqlite";
+    let protected = "C:\\ProgramData\\Vendor\\db.sqlite";
+    let src_scan = r#"{"FullName":"D:\\Data\\db.sqlite","IsDirectory":false,"LinkType":null,"FileCount":1,"DirCount":0,"ByteCount":10,"NestedLink":false,"Truncated":false,"Unreadable":false,"Roots":{"SystemRoot":"C:\\Windows"}}"#;
+    let tgt_scan = r#"{"FullName":"C:\\ProgramData\\Vendor\\db.sqlite","DotNetFullName":"C:\\ProgramData\\Vendor\\db.sqlite","Exists":false,"IsDirectory":false,"LinkType":null,"Roots":{"SystemRoot":"C:\\Windows","ProgramData":"C:\\ProgramData"}}"#;
+    let harness = connected(
+        Answer::Accept,
+        &[
+            ("WINRIG_ALLOW_FILE_OPS", "true"),
+            ("WINRIG_WRITE_ALLOW_PATHS", "C:\\ProgramData\\Vendor"),
+        ],
+    )
+    .await;
+    harness.transport.respond("NestedLink", src_scan);
+    harness
+        .transport
+        .respond("GetUnresolvedProviderPathFromPSPath", tgt_scan);
+    let result = harness.call(copy_file_call(src, protected, false)).await;
+    let message = harness.last_confirmation();
+    assert_header(&message, "copy_file");
+    assert!(
+        message.contains("Warning: the target lies in a system directory"),
+        "{message}"
+    );
+    assert_eq!(error_of(&result), None, "{:?}", result.structured_content);
+    harness.client.cancel().await.ok();
+}
+
+/// TR-FS-10, DR-5: a `move_file` that crosses volumes copies then deletes, and the
+/// confirmation names the mode and the implied delete.
+#[tokio::test]
+async fn cross_volume_file_move_shows_the_mode() {
+    let source = "C:\\Data\\a.txt";
+    let target = "D:\\Data\\a.txt";
+    let source_scan = r#"{"FullName":"C:\\Data\\a.txt","IsDirectory":false,"LinkType":null,"FileCount":1,"DirCount":0,"ByteCount":10,"NestedLink":false,"Truncated":false,"Unreadable":false,"Roots":{"SystemRoot":"C:\\Windows"}}"#;
+    let target_scan = r#"{"FullName":"D:\\Data\\a.txt","DotNetFullName":"D:\\Data\\a.txt","Exists":false,"IsDirectory":false,"LinkType":null,"Roots":{"SystemRoot":"C:\\Windows"}}"#;
+
+    let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_FILE_OPS", "true")]).await;
+    harness.transport.respond("NestedLink", source_scan);
+    harness
+        .transport
+        .respond("GetUnresolvedProviderPathFromPSPath", target_scan);
+    let result = harness.call(move_file_call(source, target, false)).await;
+
+    let message = harness.last_confirmation();
+    assert_header(&message, "move_file");
+    assert!(
+        message.contains("Mode: across volumes (by path): copy then delete the source"),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("Resolved source: {source}")),
+        "{message}"
+    );
+    assert!(
+        harness.transport.saw("[IO.File]::Delete"),
+        "the source delete never ran"
+    );
+    assert_eq!(error_of(&result), None, "{:?}", result.structured_content);
+    harness.client.cancel().await.ok();
+}
+
+/// ADR-0017 §12: a protected target is refused before any scan, so a refused
+/// operation costs no host call.
+#[tokio::test]
+async fn file_ops_refuse_a_protected_target_before_the_network() {
+    let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_FILE_OPS", "true")]).await;
+    let before = harness.transport.calls.lock().expect("lock").len();
+    let result = harness
+        .call(copy_file_call(
+            "D:\\Data\\a.txt",
+            "C:\\Windows\\x.txt",
+            false,
+        ))
+        .await;
+
+    assert!(
+        error_of(&result).is_some_and(|error| error.contains("protected")),
+        "{:?}",
+        result.structured_content
+    );
+    assert_eq!(
+        harness.transport.calls.lock().expect("lock").len(),
+        before,
+        "a protected target must not reach the host"
+    );
+    assert_eq!(
+        harness.elicitations(),
+        0,
+        "the server asked about a refused copy"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// TR-FS-09, item 5: a copy whose target is inside its own source, or equal to it,
+/// is refused before any scan.
+#[tokio::test]
+async fn file_ops_refuse_a_recursive_target() {
+    let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_FILE_OPS", "true")]).await;
+    let source_scan = r#"{"FullName":"D:\\Data\\tree","IsDirectory":true,"LinkType":null,"FileCount":1,"DirCount":1,"ByteCount":10,"NestedLink":false,"Truncated":false,"Unreadable":false,"Roots":{"SystemRoot":"C:\\Windows"}}"#;
+    harness.transport.respond("NestedLink", source_scan);
+    let result = harness
+        .call(copy_file_call(
+            "D:\\Data\\tree",
+            "D:\\Data\\tree\\sub",
+            false,
+        ))
+        .await;
+    assert!(
+        error_of(&result).is_some_and(|error| error.contains("inside the source")),
+        "{:?}",
+        result.structured_content
+    );
+    assert_eq!(
+        harness.elicitations(),
+        0,
+        "the server asked about a refused copy"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// TR-FS-10, item 6: a move removes its source, so a protected source is refused and
+/// the confirmation warns for it.
+#[tokio::test]
+async fn move_file_warns_for_a_protected_source() {
+    let source = "C:\\ProgramData\\Vendor\\db.sqlite";
+    let target = "D:\\Backup\\db.sqlite";
+    let source_scan = r#"{"FullName":"C:\\ProgramData\\Vendor\\db.sqlite","IsDirectory":false,"LinkType":null,"FileCount":1,"DirCount":0,"ByteCount":10,"NestedLink":false,"Truncated":false,"Unreadable":false,"Roots":{"SystemRoot":"C:\\Windows","ProgramData":"C:\\ProgramData"}}"#;
+    let target_scan = r#"{"FullName":"D:\\Backup\\db.sqlite","DotNetFullName":"D:\\Backup\\db.sqlite","Exists":false,"IsDirectory":false,"LinkType":null,"Roots":{"SystemRoot":"C:\\Windows"}}"#;
+
+    // Without an entry the protected source is refused with no host call.
+    let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_FILE_OPS", "true")]).await;
+    harness.transport.respond("NestedLink", source_scan);
+    let before = harness.transport.calls.lock().expect("lock").len();
+    let result = harness.call(move_file_call(source, target, false)).await;
+    assert!(
+        error_of(&result).is_some_and(|error| error.contains("protected")),
+        "{:?}",
+        result.structured_content
+    );
+    assert_eq!(
+        harness.transport.calls.lock().expect("lock").len(),
+        before,
+        "the protected source must not reach the host"
+    );
+    harness.client.cancel().await.ok();
+
+    // With the entry the move proceeds and the prompt warns for the source.
+    let harness = connected(
+        Answer::Accept,
+        &[
+            ("WINRIG_ALLOW_FILE_OPS", "true"),
+            ("WINRIG_WRITE_ALLOW_PATHS", "C:\\ProgramData\\Vendor"),
+        ],
+    )
+    .await;
+    harness.transport.respond("NestedLink", source_scan);
+    harness
+        .transport
+        .respond("GetUnresolvedProviderPathFromPSPath", target_scan);
+    let result = harness.call(move_file_call(source, target, false)).await;
+    let message = harness.last_confirmation();
+    assert!(
+        message.contains("Warning (source): the target lies in a system directory"),
+        "{message}"
+    );
+    assert_eq!(error_of(&result), None, "{:?}", result.structured_content);
+    harness.client.cancel().await.ok();
+}
+
+/// TR-FS-10, item 3: renaming onto an existing file needs `overwrite` and uses the
+/// atomic `[IO.File]::Replace`; the prompt shows the resolved destination.
+#[tokio::test]
+async fn rename_file_replaces_atomically_and_shows_the_destination() {
+    let path = "D:\\Data\\old.txt";
+    let source_scan = r#"{"FullName":"D:\\Data\\old.txt","IsDirectory":false,"LinkType":null,"FileCount":1,"DirCount":0,"ByteCount":10,"NestedLink":false,"Truncated":false,"Unreadable":false,"Roots":{"SystemRoot":"C:\\Windows"}}"#;
+    let target_scan = r#"{"FullName":"D:\\Data\\new.txt","DotNetFullName":"D:\\Data\\new.txt","Exists":true,"IsDirectory":false,"LinkType":null,"Roots":{"SystemRoot":"C:\\Windows"}}"#;
+
+    let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_FILE_OPS", "true")]).await;
+    harness.transport.respond("NestedLink", source_scan);
+    harness
+        .transport
+        .respond("GetUnresolvedProviderPathFromPSPath", target_scan);
+    let result = harness.call(rename_file_call(path, "new.txt", true)).await;
+
+    let message = harness.last_confirmation();
+    assert_header(&message, "rename_file");
+    assert!(
+        message.contains("Resolved destination: D:\\Data\\new.txt"),
+        "{message}"
+    );
+    assert!(
+        harness.transport.saw("[IO.File]::Replace"),
+        "the overwrite must use the atomic Replace"
+    );
+    assert_eq!(error_of(&result), None, "{:?}", result.structured_content);
+    harness.client.cancel().await.ok();
+}
+
+/// TR-FS-11: a create whose shallowest missing level is outside the entry is refused
+/// before any write.
+#[tokio::test]
+async fn create_directory_refuses_a_missing_ancestor_outside_the_entry() {
+    let requested = "C:\\ProgramData\\X\\Y\\a";
+    let scan = r#"{"FullName":"C:\\ProgramData\\X\\Y\\a","DotNetFullName":"C:\\ProgramData\\X\\Y\\a","Exists":false,"IsDirectory":false,"LinkType":null,"MissingLevels":3,"TopMissing":"C:\\ProgramData\\X","Roots":{"SystemRoot":"C:\\Windows","ProgramData":"C:\\ProgramData"}}"#;
+
+    let harness = connected(
+        Answer::Accept,
+        &[
+            ("WINRIG_ALLOW_FILE_OPS", "true"),
+            ("WINRIG_WRITE_ALLOW_PATHS", "C:\\ProgramData\\X\\Y"),
+        ],
+    )
+    .await;
+    harness.transport.respond("TopMissing", scan);
+    let result = harness.call(create_directory_call(requested)).await;
+    assert!(
+        error_of(&result).is_some_and(|error| error.contains("protected")),
+        "{:?}",
+        result.structured_content
+    );
+    assert_eq!(
+        harness.elicitations(),
+        0,
+        "the server asked about a refused create"
+    );
+    assert!(
+        !harness.transport.saw("CreateDirectory"),
+        "a refused create reached the host"
+    );
+    harness.client.cancel().await.ok();
 }
 
 /// AC-FS-08, AC-SEC21-1, item 5: `delete_file` with an allowlist entry warns for a

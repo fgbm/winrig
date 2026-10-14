@@ -20,10 +20,12 @@ use crate::config::{AppConfig, ConfirmFallback};
 use crate::executor::{sanitize_body_value, sanitize_path_value, sanitize_prompt_value};
 use crate::identity::RequestIdentity;
 use crate::policy::{
-    DeleteScan, FileScan, PolicyDecision, WriteScan, decide_command, decide_command_length,
-    decide_delete_file_path, decide_delete_path, decide_delete_scan, decide_file_delete,
-    decide_host, decide_port, decide_script_size, decide_service_target, decide_tls,
-    decide_write_path, decide_write_scan,
+    DeleteScan, FileScan, PolicyDecision, SourceScan, WriteScan, decide_command,
+    decide_command_length, decide_create_directory, decide_delete_file_path, decide_delete_path,
+    decide_delete_scan, decide_file_delete, decide_file_op_source, decide_file_op_target,
+    decide_host, decide_move_volume, decide_new_name, decide_path_relation, decide_port,
+    decide_script_size, decide_service_target, decide_tls, decide_write_path, decide_write_scan,
+    is_case_only_change, same_volume,
 };
 use crate::ps;
 use crate::session::{ScriptRun, SessionRegistry, UserIdentity};
@@ -161,6 +163,14 @@ const EFFECT_SET_START_TYPE: &str = "This changes the start type. The service st
 const EFFECT_RUN_COMMAND: &str =
     "This runs an arbitrary PowerShell command on the host. You cannot undo it.";
 const EFFECT_RUN_SCRIPT: &str = "This uploads and runs an arbitrary PowerShell script, then tries to delete the file. You cannot undo it.";
+const EFFECT_COPY_FILE: &str = "This copies the file. To undo it, delete the copy.";
+const EFFECT_COPY_DIRECTORY: &str =
+    "This copies the directory and its whole content. To undo it, delete the copy.";
+const EFFECT_MOVE: &str = "This moves the object. To undo it, move it back.";
+const EFFECT_RENAME: &str =
+    "This renames the object in its own directory. To undo it, rename it back.";
+const EFFECT_CREATE_DIRECTORY: &str =
+    "This creates the directory and its missing parents. To undo it, delete the new directory.";
 
 impl WinrigServer {
     #[must_use]
@@ -189,6 +199,12 @@ impl WinrigServer {
         }
         if !config.allow_script_exec {
             router.remove_route("run_script");
+        }
+        if !config.allow_file_ops {
+            router.remove_route("copy_file");
+            router.remove_route("move_file");
+            router.remove_route("rename_file");
+            router.remove_route("create_directory");
         }
         router
     }
@@ -481,6 +497,43 @@ impl WinrigServer {
                     "error": format!("Session not found: {session_id}. Use connect first.")
                 }))
             })
+    }
+
+    /// Runs a read-only pre-scan and returns its stdout, or a ready refusal. A scan
+    /// that did not run or did not parse refuses the operation (fail-closed,
+    /// ADR-0005 §5): an unreadable answer is never "safe by default".
+    async fn pre_scan(
+        &self,
+        identity: &RequestIdentity,
+        session_id: &str,
+        command: &str,
+        tool: &str,
+    ) -> Result<String, CallToolResult> {
+        let reply = self.run_value(identity, session_id, command, tool).await;
+        Self::successful_stdout(&reply).ok_or_else(|| {
+            CallToolResult::structured(json!({
+                "error": reply
+                    .get("stderr")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| reply.get("error").and_then(serde_json::Value::as_str))
+                    .unwrap_or("The pre-scan did not return a result."),
+                "scan": reply,
+            }))
+        })
+    }
+
+    /// A scan or host answer that did not parse refuses the operation (fail-closed).
+    fn parse_refusal<T>(
+        result: Result<T, String>,
+        verb: &str,
+        raw: &str,
+    ) -> Result<T, CallToolResult> {
+        result.map_err(|error| {
+            CallToolResult::structured(json!({
+                "error": format!("{error} The tool refuses to {verb}."),
+                "scan": raw,
+            }))
+        })
     }
 }
 
@@ -1174,6 +1227,63 @@ struct DeleteDirectoryParams {
 
 fn default_5000() -> i64 {
     5000
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CopyFileParams {
+    #[schemars(description = "Session ID that connect returns.")]
+    session_id: String,
+    #[schemars(
+        description = "Absolute path of the file or the directory to copy. A path under a system directory is allowed for a copy."
+    )]
+    source: String,
+    #[schemars(
+        description = "Absolute path of the destination. The tool refuses an existing target unless overwrite is set, and it never replaces an existing directory."
+    )]
+    target: String,
+    #[schemars(description = "Replace an existing file target. The default is false.")]
+    #[serde(default)]
+    overwrite: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct MoveFileParams {
+    #[schemars(description = "Session ID that connect returns.")]
+    session_id: String,
+    #[schemars(description = "Absolute path of the file or the directory to move.")]
+    source: String,
+    #[schemars(
+        description = "Absolute path of the destination. On one volume the host renames the object. Across volumes the tool copies a file and then deletes the source; it refuses a cross-volume directory move."
+    )]
+    target: String,
+    #[schemars(description = "Replace an existing file target. The default is false.")]
+    #[serde(default)]
+    overwrite: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RenameFileParams {
+    #[schemars(description = "Session ID that connect returns.")]
+    session_id: String,
+    #[schemars(description = "Absolute path of the file or the directory to rename.")]
+    path: String,
+    #[schemars(
+        description = "New name of the last path component. Pass one file name, not a path: a separator, a reserved device name and a trailing dot or space are refused."
+    )]
+    new_name: String,
+    #[schemars(description = "Replace an existing file of the new name. The default is false.")]
+    #[serde(default)]
+    overwrite: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CreateDirectoryParams {
+    #[schemars(description = "Session ID that connect returns.")]
+    session_id: String,
+    #[schemars(
+        description = "Absolute path of the directory to create. The tool also creates each missing parent."
+    )]
+    path: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -2342,7 +2452,7 @@ impl WinrigServer {
         let safe_value = ps::escape(&params.value_name);
         let safe_data = ps::escape(&params.value_data);
         let command = format!(
-            "if (-not (Test-Path -LiteralPath '{safe_key}')) {{ New-Item -Path '{safe_key}' -Force | Out-Null }}; \
+            "if (-not (Test-Path -LiteralPath '{safe_key}')) {{ New-Item -LiteralPath '{safe_key}' -Force | Out-Null }}; \
              Set-ItemProperty -LiteralPath '{safe_key}' -Name '{safe_value}' -Value '{safe_data}' -Type {ps_type} -ErrorAction Stop; \
              $v = Get-ItemProperty -LiteralPath '{safe_key}' -Name '{safe_value}' -ErrorAction Stop; \
              [PSCustomObject]@{{ Key='{safe_key}'; Name='{safe_value}'; Value=[string]$v.'{safe_value}'; Type='{ps_type}' }} \
@@ -2411,26 +2521,6 @@ impl WinrigServer {
         if let Some(result) = self.missing_session(&identity, &params.session_id) {
             return Ok(result);
         }
-        // The plan is built entirely before the network: the size limit and an
-        // unknown encoding refuse without leaving anything on the host
-        // (TR-FS-04).
-        // Unique per call: two parallel calls to one path would otherwise share
-        // the temporary file, mix their chunks, and the first rename would take
-        // the file from under the second call. The suffix is random, not a pid
-        // with a counter: two winrig instances on different machines can get
-        // the same pid and write to one host.
-        let temp_path = format!("{}.winrig-{}.part", params.path, random_suffix());
-        let plan = match ps::write_plan(
-            &params.path,
-            &temp_path,
-            &params.content,
-            &params.encoding,
-            self.config.max_write_bytes,
-        ) {
-            Ok(plan) => plan,
-            Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
-        };
-
         // Host-side scan: the path as .NET and PowerShell resolve it, the
         // target's existence, and the host's protected roots (TR-FS-03,
         // TR-FS-06). It does not close the race, but it tells creation from
@@ -2476,6 +2566,26 @@ impl WinrigServer {
             })));
         }
         let exists = scan.exists;
+        // The chunks and the replacement reach the host as .NET calls, so they use
+        // the .NET-resolved path, not the raw request text (ADR-0017 §18).
+        // Unique per call: two parallel calls to one path would otherwise share the
+        // temporary file and the first rename would take it from the second call. The
+        // suffix is random, not a pid with a counter: two winrig instances can get the
+        // same pid.
+        let target_path = scan.dotnet_full_name.clone();
+        let temp_path = format!("{target_path}.winrig-{}.part", random_suffix());
+        // The plan is built before the confirmation: the size limit and an unknown
+        // encoding refuse without leaving anything on the host (TR-FS-04).
+        let plan = match ps::write_plan(
+            &target_path,
+            &temp_path,
+            &params.content,
+            &params.encoding,
+            self.config.max_write_bytes,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
+        };
 
         let bytes = params.content.len();
         let mut confirmation = self
@@ -2923,6 +3033,635 @@ impl WinrigServer {
             .run(&identity, &params.session_id, &command, "delete_directory")
             .await)
     }
+
+    #[tool(
+        name = "copy_file",
+        description = "Copy a file or a directory on the host. A directory copy is recursive, and the confirmation shows the file, directory and byte counts. The tool refuses an existing target unless overwrite is set, and it never replaces an existing directory. The source may be under a protected root, because a copy only reads it; the target obeys the write allowlist WINRIG_WRITE_ALLOW_PATHS and warns for a system directory or a volume root. The copy refuses a source tree that holds a symbolic link or a junction, which a recursive copy would follow. The tool reaches the host with the [IO.File] and [IO.Directory] classes, so a wildcard in a path cannot expand. A partial copy is an error, never a success. The tool can fail if the copy produces no output for 60 seconds. The server declares the tool only with WINRIG_ALLOW_FILE_OPS."
+    )]
+    async fn copy_file(
+        &self,
+        Parameters(params): Parameters<CopyFileParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let identity = self.identity(&ctx)?;
+        // ADR-0017 §12: the lexical refusal runs before any scan, so a protected
+        // target costs no host call.
+        let lexical = decide_write_path(&params.target, &self.config.write_allow_paths);
+        if !lexical.allow {
+            self.audit_refusal(&identity, "copy_file", &lexical);
+            return Ok(CallToolResult::structured(
+                json!({ "error": lexical.reason }),
+            ));
+        }
+        if let Some(result) = self.missing_session(&identity, &params.session_id) {
+            return Ok(result);
+        }
+        // The source is read-only, so a protected source is allowed (ADR-0017 §16);
+        // the scan refuses a link root and a directory tree that holds a link
+        // (ADR-0017 §17). The target obeys the write boundary (§15).
+        let raw = match self
+            .pre_scan(
+                &identity,
+                &params.session_id,
+                &ps::copy_source_scan(&params.source),
+                "copy_file",
+            )
+            .await
+        {
+            Ok(raw) => raw,
+            Err(result) => return Ok(result),
+        };
+        let source = match Self::parse_refusal(SourceScan::from_json(&raw), "copy", &raw) {
+            Ok(scan) => scan,
+            Err(result) => return Ok(result),
+        };
+        let source_decision = decide_file_op_source(
+            &source,
+            &params.source,
+            false,
+            source.is_directory,
+            &self.config.write_allow_paths,
+        );
+        if !source_decision.allow {
+            self.audit_refusal(&identity, "copy_file", &source_decision);
+            return Ok(CallToolResult::structured(json!({
+                "error": source_decision.reason,
+                "scan": raw,
+            })));
+        }
+        let relation = decide_path_relation(&params.source, &params.target, source.is_directory);
+        if !relation.allow {
+            self.audit_refusal(&identity, "copy_file", &relation);
+            return Ok(CallToolResult::structured(json!({
+                "error": relation.reason,
+            })));
+        }
+        let raw_target = match self
+            .pre_scan(
+                &identity,
+                &params.session_id,
+                &ps::write_scan(&params.target),
+                "copy_file",
+            )
+            .await
+        {
+            Ok(raw) => raw,
+            Err(result) => return Ok(result),
+        };
+        let target =
+            match Self::parse_refusal(WriteScan::from_json(&raw_target), "copy", &raw_target) {
+                Ok(scan) => scan,
+                Err(result) => return Ok(result),
+            };
+        let target_decision = decide_file_op_target(
+            &target,
+            &params.target,
+            source.is_directory,
+            params.overwrite,
+            "copy to",
+            &self.config.write_allow_paths,
+        );
+        if !target_decision.allow {
+            self.audit_refusal(&identity, "copy_file", &target_decision);
+            return Ok(CallToolResult::structured(json!({
+                "error": target_decision.reason,
+                "scan": raw_target,
+            })));
+        }
+        // A path too long for one WinRS command line refuses before the prompt. The
+        // resolved paths reach the command, so the .NET calls act on the real path.
+        let command = match ps::copy_command(
+            &source.full_name,
+            &target.dotnet_full_name,
+            params.overwrite,
+            source.is_directory,
+        ) {
+            Ok(command) => command,
+            Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
+        };
+        let action = if source.is_directory {
+            "COPY DIRECTORY"
+        } else {
+            "COPY FILE"
+        };
+        let mut confirmation = self
+            .confirmation(&identity, &params.session_id, "copy_file", action)
+            .path("Source", &params.source)
+            .path("Resolved source", &source.full_name)
+            .path("Target", &params.target)
+            .path("Resolved target", &target.full_name)
+            .field("Overwrite", if params.overwrite { "yes" } else { "no" });
+        for (label, value) in source_size_fields(&source) {
+            confirmation = confirmation.field(label, &value);
+        }
+        if let Some(class) = target_decision.class {
+            confirmation = confirmation.field("Warning", class);
+        }
+        require_confirmation!(
+            &self,
+            &ctx,
+            confirmation.effect(if source.is_directory {
+                EFFECT_COPY_DIRECTORY
+            } else {
+                EFFECT_COPY_FILE
+            })
+        );
+        if let Some(entry) = &target_decision.matched {
+            self.registry.audit_write_allow(
+                &identity.username,
+                "copy_file",
+                &target.full_name,
+                entry,
+            );
+        }
+        Ok(file_op_reply(
+            &self
+                .run_value(&identity, &params.session_id, &command, "copy_file")
+                .await,
+        ))
+    }
+
+    #[tool(
+        name = "move_file",
+        description = "Move a file or a directory on the host. By path, on one volume the host renames the object; across volumes the tool copies a file, verifies the size and then deletes the source. A mount point or a junction in a parent can turn a by-path rename into a copy, which the run-time check refuses for a directory. The tool refuses a cross-volume move of a directory, because the implied recursive delete falls under DR-6; copy the directory and delete the source in two calls. The confirmation shows the resolved source and target, the mode, the implied delete and the overwrite state. The tool refuses an existing target unless overwrite is set, and it never replaces an existing directory. The source obeys the write allowlist, because the move removes it. The tool reaches the host with the [IO.File] and [IO.Directory] classes, so a wildcard in a path cannot expand. A partial move is an error, never a success. The tool can fail if the move produces no output for 60 seconds. The server declares the tool only with WINRIG_ALLOW_FILE_OPS."
+    )]
+    async fn move_file(
+        &self,
+        Parameters(params): Parameters<MoveFileParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let identity = self.identity(&ctx)?;
+        // ADR-0017 §12: the lexical refusals run before any scan, so a protected
+        // target or source costs no host call.
+        for (path, decision) in [
+            (
+                &params.target,
+                decide_write_path(&params.target, &self.config.write_allow_paths),
+            ),
+            (
+                &params.source,
+                decide_write_path(&params.source, &self.config.write_allow_paths),
+            ),
+        ] {
+            if !decision.allow {
+                self.audit_refusal(&identity, "move_file", &decision);
+                return Ok(CallToolResult::structured(json!({
+                    "error": decision.reason,
+                    "path": path,
+                })));
+            }
+        }
+        if let Some(result) = self.missing_session(&identity, &params.session_id) {
+            return Ok(result);
+        }
+        let raw = match self
+            .pre_scan(
+                &identity,
+                &params.session_id,
+                &ps::copy_source_scan(&params.source),
+                "move_file",
+            )
+            .await
+        {
+            Ok(raw) => raw,
+            Err(result) => return Ok(result),
+        };
+        let source = match Self::parse_refusal(SourceScan::from_json(&raw), "move", &raw) {
+            Ok(scan) => scan,
+            Err(result) => return Ok(result),
+        };
+        // The move removes the source, so it obeys the write boundary and its
+        // allowlist (ADR-0017 §16, §18); a nested link does not block a rename.
+        let source_decision = decide_file_op_source(
+            &source,
+            &params.source,
+            true,
+            false,
+            &self.config.write_allow_paths,
+        );
+        if !source_decision.allow {
+            self.audit_refusal(&identity, "move_file", &source_decision);
+            return Ok(CallToolResult::structured(json!({
+                "error": source_decision.reason,
+                "scan": raw,
+            })));
+        }
+        // A change of case only names the same object, so the relation check and the
+        // target overwrite check do not apply; the move needs two steps (TR-FS-10).
+        let case_only = is_case_only_change(&params.source, &params.target);
+        if !case_only {
+            let relation =
+                decide_path_relation(&params.source, &params.target, source.is_directory);
+            if !relation.allow {
+                self.audit_refusal(&identity, "move_file", &relation);
+                return Ok(CallToolResult::structured(json!({
+                    "error": relation.reason,
+                })));
+            }
+        }
+        let raw_target = match self
+            .pre_scan(
+                &identity,
+                &params.session_id,
+                &ps::write_scan(&params.target),
+                "move_file",
+            )
+            .await
+        {
+            Ok(raw) => raw,
+            Err(result) => return Ok(result),
+        };
+        let target =
+            match Self::parse_refusal(WriteScan::from_json(&raw_target), "move", &raw_target) {
+                Ok(scan) => scan,
+                Err(result) => return Ok(result),
+            };
+        let target_decision = if case_only {
+            None
+        } else {
+            let decision = decide_file_op_target(
+                &target,
+                &params.target,
+                source.is_directory,
+                params.overwrite,
+                "move to",
+                &self.config.write_allow_paths,
+            );
+            if !decision.allow {
+                self.audit_refusal(&identity, "move_file", &decision);
+                return Ok(CallToolResult::structured(json!({
+                    "error": decision.reason,
+                    "scan": raw_target,
+                })));
+            }
+            Some(decision)
+        };
+        if !case_only {
+            let volume_decision =
+                decide_move_volume(&source.full_name, &target.full_name, source.is_directory);
+            if !volume_decision.allow {
+                self.audit_refusal(&identity, "move_file", &volume_decision);
+                return Ok(CallToolResult::structured(json!({
+                    "error": volume_decision.reason,
+                })));
+            }
+        }
+        let same = same_volume(&source.full_name, &target.full_name);
+        let command = if case_only {
+            ps::move_case_command(
+                &source.full_name,
+                &target.dotnet_full_name,
+                source.is_directory,
+                params.overwrite,
+            )
+        } else if same {
+            ps::move_rename_command(
+                &source.full_name,
+                &target.dotnet_full_name,
+                source.is_directory,
+                params.overwrite,
+            )
+        } else {
+            ps::move_copy_delete_command(
+                &source.full_name,
+                &target.dotnet_full_name,
+                params.overwrite,
+            )
+        };
+        let command = match command {
+            Ok(command) => command,
+            Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
+        };
+        let action = if source.is_directory {
+            "MOVE DIRECTORY"
+        } else {
+            "MOVE FILE"
+        };
+        let mode = if same {
+            "one volume (by path): rename"
+        } else {
+            "across volumes (by path): copy then delete the source"
+        };
+        let mut confirmation = self
+            .confirmation(&identity, &params.session_id, "move_file", action)
+            .path("Source", &params.source)
+            .path("Resolved source", &source.full_name)
+            .path("Target", &params.target)
+            .path("Resolved target", &target.full_name)
+            .field("Mode", mode)
+            .field("Overwrite", if params.overwrite { "yes" } else { "no" });
+        for (label, value) in source_size_fields(&source) {
+            confirmation = confirmation.field(label, &value);
+        }
+        // ADR-0017 §36: a protected target or a protected source (the move removes it)
+        // carries the warning line.
+        if let Some(class) = target_decision.as_ref().and_then(|decision| decision.class) {
+            confirmation = confirmation.field("Warning", class);
+        }
+        if let Some(class) = source_decision.class {
+            confirmation = confirmation.field("Warning (source)", class);
+        }
+        require_confirmation!(&self, &ctx, confirmation.effect(EFFECT_MOVE));
+        // ADR-0017 §39: the audit names the entry that permitted each protected
+        // path, the removed source and the written target.
+        for (path, entry) in [
+            (&source.full_name, &source_decision.matched),
+            (
+                &target.full_name,
+                &target_decision
+                    .as_ref()
+                    .and_then(|decision| decision.matched.clone()),
+            ),
+        ] {
+            if let Some(entry) = entry {
+                self.registry
+                    .audit_write_allow(&identity.username, "move_file", path, entry);
+            }
+        }
+        Ok(file_op_reply(
+            &self
+                .run_value(&identity, &params.session_id, &command, "move_file")
+                .await,
+        ))
+    }
+
+    #[tool(
+        name = "rename_file",
+        description = "Rename a file or a directory in its own directory. Pass one new name, not a path: a separator, a reserved device name (CON, NUL, COM1, ...) and a trailing dot or space are refused. The rename stays on one volume. The confirmation shows the resolved path, the resolved destination and the new name. The tool refuses a target that already exists unless overwrite is set, and it never replaces an existing directory; an existing file is replaced with the atomic [IO.File]::Replace. The path obeys the write allowlist. The tool reaches the host with the [IO.File] and [IO.Directory] classes, so a wildcard in a path cannot expand. The server declares the tool only with WINRIG_ALLOW_FILE_OPS."
+    )]
+    async fn rename_file(
+        &self,
+        Parameters(params): Parameters<RenameFileParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let identity = self.identity(&ctx)?;
+        // TR-FS-10: the new name is one file name, checked before any host call.
+        let name_decision = decide_new_name(&params.new_name);
+        if !name_decision.allow {
+            self.audit_refusal(&identity, "rename_file", &name_decision);
+            return Ok(CallToolResult::structured(
+                json!({ "error": name_decision.reason }),
+            ));
+        }
+        // ADR-0017 §12: the lexical refusals run before any scan, so a protected path
+        // costs no host call. The destination is the parent of the requested path
+        // plus the new name.
+        let Some(requested_target) = rename_target(&params.path, &params.new_name) else {
+            return Ok(CallToolResult::structured(json!({
+                "error": "the path has no parent directory; pass an absolute path",
+            })));
+        };
+        for (path, decision) in [
+            (
+                &params.path,
+                decide_write_path(&params.path, &self.config.write_allow_paths),
+            ),
+            (
+                &requested_target,
+                decide_write_path(&requested_target, &self.config.write_allow_paths),
+            ),
+        ] {
+            if !decision.allow {
+                self.audit_refusal(&identity, "rename_file", &decision);
+                return Ok(CallToolResult::structured(json!({
+                    "error": decision.reason,
+                    "path": path,
+                })));
+            }
+        }
+        if let Some(result) = self.missing_session(&identity, &params.session_id) {
+            return Ok(result);
+        }
+        let raw = match self
+            .pre_scan(
+                &identity,
+                &params.session_id,
+                &ps::copy_source_scan(&params.path),
+                "rename_file",
+            )
+            .await
+        {
+            Ok(raw) => raw,
+            Err(result) => return Ok(result),
+        };
+        let source = match Self::parse_refusal(SourceScan::from_json(&raw), "rename", &raw) {
+            Ok(scan) => scan,
+            Err(result) => return Ok(result),
+        };
+        let source_decision = decide_file_op_source(
+            &source,
+            &params.path,
+            true,
+            false,
+            &self.config.write_allow_paths,
+        );
+        if !source_decision.allow {
+            self.audit_refusal(&identity, "rename_file", &source_decision);
+            return Ok(CallToolResult::structured(json!({
+                "error": source_decision.reason,
+                "scan": raw,
+            })));
+        }
+        let Some(target_path) = rename_target(&source.full_name, &params.new_name) else {
+            return Ok(CallToolResult::structured(json!({
+                "error": "the path has no parent directory; pass an absolute path",
+            })));
+        };
+        // A change of case only names the same object; the two-step command handles it
+        // and the relation and target overwrite checks do not apply (TR-FS-10).
+        let case_only = is_case_only_change(&source.full_name, &target_path);
+        if !case_only {
+            let relation =
+                decide_path_relation(&source.full_name, &target_path, source.is_directory);
+            if !relation.allow {
+                self.audit_refusal(&identity, "rename_file", &relation);
+                return Ok(CallToolResult::structured(json!({
+                    "error": relation.reason,
+                })));
+            }
+        }
+        let raw_target = match self
+            .pre_scan(
+                &identity,
+                &params.session_id,
+                &ps::write_scan(&target_path),
+                "rename_file",
+            )
+            .await
+        {
+            Ok(raw) => raw,
+            Err(result) => return Ok(result),
+        };
+        let target =
+            match Self::parse_refusal(WriteScan::from_json(&raw_target), "rename", &raw_target) {
+                Ok(scan) => scan,
+                Err(result) => return Ok(result),
+            };
+        let target_decision = if case_only {
+            None
+        } else {
+            let decision = decide_file_op_target(
+                &target,
+                &target_path,
+                source.is_directory,
+                params.overwrite,
+                "rename",
+                &self.config.write_allow_paths,
+            );
+            if !decision.allow {
+                self.audit_refusal(&identity, "rename_file", &decision);
+                return Ok(CallToolResult::structured(json!({
+                    "error": decision.reason,
+                    "scan": raw_target,
+                })));
+            }
+            Some(decision)
+        };
+        let command = match if case_only {
+            ps::move_case_command(
+                &source.full_name,
+                &target_path,
+                source.is_directory,
+                params.overwrite,
+            )
+        } else {
+            ps::rename_command(
+                &source.full_name,
+                &target_path,
+                source.is_directory,
+                params.overwrite,
+            )
+        } {
+            Ok(command) => command,
+            Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
+        };
+        let mut confirmation = self
+            .confirmation(&identity, &params.session_id, "rename_file", "RENAME")
+            .path("Path", &params.path)
+            .path("Resolved", &source.full_name)
+            .path("Resolved destination", &target_path)
+            .field("New name", &params.new_name)
+            .field("Overwrite", if params.overwrite { "yes" } else { "no" });
+        if let Some(class) = target_decision.as_ref().and_then(|decision| decision.class) {
+            confirmation = confirmation.field("Warning", class);
+        }
+        if let Some(class) = source_decision.class {
+            confirmation = confirmation.field("Warning (source)", class);
+        }
+        require_confirmation!(&self, &ctx, confirmation.effect(EFFECT_RENAME));
+        for (path, entry) in [
+            (&source.full_name, &source_decision.matched),
+            (
+                &target.full_name,
+                &target_decision
+                    .as_ref()
+                    .and_then(|decision| decision.matched.clone()),
+            ),
+        ] {
+            if let Some(entry) = entry {
+                self.registry
+                    .audit_write_allow(&identity.username, "rename_file", path, entry);
+            }
+        }
+        Ok(file_op_reply(
+            &self
+                .run_value(&identity, &params.session_id, &command, "rename_file")
+                .await,
+        ))
+    }
+
+    #[tool(
+        name = "create_directory",
+        description = "Create a directory and each missing parent on the host. Every created level lies inside the write boundary, and the target obeys the write allowlist WINRIG_WRITE_ALLOW_PATHS. The confirmation shows the resolved path and the number of created levels. The tool refuses a target that already exists and creates only a missing directory. The tool reaches the host with the [IO.Directory] class, so a wildcard in a path cannot expand. The server declares the tool only with WINRIG_ALLOW_FILE_OPS."
+    )]
+    async fn create_directory(
+        &self,
+        Parameters(params): Parameters<CreateDirectoryParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let identity = self.identity(&ctx)?;
+        // ADR-0017 §12: the lexical refusal runs before any scan, so a protected
+        // target costs no host call.
+        let lexical = decide_write_path(&params.path, &self.config.write_allow_paths);
+        if !lexical.allow {
+            self.audit_refusal(&identity, "create_directory", &lexical);
+            return Ok(CallToolResult::structured(
+                json!({ "error": lexical.reason }),
+            ));
+        }
+        if let Some(result) = self.missing_session(&identity, &params.session_id) {
+            return Ok(result);
+        }
+        let raw = match self
+            .pre_scan(
+                &identity,
+                &params.session_id,
+                &ps::create_directory_scan(&params.path),
+                "create_directory",
+            )
+            .await
+        {
+            Ok(raw) => raw,
+            Err(result) => return Ok(result),
+        };
+        let target =
+            match Self::parse_refusal(WriteScan::from_json(&raw), "create a directory at", &raw) {
+                Ok(scan) => scan,
+                Err(result) => return Ok(result),
+            };
+        // TR-FS-11: an existing target is refused, and the final path and the
+        // shallowest absent level both pass the write boundary, so every created
+        // level lies inside it.
+        let top = top_missing(&raw);
+        let target_decision = decide_create_directory(
+            &target,
+            &params.path,
+            top.as_deref(),
+            &self.config.write_allow_paths,
+        );
+        if !target_decision.allow {
+            self.audit_refusal(&identity, "create_directory", &target_decision);
+            return Ok(CallToolResult::structured(json!({
+                "error": target_decision.reason,
+                "scan": raw,
+            })));
+        }
+        let command = match ps::create_directory_command(&target.dotnet_full_name) {
+            Ok(command) => command,
+            Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
+        };
+        let levels = missing_levels(&raw);
+        let mut confirmation = self
+            .confirmation(
+                &identity,
+                &params.session_id,
+                "create_directory",
+                "CREATE DIRECTORY",
+            )
+            .path("Path", &params.path)
+            .path("Resolved", &target.full_name)
+            .field("Created levels", &created_levels_label(levels));
+        if let Some(top) = &top {
+            confirmation = confirmation.path("Top level", top);
+        }
+        if let Some(class) = target_decision.class {
+            confirmation = confirmation.field("Warning", class);
+        }
+        require_confirmation!(&self, &ctx, confirmation.effect(EFFECT_CREATE_DIRECTORY));
+        if let Some(entry) = &target_decision.matched {
+            self.registry.audit_write_allow(
+                &identity.username,
+                "create_directory",
+                &target.full_name,
+                entry,
+            );
+        }
+        Ok(file_op_reply(
+            &self
+                .run_value(&identity, &params.session_id, &command, "create_directory")
+                .await,
+        ))
+    }
 }
 
 /// The service state as a plain string, so the prompt shows a word (`Running`,
@@ -2963,6 +3702,116 @@ fn old_value_label(value: &serde_json::Value) -> String {
         // a wrong assumption.
         _ => "unknown".to_owned(),
     }
+}
+
+/// The count lines of a copy or move prompt: the file, directory and byte counts of
+/// a directory source, or the size of a file (TR-SEC-21). A truncated scan names the
+/// counts as lower bounds, so the operator is not misled.
+fn source_size_fields(scan: &SourceScan) -> Vec<(&'static str, String)> {
+    if scan.is_directory {
+        let suffix = if scan.truncated {
+            " (lower bound; the scan hit its cap)"
+        } else {
+            ""
+        };
+        vec![
+            ("Files", format!("{}{suffix}", scan.file_count)),
+            ("Directories", format!("{}{suffix}", scan.dir_count)),
+            ("Bytes", format!("{}{suffix}", scan.byte_count)),
+        ]
+    } else {
+        vec![("Bytes", scan.byte_count.to_string())]
+    }
+}
+
+/// The number of directory levels a create adds, from the pre-scan. A missing field
+/// gives 0, so a wrong count never appears as a positive number.
+fn missing_levels(stdout: &str) -> i64 {
+    serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .ok()
+        .and_then(|value| {
+            value
+                .get("MissingLevels")
+                .and_then(serde_json::Value::as_i64)
+        })
+        .unwrap_or(0)
+}
+
+/// The shallowest absent directory level a create adds, from the pre-scan. It is the
+/// highest directory the call would create, and the write boundary checks it as a
+/// target (TR-FS-11).
+fn top_missing(stdout: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+    value
+        .get("TopMissing")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+}
+
+/// The reply of a modifying file operation: the host JSON of a success, or a plain
+/// error. A non-zero exit of the command (a refusal or a partial copy) is a failure,
+/// never a success (TR-FS-09/10).
+fn file_op_reply(reply: &serde_json::Value) -> CallToolResult {
+    let stdout = reply
+        .get("stdout")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    match WinrigServer::successful_stdout(reply) {
+        Some(out) => {
+            let mut value = serde_json::from_str::<serde_json::Value>(out.trim())
+                .ok()
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_else(|| json!({}));
+            if let Some(map) = value.as_object_mut() {
+                map.insert("status".to_owned(), json!("ok"));
+            }
+            CallToolResult::structured(value)
+        }
+        None => {
+            // A non-zero exit is a refusal or a partial operation. The plain error
+            // comes from the command JSON, then the stderr of the call (TR-FS-09/10).
+            let from_json = serde_json::from_str::<serde_json::Value>(stdout.trim())
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("Error")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|error| !error.is_empty())
+                        .map(str::to_owned)
+                });
+            let error = reply
+                .get("stderr")
+                .and_then(serde_json::Value::as_str)
+                .filter(|error| !error.is_empty())
+                .map(str::to_owned)
+                .or(from_json)
+                .or_else(|| {
+                    reply
+                        .get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| "The file operation failed.".to_owned());
+            CallToolResult::structured(json!({ "error": error, "output": stdout }))
+        }
+    }
+}
+
+/// The prompt label for the number of directory levels a create adds (TR-FS-11).
+fn created_levels_label(levels: i64) -> String {
+    if levels == 1 {
+        "1 level".to_owned()
+    } else {
+        format!("{levels} levels")
+    }
+}
+
+/// The parent directory of the resolved path plus a new name. The host resolved
+/// path is used, so the check and the call agree.
+fn rename_target(resolved: &str, new_name: &str) -> Option<String> {
+    let parent = resolved.rsplit_once(['\\', '/']).map(|(head, _)| head)?;
+    (!parent.is_empty()).then(|| format!("{parent}\\{new_name}"))
 }
 
 /// The size and the modification time of a scanned file, in the invariant format
@@ -3165,6 +4014,210 @@ mod tests {
         assert!(names.iter().any(|name| name == "run_script"));
         assert_eq!(names.len(), 44, "expected 44 tools with run_script");
         assert!(on.tool_router.has_route("run_script"));
+    }
+
+    /// TR-FS-08, AC-FS-13: the four file operations are not advertised while the
+    /// flag is off, and each has no route. Enabling them adds exactly four tools.
+    #[test]
+    fn file_ops_are_absent_until_the_operator_enables_them() {
+        let off = server_with(&[]);
+        let names: Vec<String> = off
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        for tool in ["copy_file", "move_file", "rename_file", "create_directory"] {
+            assert!(
+                !names.iter().any(|name| name == tool),
+                "{tool} must not be advertised while disabled"
+            );
+            assert!(
+                !off.tool_router.has_route(tool),
+                "{tool} must have no route"
+            );
+        }
+        assert_eq!(
+            names.len(),
+            43,
+            "expected 43 tools without the file operations"
+        );
+
+        let on = server_with(&[("WINRIG_ALLOW_FILE_OPS", "true")]);
+        let names: Vec<String> = on
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        for tool in ["copy_file", "move_file", "rename_file", "create_directory"] {
+            assert!(names.iter().any(|name| name == tool), "{tool} is missing");
+            assert!(on.tool_router.has_route(tool), "{tool} has no route");
+        }
+        assert_eq!(
+            names.len(),
+            47,
+            "expected 47 tools with the file operations"
+        );
+    }
+
+    /// AC-FS-10: the confirmation of a directory copy shows the file, directory
+    /// and byte counts from the scan; a file copy shows the size.
+    #[test]
+    fn copy_file_shows_the_counts() {
+        let directory = SourceScan {
+            full_name: "D:\\Data\\tree".to_owned(),
+            is_directory: true,
+            link_type: None,
+            nested_link: false,
+            truncated: false,
+            unreadable: false,
+            file_count: 3,
+            dir_count: 2,
+            byte_count: 4096,
+            roots: crate::policy::HostRoots::default(),
+        };
+        let fields = source_size_fields(&directory);
+        assert_eq!(
+            fields,
+            vec![
+                ("Files", "3".to_owned()),
+                ("Directories", "2".to_owned()),
+                ("Bytes", "4096".to_owned()),
+            ]
+        );
+        let prompt = Confirmation::new("copy_file", "COPY DIRECTORY", "host1", "contoso\\alice")
+            .path("Source", "D:\\Data\\tree")
+            .path("Target", "D:\\Backup\\tree")
+            .field("Overwrite", "no")
+            .field(fields[0].0, &fields[0].1)
+            .field(fields[1].0, &fields[1].1)
+            .field(fields[2].0, &fields[2].1)
+            .render();
+        assert!(prompt.contains("Files: 3"), "{prompt}");
+        assert!(prompt.contains("Directories: 2"), "{prompt}");
+        assert!(prompt.contains("Bytes: 4096"), "{prompt}");
+
+        // A copy of one file names its size, not the tree counts.
+        let file = SourceScan {
+            is_directory: false,
+            byte_count: 12,
+            ..directory
+        };
+        assert_eq!(source_size_fields(&file), vec![("Bytes", "12".to_owned())]);
+        // A truncated scan names the counts as lower bounds.
+        let big = SourceScan {
+            is_directory: true,
+            truncated: true,
+            ..file
+        };
+        assert!(source_size_fields(&big)[0].1.contains("lower bound"));
+    }
+
+    /// AC-FS-10, ADR-0017 §15: an existing directory target is refused before the
+    /// network, with or without `overwrite`.
+    #[test]
+    fn copy_refuses_a_directory_overwrite() {
+        let target = "D:\\Backup\\logs";
+        let scan = WriteScan {
+            full_name: target.to_owned(),
+            dotnet_full_name: target.to_owned(),
+            exists: true,
+            is_directory: true,
+            link_type: None,
+            roots: crate::policy::HostRoots::default(),
+        };
+        for overwrite in [false, true] {
+            let decision = decide_file_op_target(&scan, target, true, overwrite, "copy to", &[]);
+            assert!(!decision.allow, "overwrite={overwrite}");
+            assert_eq!(decision.code, "PATH_IS_DIRECTORY");
+        }
+    }
+
+    /// AC-FS-11, ADR-0017 §18: a cross-volume move of a directory is refused; a file
+    /// across volumes and anything on one volume is allowed.
+    #[test]
+    fn cross_volume_directory_move_is_refused() {
+        let decision = decide_move_volume("C:\\Data\\dir", "D:\\Data\\dir", true);
+        assert!(!decision.allow, "{}", decision.reason);
+        assert_eq!(decision.code, "CROSS_VOLUME_MOVE");
+        assert!(decide_move_volume("C:\\Data\\a.txt", "D:\\Data\\a.txt", false).allow);
+        assert!(decide_move_volume("C:\\Data\\dir", "C:\\Data\\dir2", true).allow);
+    }
+
+    /// AC-FS-12, TR-FS-11: the create-directory confirmation shows the number of
+    /// created levels, and every created level lies under the resolved path.
+    #[test]
+    fn create_directory_shows_the_created_levels() {
+        assert_eq!(created_levels_label(1), "1 level");
+        assert_eq!(created_levels_label(3), "3 levels");
+        let prompt = Confirmation::new(
+            "create_directory",
+            "CREATE DIRECTORY",
+            "host1",
+            "contoso\\alice",
+        )
+        .path("Path", "C:\\Data\\a\\b\\c")
+        .path("Resolved", "C:\\Data\\a\\b\\c")
+        .field("Created levels", &created_levels_label(3))
+        .render();
+        assert!(prompt.contains("Created levels: 3 levels"), "{prompt}");
+
+        let raw = r#"{"FullName":"C:\\Data\\a\\b\\c","DotNetFullName":"C:\\Data\\a\\b\\c","Exists":false,"IsDirectory":false,"LinkType":null,"MissingLevels":3,"TopMissing":"C:\\Data\\a","Roots":{"SystemRoot":"C:\\Windows"}}"#;
+        assert_eq!(missing_levels(raw), 3);
+        assert_eq!(missing_levels("not json"), 0);
+        assert_eq!(top_missing(raw).as_deref(), Some("C:\\Data\\a"));
+        assert_eq!(top_missing("not json"), None);
+
+        // A rename derives its target from the resolved path plus the new name.
+        assert_eq!(
+            rename_target("C:\\Data\\old.txt", "new.txt").as_deref(),
+            Some("C:\\Data\\new.txt")
+        );
+        assert_eq!(rename_target("old.txt", "new.txt"), None);
+    }
+
+    /// TR-FS-09/10, item 7: a command with a non-zero exit is a failure, and its JSON
+    /// carries the counts and a plain error; a zero exit with JSON is a success.
+    #[test]
+    fn file_op_reply_reports_a_partial_copy_as_an_error() {
+        let partial = json!({
+            "status_code": 1,
+            "stdout": "{\"Mode\":\"directory\",\"Total\":5,\"Copied\":2,\"Error\":\"the target may be partial: access denied\"}",
+            "stderr": "",
+        });
+        let value = file_op_reply(&partial)
+            .structured_content
+            .expect("structured");
+        assert!(
+            value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|error| error.contains("may be partial")),
+            "{value}"
+        );
+        assert!(
+            value
+                .get("output")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|out| out.contains("\"Copied\":2")),
+            "{value}"
+        );
+
+        let done = json!({
+            "status_code": 0,
+            "stdout": "{\"Mode\":\"file\",\"Total\":1,\"Copied\":1,\"Error\":\"\"}",
+            "stderr": "",
+        });
+        let value = file_op_reply(&done).structured_content.expect("structured");
+        assert_eq!(
+            value.get("status").and_then(serde_json::Value::as_str),
+            Some("ok")
+        );
+        assert_eq!(
+            value.get("Copied").and_then(serde_json::Value::as_i64),
+            Some(1)
+        );
     }
 
     /// TR-EXE-06, AC-EXE-07: a script above the byte limit is refused before the
@@ -3413,17 +4466,22 @@ mod tests {
         assert!(tools.iter().any(|tool| tool.name == "delete_directory"));
         assert!(tools.iter().any(|tool| tool.name == "run_command"));
         assert!(tools.iter().any(|tool| tool.name == "run_script"));
+        assert!(tools.iter().any(|tool| tool.name == "copy_file"));
+        assert!(tools.iter().any(|tool| tool.name == "move_file"));
+        assert!(tools.iter().any(|tool| tool.name == "rename_file"));
+        assert!(tools.iter().any(|tool| tool.name == "create_directory"));
         // An exact count: "at least 30" would catch neither a lost tool nor a
         // duplicate. These are all declared tools; the configuration decides
-        // how many the agent sees (TR-FS-01, TR-EXE-01, TR-EXE-05), and
+        // how many the agent sees (TR-FS-01, TR-FS-08, TR-EXE-01, TR-EXE-05), and
         // `write_file_is_absent_until_the_operator_enables_it`,
+        // `file_ops_are_absent_until_the_operator_enables_them`,
         // `run_command_is_absent_until_the_operator_enables_it` and
         // `run_script_is_absent_until_the_operator_enables_it` check that.
-        assert_eq!(tools.len(), 46, "expected 46 declared tools");
+        assert_eq!(tools.len(), 50, "expected 50 declared tools");
         let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 46, "tool names must be unique");
+        assert_eq!(names.len(), 50, "tool names must be unique");
     }
 
     #[test]
@@ -3435,10 +4493,14 @@ mod tests {
         let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         names.sort_unstable();
         for expected in [
+            "copy_file",
+            "create_directory",
             "delete_directory",
             "delete_file",
             "flush_dns",
             "kill_process",
+            "move_file",
+            "rename_file",
             "restart_service",
             "run_command",
             "run_script",
@@ -3479,6 +4541,11 @@ mod tests {
             EFFECT_SET_START_TYPE,
             EFFECT_RUN_COMMAND,
             EFFECT_RUN_SCRIPT,
+            EFFECT_COPY_FILE,
+            EFFECT_COPY_DIRECTORY,
+            EFFECT_MOVE,
+            EFFECT_RENAME,
+            EFFECT_CREATE_DIRECTORY,
         ] {
             assert!(!effect.is_empty(), "an effect line is empty");
             assert!(

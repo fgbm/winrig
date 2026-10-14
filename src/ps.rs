@@ -181,22 +181,25 @@ pub fn write_commit(temp_path: &str, path: &str, encoding: &str) -> Result<Strin
         ));
     }
     let safe_temp = escape(temp_path);
-    let safe_path = escape(path);
+    // The `-Destination` parameter expands a wildcard, so the replacement uses the
+    // `[IO.File]` class instead (ADR-0017 §18).
     let Some(dotnet) = dotnet_encoding(&key) else {
+        let replace = replace_target_command(temp_path, path);
         return Ok(format!(
-            "Move-Item -LiteralPath '{safe_temp}' -Destination '{safe_path}' -Force -ErrorAction Stop; \
-             Write-Output 'File written successfully'"
+            "{replace}; Write-Output 'File written successfully'"
         ));
     };
     // The conversion goes into a second temporary file, and only then the
     // target is replaced by a rename. Writing straight to the target would
     // truncate it first, and a failure at this step would leave a truncated
     // file in place of the real one (TR-FS-05).
-    let safe_staged = escape(&format!("{temp_path}.enc"));
+    let staged = format!("{temp_path}.enc");
+    let safe_staged = escape(&staged);
+    let replace = replace_target_command(&staged, path);
     Ok(format!(
         "$text = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes('{safe_temp}')); \
          [IO.File]::WriteAllText('{safe_staged}', $text, {dotnet}); \
-         Move-Item -LiteralPath '{safe_staged}' -Destination '{safe_path}' -Force -ErrorAction Stop; \
+         {replace}; \
          Remove-Item -LiteralPath '{safe_temp}' -Force -ErrorAction SilentlyContinue; \
          Write-Output 'File written successfully'"
     ))
@@ -605,6 +608,363 @@ pub fn delete_directory_scan(path: &str, limit: i64) -> String {
          FileCount=$files.Count; DirCount=$dirs.Count; TotalItems=($files.Count + $dirs.Count); {HOST_ROOTS} }} \
          | ConvertTo-Json -Compress"
     )
+}
+
+/// The item cap of the pre-scan of a directory source (ADR-0017 §17).
+///
+/// A larger tree reports lower-bound counts with `Truncated`, so the prompt stays
+/// bounded. The copy command re-checks the tree, its link content and the copied
+/// count, so a truncated pre-scan cannot hide an incomplete copy.
+pub const COPY_SCAN_ITEM_CAP: usize = 20_000;
+
+/// The refusal for a file-operation command that cannot fit one WinRS command line.
+fn fit_or_error(command: String) -> Result<String, String> {
+    if fits_command_line(&command) {
+        Ok(command)
+    } else {
+        Err(format!(
+            "the path is too long; a file-operation command must fit one WinRS command line of \
+             {WINRS_COMMAND_LINE_LIMIT} characters; shorten the source or the target"
+        ))
+    }
+}
+
+/// The pre-scan of a file-operation source: the link type, the counts of a directory
+/// tree, the presence of a nested link and the host roots (ADR-0017 §16–17).
+///
+/// `Get-Item -ErrorAction Stop` refuses a missing source. A directory source is
+/// walked to the item cap; a larger tree reports `Truncated` true and the counts as
+/// lower bounds. `LinkType` is the final component and `NestedLink` marks a link
+/// anywhere in the tree, which a recursive copy would follow.
+#[must_use]
+pub fn copy_source_scan(path: &str) -> String {
+    let safe = escape(path);
+    let cap = COPY_SCAN_ITEM_CAP;
+    let over = cap + 1;
+    format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $item = Get-Item -LiteralPath '{safe}' -Force -ErrorAction Stop; \
+         $isDir = [bool]$item.PSIsContainer; \
+         $files = 0; $dirs = 0; $bytes = 0; $nested = $false; $trunc = $false; $unread = $false; \
+         if ($isDir) {{ \
+         $all = @(Get-ChildItem -LiteralPath '{safe}' -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable walkErr | Select-Object -First {over}); \
+         $unread = [bool]($walkErr.Count); \
+         $trunc = [bool]($all.Count -gt {cap}); \
+         if ($trunc) {{ $all = @($all | Select-Object -First {cap}) }}; \
+         $fileItems = @($all | Where-Object {{ -not $_.PSIsContainer }}); \
+         $files = $fileItems.Count; \
+         $dirs = @($all | Where-Object {{ $_.PSIsContainer }}).Count; \
+         $bytes = [long](($fileItems | Measure-Object -Property Length -Sum).Sum); \
+         $nested = [bool](@($all | Where-Object {{ $_.LinkType }}).Count -gt 0) \
+         }} else {{ \
+         $files = 1; $bytes = [long]$item.Length \
+         }}; \
+         [PSCustomObject]@{{ FullName=$item.FullName; IsDirectory=$isDir; LinkType=$item.LinkType; \
+         FileCount=$files; DirCount=$dirs; ByteCount=$bytes; NestedLink=$nested; Truncated=$trunc; Unreadable=$unread; {HOST_ROOTS} }} \
+         | ConvertTo-Json -Compress"
+    )
+}
+
+/// The PowerShell boolean literal for a confirmation flag.
+fn ps_bool(value: bool) -> &'static str {
+    if value { "$true" } else { "$false" }
+}
+
+/// Replaces a target file with a source file without a wildcard-aware parameter
+/// (ADR-0017 §18).
+///
+/// The `-Destination` parameter of `Move-Item` and `Copy-Item` expands a wildcard,
+/// so `C:\[W]indows\x` would reach `System32`. `[IO.File]::Replace` and
+/// `[IO.File]::Move` act on the literal path. `Replace` needs an existing target,
+/// so a missing target uses `Move`.
+fn replace_target_command(from: &str, to: &str) -> String {
+    let safe_from = escape(from);
+    let safe_to = escape(to);
+    // `[NullString]::Value` passes a typed null to the `string` backup parameter;
+    // a bare `$null` becomes `""`, which `File.Replace` rejects.
+    format!(
+        "if ([IO.File]::Exists('{safe_to}')) {{ [IO.File]::Replace('{safe_from}', '{safe_to}', [NullString]::Value) }} \
+         else {{ [IO.File]::Move('{safe_from}', '{safe_to}') }}"
+    )
+}
+
+/// The copy of a file or a directory (TR-FS-09, ADR-0017 §17).
+///
+/// The command repeats the safety checks before it writes: the source must not be a
+/// name surrogate, its kind must match the confirmation, the target must not be an
+/// existing directory or a name surrogate, and without `overwrite` the target must not
+/// exist. A directory tree is walked once; a name surrogate anywhere in it is refused,
+/// because a recursive walk would follow it. The copy uses the `[IO.File]` and
+/// `[IO.Directory]` classes, whose parameters do not expand a wildcard. On a partial
+/// failure the command returns `copied`, `total` and a plain `error`, and it exits
+/// non-zero, so a partial copy is never reported as success.
+///
+/// # Errors
+///
+/// An error text when the command cannot fit one WinRS command line.
+pub fn copy_command(
+    source: &str,
+    target: &str,
+    overwrite: bool,
+    is_directory: bool,
+) -> Result<String, String> {
+    let safe_src = escape(source);
+    let safe_tgt = escape(target);
+    let expect = ps_bool(is_directory);
+    let ow = ps_bool(overwrite);
+    let mode = if is_directory { "directory" } else { "file" };
+    let body = if is_directory {
+        format!(
+            "$items = @(Get-ChildItem -LiteralPath '{safe_src}' -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable walkErr); \
+             if ($walkErr.Count) {{ throw 'Refusing to copy: the source tree is not fully readable; a copy would be partial' }}; \
+             if (@($items | Where-Object {{ $_.LinkType }}).Count -gt 0) {{ throw 'Refusing to copy: the source tree contains a symbolic link or a junction' }}; \
+             $total = @($items | Where-Object {{ -not $_.PSIsContainer }}).Count; \
+             $writing = $true; \
+             [IO.Directory]::CreateDirectory('{safe_tgt}') | Out-Null; \
+             foreach ($it in $items) {{ \
+             $rel = $it.FullName.Substring($s.FullName.Length).TrimStart('\\'); \
+             $dst = [IO.Path]::Combine('{safe_tgt}', $rel); \
+             if ($it.PSIsContainer) {{ [IO.Directory]::CreateDirectory($dst) | Out-Null }} \
+             else {{ [IO.File]::Copy($it.FullName, $dst, {ow}) | Out-Null; $copied++ }} \
+             }}; \
+             if ($copied -ne $total) {{ throw \"the copy is incomplete: $copied of $total files\" }}"
+        )
+    } else {
+        format!(
+            "$writing = $true; \
+             $total = 1; \
+             [IO.File]::Copy($s.FullName, '{safe_tgt}', {ow}) | Out-Null; \
+             $copied = 1; \
+             if ((Get-Item -LiteralPath '{safe_tgt}' -Force).Length -ne $s.Length) {{ throw 'the copied file is not the same size as the source' }}"
+        )
+    };
+    fit_or_error(format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $err = ''; $copied = 0; $total = 0; $writing = $false; \
+         try {{ \
+         $s = Get-Item -LiteralPath '{safe_src}' -Force -ErrorAction Stop; \
+         if ($s.LinkType) {{ throw 'Refusing to copy: the source is a symbolic link or a junction' }}; \
+         if ([bool]$s.PSIsContainer -ne {expect}) {{ throw 'the source is not the kind the confirmation showed; the tool refuses' }}; \
+         $t = $null; if (Test-Path -LiteralPath '{safe_tgt}') {{ $t = Get-Item -LiteralPath '{safe_tgt}' -Force -ErrorAction Stop }}; \
+         if ($t) {{ \
+         if ($t.PSIsContainer) {{ throw 'the target is an existing directory; delete it first with delete_directory' }}; \
+         if ($t.LinkType) {{ throw 'the target is a symbolic link or a junction; the tool refuses' }}; \
+         if (-not {ow}) {{ throw 'the target already exists; pass overwrite=true to replace it' }} \
+         }}; \
+         {body} \
+         }} catch {{ if ($writing) {{ $err = 'the target may be partial: ' + $_.Exception.Message }} else {{ $err = $_.Exception.Message }} }}; \
+         [PSCustomObject]@{{ Mode='{mode}'; Total=$total; Copied=$copied; Error=$err }} | ConvertTo-Json -Compress; \
+         if ($err) {{ exit 1 }}"
+    ))
+}
+
+/// The same-volume move of a file or a directory (ADR-0017 §18).
+///
+/// `[IO.File]::Move` and `[IO.Directory]::Move` act on the literal path and stay on
+/// one volume. An existing file target needs `overwrite`, and the replacement uses
+/// the atomic `[IO.File]::Replace`; an existing directory target is refused in all
+/// cases. The command refuses a name surrogate and a source whose kind changed.
+///
+/// # Errors
+///
+/// An error text when the command cannot fit one WinRS command line.
+pub fn move_rename_command(
+    source: &str,
+    target: &str,
+    is_directory: bool,
+    overwrite: bool,
+) -> Result<String, String> {
+    move_item_command(source, target, is_directory, overwrite)
+}
+
+/// The rename of the last path component inside its own directory (TR-FS-10,
+/// ADR-0017 §19). The operation is the same same-volume move, so the command is
+/// shared with [`move_rename_command`].
+///
+/// # Errors
+///
+/// An error text when the command cannot fit one WinRS command line.
+pub fn rename_command(
+    source: &str,
+    target: &str,
+    is_directory: bool,
+    overwrite: bool,
+) -> Result<String, String> {
+    move_item_command(source, target, is_directory, overwrite)
+}
+
+/// The shared same-volume move command for `move_file` and `rename_file`.
+fn move_item_command(
+    source: &str,
+    target: &str,
+    is_directory: bool,
+    overwrite: bool,
+) -> Result<String, String> {
+    let safe_src = escape(source);
+    let safe_tgt = escape(target);
+    let expect = ps_bool(is_directory);
+    let ow = ps_bool(overwrite);
+    let action = if is_directory {
+        format!("[IO.Directory]::Move($s.FullName, '{safe_tgt}')")
+    } else {
+        // `[NullString]::Value` keeps the `string` backup parameter typed; a bare
+        // `$null` becomes `""` and `File.Replace` rejects it.
+        format!(
+            "if ($t) {{ if (-not {ow}) {{ throw 'the target already exists; pass overwrite=true to replace it' }}; \
+             [IO.File]::Replace($s.FullName, '{safe_tgt}', [NullString]::Value) }} \
+             else {{ [IO.File]::Move($s.FullName, '{safe_tgt}') }}"
+        )
+    };
+    fit_or_error(format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $s = Get-Item -LiteralPath '{safe_src}' -Force -ErrorAction Stop; \
+         if ($s.LinkType) {{ throw 'Refusing to move: the source is a symbolic link or a junction' }}; \
+         if ([bool]$s.PSIsContainer -ne {expect}) {{ throw 'the source is not the kind the confirmation showed; the tool refuses' }}; \
+         $t = $null; if (Test-Path -LiteralPath '{safe_tgt}') {{ $t = Get-Item -LiteralPath '{safe_tgt}' -Force -ErrorAction Stop }}; \
+         if ($t) {{ \
+         if ($t.PSIsContainer) {{ throw 'the target is an existing directory; the tool does not replace a directory' }}; \
+         if ($t.LinkType) {{ throw 'the target is a symbolic link or a junction; the tool refuses' }} \
+         }}; \
+         {action}; \
+         if (Test-Path -LiteralPath '{safe_src}') {{ throw 'the source still exists after the move' }}; \
+         Write-Output 'Moved'"
+    ))
+}
+
+/// The same-volume move for a change of case only (`a.txt` → `A.txt`), TR-FS-10.
+///
+/// `[IO.File]::Move` and `[IO.Directory]::Move` treat a case-only target as the same
+/// object and refuse, so the move goes through a unique temporary name in the same
+/// directory. The command does not re-read the source path afterwards: `Test-Path` is
+/// case-insensitive and would report the renamed object as still present. The
+/// overwrite flag does not apply, because the target is the same object.
+///
+/// # Errors
+///
+/// An error text when the command cannot fit one WinRS command line.
+pub fn move_case_command(
+    source: &str,
+    target: &str,
+    is_directory: bool,
+    overwrite: bool,
+) -> Result<String, String> {
+    let safe_src = escape(source);
+    let safe_tgt = escape(target);
+    let expect = ps_bool(is_directory);
+    let ow = ps_bool(overwrite);
+    let move_class = if is_directory {
+        "[IO.Directory]::Move"
+    } else {
+        "[IO.File]::Move"
+    };
+    fit_or_error(format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $s = Get-Item -LiteralPath '{safe_src}' -Force -ErrorAction Stop; \
+         if ($s.LinkType) {{ throw 'Refusing to move: the source is a symbolic link or a junction' }}; \
+         if ([bool]$s.PSIsContainer -ne {expect}) {{ throw 'the source is not the kind the confirmation showed; the tool refuses' }}; \
+         $t = $null; if (Test-Path -LiteralPath '{safe_tgt}') {{ $t = Get-Item -LiteralPath '{safe_tgt}' -Force -ErrorAction Stop }}; \
+         if ($t -and -not $s.FullName.Equals($t.FullName, [StringComparison]::Ordinal)) {{ \
+         if ($t.PSIsContainer) {{ throw 'the target is an existing directory; the tool does not replace a directory' }}; \
+         if ($t.LinkType) {{ throw 'the target is a symbolic link or a junction; the tool refuses' }}; \
+         if (-not {ow}) {{ throw 'the target already exists; pass overwrite=true to replace it' }} \
+         }}; \
+         $tmp = [IO.Path]::Combine([IO.Path]::GetDirectoryName($s.FullName), '.winrig-' + [Guid]::NewGuid().ToString('N') + '.tmp'); \
+         {move_class}($s.FullName, $tmp); {move_class}($tmp, '{safe_tgt}'); \
+         Write-Output 'Moved'"
+    ))
+}
+
+/// The cross-volume move of a file: copy, verify the size, then delete (TR-FS-10).
+///
+/// The delete falls under DR-6, so the command refuses a directory at run time (a
+/// change between the confirmation and the call cannot turn a file move into a
+/// recursive delete), and it deletes the source only when the copied length matches.
+/// The copy uses `[IO.File]::Copy`, whose path does not expand a wildcard. The result
+/// carries `copied`, `total` and a plain `error`: a failed copy names a partial
+/// target, a failed delete names two remaining copies, and the exit code is non-zero.
+///
+/// # Errors
+///
+/// An error text when the command cannot fit one WinRS command line.
+pub fn move_copy_delete_command(
+    source: &str,
+    target: &str,
+    overwrite: bool,
+) -> Result<String, String> {
+    let safe_src = escape(source);
+    let safe_tgt = escape(target);
+    let ow = ps_bool(overwrite);
+    fit_or_error(format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $err = ''; $copied = 0; $total = 1; $phase = 'copy'; \
+         try {{ \
+         $s = Get-Item -LiteralPath '{safe_src}' -Force -ErrorAction Stop; \
+         if ($s.LinkType) {{ throw 'Refusing to move: the source is a symbolic link or a junction' }}; \
+         if ($s.PSIsContainer) {{ throw 'Refusing a cross-volume move of a directory; copy it and delete the source in two calls' }}; \
+         $t = $null; if (Test-Path -LiteralPath '{safe_tgt}') {{ $t = Get-Item -LiteralPath '{safe_tgt}' -Force -ErrorAction Stop }}; \
+         if ($t) {{ \
+         if ($t.PSIsContainer) {{ throw 'the target is an existing directory; delete it first with delete_directory' }}; \
+         if ($t.LinkType) {{ throw 'the target is a symbolic link or a junction; the tool refuses' }}; \
+         if (-not {ow}) {{ throw 'the target already exists; pass overwrite=true to replace it' }} \
+         }}; \
+         $before = [long]$s.Length; \
+         [IO.File]::Copy($s.FullName, '{safe_tgt}', {ow}) | Out-Null; \
+         $after = [long](Get-Item -LiteralPath '{safe_tgt}' -Force).Length; \
+         if ($after -ne $before) {{ throw 'Refusing to delete the source: the copy is not complete' }}; \
+         $phase = 'delete'; \
+         [IO.File]::Delete($s.FullName); \
+         if (Test-Path -LiteralPath '{safe_src}') {{ throw 'the source still exists after the move' }}; \
+         $copied = 1 \
+         }} catch {{ if ($phase -eq 'delete') {{ $err = 'the copy is complete but the source was not deleted; both copies remain: ' + $_.Exception.Message }} else {{ $err = 'the target may be partial: ' + $_.Exception.Message }} }}; \
+         [PSCustomObject]@{{ Mode='file'; Total=$total; Copied=$copied; Error=$err }} | ConvertTo-Json -Compress; \
+         if ($err) {{ exit 1 }}"
+    ))
+}
+
+/// The pre-scan of a `create_directory` target: the path, the directory flag, the
+/// link type, the count and the top of the created levels and the host roots
+/// (TR-FS-11).
+///
+/// The count walks up from the resolved path while a level is absent, so the prompt
+/// names the number of directories the tool will add. `TopMissing` is the shallowest
+/// absent level: it is the highest directory the call would create, and the caller
+/// checks it against the strict-descendant rule of the write boundary.
+#[must_use]
+pub fn create_directory_scan(path: &str) -> String {
+    let safe = escape(path);
+    format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath('{safe}'); \
+         $net = [IO.Path]::GetFullPath('{safe}'); \
+         $exists = [bool](Test-Path -LiteralPath '{safe}'); \
+         $it = if ($exists) {{ Get-Item -LiteralPath '{safe}' -Force -ErrorAction Stop }} else {{ $null }}; \
+         $levels = 0; $top = ''; $cur = $full; \
+         while ($cur -and -not (Test-Path -LiteralPath $cur)) {{ $levels++; $top = $cur; $cur = Split-Path -Parent $cur }}; \
+         [PSCustomObject]@{{ FullName=$full; DotNetFullName=$net; Exists=$exists; \
+         IsDirectory=[bool]($it -and $it.PSIsContainer); LinkType=if ($it) {{ $it.LinkType }} else {{ $null }}; \
+         MissingLevels=$levels; TopMissing=$top; {HOST_ROOTS} }} | ConvertTo-Json -Compress"
+    )
+}
+
+/// The creation of a directory and its missing parents (TR-FS-11, ADR-0017 §20).
+///
+/// `[IO.Directory]::CreateDirectory` creates the parents and acts on the literal
+/// path, so a wildcard in the path cannot expand. An existing file or directory is a
+/// refusal: the tool creates only a missing directory.
+///
+/// # Errors
+///
+/// An error text when the command cannot fit one WinRS command line.
+pub fn create_directory_command(path: &str) -> Result<String, String> {
+    let safe = escape(path);
+    fit_or_error(format!(
+        "$ErrorActionPreference = 'Stop'; \
+         if ([IO.File]::Exists('{safe}')) {{ throw 'the path is an existing file; the tool creates only a missing directory' }}; \
+         if ([IO.Directory]::Exists('{safe}')) {{ throw 'the directory already exists; the tool creates only a missing directory' }}; \
+         [IO.Directory]::CreateDirectory('{safe}') | Out-Null; \
+         if (-not [IO.Directory]::Exists('{safe}')) {{ throw 'the directory was not created' }}; \
+         Write-Output 'Created'"
+    ))
 }
 
 /// Clamps a number into the inclusive range `low`..=`high`.
@@ -1779,7 +2139,7 @@ pub fn get_certificates(store: &str, days_until_expiry: i64) -> Result<String, S
         String::new()
     };
     Ok(format!(
-        "Get-ChildItem -Path 'Cert:\\{st}\\My' -ErrorAction Stop {expiry_filter}\
+        "Get-ChildItem -LiteralPath 'Cert:\\{st}\\My' -ErrorAction Stop {expiry_filter}\
          | Select-Object @{{N='Subject';E={{$_.Subject.Substring(0,[Math]::Min($_.Subject.Length,80))}}}}, \
          @{{N='Expires';E={{$_.NotAfter.ToString('yyyy-MM-dd')}}}}, \
          @{{N='DaysLeft';E={{[math]::Round(($_.NotAfter-(Get-Date)).TotalDays)}}}}, Thumbprint \
@@ -4565,7 +4925,11 @@ mod tests {
     #[test]
     fn commit_renames_for_utf8_and_converts_otherwise() {
         let utf8 = write_commit("C:\\Temp\\p", "C:\\out.txt", "utf8").expect("valid");
-        assert!(utf8.contains("Move-Item"), "{utf8}");
+        assert!(utf8.contains("[IO.File]::Move("), "{utf8}");
+        assert!(
+            !utf8.contains("Move-Item"),
+            "the wildcard-aware parameter must not carry the target: {utf8}"
+        );
         assert!(!utf8.contains("Text.Encoding"), "byte-exact: {utf8}");
 
         let unicode = write_commit("C:\\Temp\\p", "C:\\out.txt", "unicode").expect("valid");
@@ -4584,8 +4948,12 @@ mod tests {
                 "{encoding} writes the target in place: {command}"
             );
             assert!(
-                command.contains("Move-Item"),
-                "{encoding} must replace the target by rename: {command}"
+                command.contains("[IO.File]::Move(") || command.contains("[IO.File]::Replace("),
+                "{encoding} must replace the target by a file move: {command}"
+            );
+            assert!(
+                !command.contains("Move-Item"),
+                "{encoding} must not use a wildcard-aware destination: {command}"
             );
         }
     }
@@ -4621,7 +4989,7 @@ mod tests {
         assert!(plan[0].contains("WriteAllBytes"));
         assert!(plan[1].contains("Append"));
         assert!(plan[2].contains("Append"));
-        assert!(plan[3].contains("Move-Item"));
+        assert!(plan[3].contains("[IO.File]::Move("));
     }
 
     /// TR-FS-04: the limit is checked before the network and the refusal names
@@ -4641,7 +5009,7 @@ mod tests {
         let plan = write_plan("C:\\out.txt", "C:\\out.part", "", "utf8", 64 * 1024).expect("valid");
         assert_eq!(plan.len(), 2, "{plan:#?}");
         assert!(plan[0].contains("WriteAllBytes"));
-        assert!(plan[1].contains("Move-Item"));
+        assert!(plan[1].contains("[IO.File]::Move("));
     }
 
     /// The size counts bytes, not characters: Cyrillic is twice as long in
@@ -4685,7 +5053,9 @@ mod tests {
         assert!(!plan[0].contains("Append"), "{}", plan[0]);
         assert!(plan[1].contains("Append"), "{}", plan[1]);
         assert!(
-            !plan.iter().any(|step| step.contains("Move-Item")),
+            !plan
+                .iter()
+                .any(|step| step.contains("Move-Item") || step.contains("[IO.File]::Move(")),
             "the staging write must not rename: {plan:#?}"
         );
     }
@@ -4914,6 +5284,15 @@ mod tests {
             write_scan(text),
             delete_file_scan(text),
             delete_directory_scan(text, 10),
+            copy_source_scan(text),
+            copy_command(text, text, false, false).expect("valid"),
+            copy_command(text, text, true, true).expect("valid"),
+            move_rename_command(text, text, false, false).expect("valid"),
+            move_rename_command(text, text, true, true).expect("valid"),
+            move_copy_delete_command(text, text, false).expect("valid"),
+            rename_command(text, text, false, false).expect("valid"),
+            create_directory_scan(text),
+            create_directory_command(text).expect("valid"),
             run_command(text).expect("valid"),
             script_temp_path(text),
             run_script_file(text, &script_sha256(text)).expect("valid"),
@@ -5301,5 +5680,240 @@ mod tests {
                 command_line_chars(&command)
             );
         }
+    }
+
+    /// AC-FS-11: on one volume `move_file` renames the object with `[IO.File]::Move`,
+    /// re-checks the source kind and link and never uses a wildcard-aware parameter.
+    #[test]
+    fn move_file_renames_on_one_volume() {
+        let command =
+            move_rename_command("C:\\Data\\a.txt", "C:\\Data\\b.txt", false, false).expect("valid");
+        assert!(
+            command.contains("[IO.File]::Move($s.FullName, 'C:\\Data\\b.txt')"),
+            "{command}"
+        );
+        assert!(!command.contains("Move-Item"), "{command}");
+        assert!(!command.contains("-Destination"), "{command}");
+        assert!(
+            command.contains("$s.LinkType"),
+            "the command must re-check the source link: {command}"
+        );
+        assert!(
+            command.contains("[bool]$s.PSIsContainer -ne $false"),
+            "the command must re-check the source kind: {command}"
+        );
+        let dir = move_rename_command("C:\\Data\\d", "C:\\Data\\e", true, false).expect("valid");
+        assert!(
+            dir.contains("[IO.Directory]::Move($s.FullName, 'C:\\Data\\e')"),
+            "{dir}"
+        );
+        // An existing file target needs `overwrite` and uses the atomic `Replace`.
+        let over = move_rename_command("C:\\a", "C:\\b", false, true).expect("valid");
+        assert!(
+            over.contains("[IO.File]::Replace($s.FullName, 'C:\\b', [NullString]::Value)"),
+            "{over}"
+        );
+        let no_over = move_rename_command("C:\\a", "C:\\b", false, false).expect("valid");
+        assert!(no_over.contains("pass overwrite=true"), "{no_over}");
+    }
+
+    /// AC-FS-11: across volumes a file is copied with `[IO.File]::Copy`, its size is
+    /// verified, and only then the source is deleted; a directory is refused at run
+    /// time and a partial result is reported, never as success.
+    #[test]
+    fn move_file_copies_and_deletes_a_file_across_volumes() {
+        let command =
+            move_copy_delete_command("C:\\Data\\a.txt", "D:\\Data\\a.txt", false).expect("valid");
+        let copy_at = command.find("[IO.File]::Copy").expect("copy");
+        let check_at = command.find("$after -ne $before").expect("size check");
+        let delete_at = command.find("[IO.File]::Delete").expect("delete");
+        assert!(
+            copy_at < check_at && check_at < delete_at,
+            "the delete must follow the verified copy: {command}"
+        );
+        assert!(
+            command.contains("if ($s.PSIsContainer) { throw"),
+            "a directory must be refused at run time: {command}"
+        );
+        assert!(command.contains("the target may be partial"), "{command}");
+        assert!(command.contains("both copies remain"), "{command}");
+        assert!(command.contains("if ($err) { exit 1 }"), "{command}");
+        assert!(!command.contains("Copy-Item"), "{command}");
+        assert!(!command.contains("-Destination"), "{command}");
+    }
+
+    /// AC-FS-11, ADR-0017 §19: `rename_file` moves inside its own directory with
+    /// `[IO.File]::Move`, replaces an existing target atomically with
+    /// `[IO.File]::Replace`, and offers no wildcard-aware parameter.
+    #[test]
+    fn rename_file_changes_the_last_component() {
+        let command =
+            rename_command("C:\\Data\\old.txt", "C:\\Data\\new.txt", false, false).expect("valid");
+        assert!(
+            command.contains("[IO.File]::Move($s.FullName, 'C:\\Data\\new.txt')"),
+            "{command}"
+        );
+        assert!(!command.contains("-Destination"), "{command}");
+        assert!(!command.contains("Rename-Item"), "{command}");
+        let over =
+            rename_command("C:\\Data\\old.txt", "C:\\Data\\new.txt", false, true).expect("valid");
+        assert!(
+            over.contains(
+                "[IO.File]::Replace($s.FullName, 'C:\\Data\\new.txt', [NullString]::Value)"
+            ),
+            "{over}"
+        );
+        let dir = rename_command("C:\\Data\\old", "C:\\Data\\new", true, true).expect("valid");
+        assert!(
+            dir.contains("[IO.Directory]::Move($s.FullName, 'C:\\Data\\new')"),
+            "{dir}"
+        );
+    }
+
+    /// TR-FS-10: a change of case only (`a.txt` → `A.txt`) moves through a unique
+    /// temporary name, because the two-step avoids the `File.Move` case collision and
+    /// the case-insensitive `Test-Path` of the source.
+    #[test]
+    fn move_case_command_uses_a_temporary_name() {
+        let command =
+            move_case_command("D:\\Data\\a.txt", "D:\\Data\\A.txt", false, false).expect("valid");
+        assert!(
+            command.contains("[IO.File]::Move($s.FullName, $tmp)"),
+            "{command}"
+        );
+        assert!(
+            command.contains("[IO.File]::Move($tmp, 'D:\\Data\\A.txt')"),
+            "{command}"
+        );
+        assert!(command.contains("[Guid]::NewGuid"), "{command}");
+        assert!(
+            !command.contains("Test-Path -LiteralPath 'D:\\Data\\a.txt'"),
+            "a case-only move must not re-read the source path: {command}"
+        );
+        // A directory uses the directory class on both steps.
+        let dir = move_case_command("D:\\Data\\Old", "D:\\Data\\OLD", true, false).expect("valid");
+        assert!(
+            dir.contains("[IO.Directory]::Move($s.FullName, $tmp)"),
+            "{dir}"
+        );
+        assert!(
+            dir.contains("[IO.Directory]::Move($tmp, 'D:\\Data\\OLD')"),
+            "{dir}"
+        );
+    }
+
+    /// TR-FS-09, item 2: the directory copy refuses an unreadable tree before the
+    /// first write; the pre-scan collects the walk errors in `Unreadable`.
+    #[test]
+    fn copy_command_refuses_an_unreadable_tree_before_the_first_write() {
+        let command =
+            copy_command("D:\\Data\\logs", "E:\\Backup\\logs", false, true).expect("valid");
+        let walk_err = command
+            .find("-ErrorVariable walkErr")
+            .expect("the walk collects its errors");
+        let throw = command
+            .find("the source tree is not fully readable")
+            .expect("the walk error throws");
+        let first_write = command
+            .find("[IO.Directory]::CreateDirectory('E:\\Backup\\logs')")
+            .expect("the write");
+        assert!(
+            walk_err < throw && throw < first_write,
+            "the unreadable check must precede the first write: {command}"
+        );
+
+        let scan = copy_source_scan("D:\\Data\\logs");
+        assert!(scan.contains("-ErrorVariable walkErr"), "{scan}");
+        assert!(scan.contains("Unreadable=$unread"), "{scan}");
+    }
+
+    /// AC-FS-12, ADR-0017 §20: `create_directory` makes the final directory and the
+    /// missing parents with `[IO.Directory]::CreateDirectory`, and the scan counts the
+    /// levels and names the shallowest one.
+    #[test]
+    fn create_directory_makes_the_missing_parents() {
+        let command = create_directory_command("C:\\Data\\a\\b\\c").expect("valid");
+        assert!(
+            command.contains("[IO.Directory]::CreateDirectory('C:\\Data\\a\\b\\c')"),
+            "{command}"
+        );
+        assert!(!command.contains("New-Item"), "{command}");
+        assert!(!command.contains("-Path '"), "{command}");
+        let scan = create_directory_scan("C:\\Data\\a\\b\\c");
+        assert!(scan.contains("MissingLevels=$levels"), "{scan}");
+        assert!(scan.contains("TopMissing=$top"), "{scan}");
+        assert!(scan.contains("Split-Path -Parent $cur"), "{scan}");
+    }
+
+    /// Every file-operation command fits one WinRS command line for a long path, and
+    /// a path too long for the line is refused before the transport.
+    #[test]
+    fn file_operation_commands_fit_the_winrs_line() {
+        let long = format!("C:\\{}", "d".repeat(120));
+        for command in [
+            copy_command(&long, &long, true, true).expect("valid"),
+            move_rename_command(&long, &long, true, false).expect("valid"),
+            move_copy_delete_command(&long, &long, true).expect("valid"),
+            rename_command(&long, &long, true, false).expect("valid"),
+            create_directory_command(&long).expect("valid"),
+        ] {
+            assert!(
+                command_line_chars(&command) < WINRS_COMMAND_LINE_LIMIT,
+                "{}",
+                command_line_chars(&command)
+            );
+        }
+        let over = format!("C:\\{}", "d".repeat(3_500));
+        assert!(copy_command(&over, &over, false, false).is_err());
+    }
+
+    /// ADR-0017 §18: a user path never reaches a wildcard-aware parameter. Only
+    /// `-LiteralPath` may carry it; `-Destination` and `-Path` expand a wildcard, so
+    /// `C:\[W]indows\x` would reach `System32`. The `[IO.File]` and `[IO.Directory]`
+    /// classes act on the literal path.
+    #[test]
+    fn no_generator_passes_a_user_path_to_a_wildcard_parameter() {
+        let mut hits = Vec::new();
+        for command in every_generator_command("x") {
+            for needle in ["-Destination '", "-Path '"] {
+                if command.contains(needle) {
+                    hits.push(format!("{needle} in: {command}"));
+                }
+            }
+            // A path-item cmdlet followed directly by a quoted path is positional and
+            // wildcard-aware; the literal form is the only permitted one.
+            for cmdlet in [
+                "Copy-Item",
+                "Move-Item",
+                "Rename-Item",
+                "New-Item",
+                "Remove-Item",
+                "Set-Content",
+                "Get-Content",
+            ] {
+                if command.contains(&format!("{cmdlet} '")) {
+                    hits.push(format!("{cmdlet} with a positional path in: {command}"));
+                }
+            }
+        }
+        assert!(hits.is_empty(), "{}", hits.join("\n\n"));
+    }
+
+    /// A bare `$null` becomes `""` in a .NET `string` parameter, and
+    /// `File.Replace` rejects an empty backup name; `[NullString]::Value` keeps the
+    /// null typed (TR-FS-05, TR-FS-10).
+    #[test]
+    fn no_generator_passes_a_bare_null_to_a_net_call() {
+        let mut hits = Vec::new();
+        for command in every_generator_command("x") {
+            if command.contains(", $null)") {
+                hits.push(command);
+            }
+        }
+        assert!(
+            hits.is_empty(),
+            "a bare $null reaches a .NET call:\n{}",
+            hits.join("\n\n")
+        );
     }
 }

@@ -919,6 +919,465 @@ pub fn decide_overwrite(path: &str, exists: bool, overwrite: bool) -> PolicyDeci
     }
 }
 
+/// These values belong to devices, not files, in every directory (TR-FS-10).
+///
+/// A file name equal to one of these, with or without an extension, is refused: the
+/// host would ignore the part after it and reach the device instead (for example
+/// `NUL.txt` writes into the null device).
+pub const RESERVED_NAMES: [&str; 32] = [
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "CONIN$",
+    "CONOUT$",
+    "COM0",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "COM\u{00b9}",
+    "COM\u{00b2}",
+    "COM\u{00b3}",
+    "LPT0",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+    "LPT\u{00b9}",
+    "LPT\u{00b2}",
+    "LPT\u{00b3}",
+];
+
+/// A value such as `CON` or `COM1` names a device in every directory, with or
+/// without an extension (TR-FS-10).
+///
+/// The base before the first dot is compared after its trailing spaces are dropped,
+/// because Win32 ignores them: `NUL .txt` reaches the null device.
+#[must_use]
+pub fn is_reserved_new_name(name: &str) -> bool {
+    let base = name.split('.').next().unwrap_or(name).trim_end();
+    RESERVED_NAMES
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(base))
+}
+
+/// The refusal text of `rename_file` states this grammar (DR-8).
+pub const NEW_NAME_FORM: &str = "one file name without a directory separator, a reserved device name (CON, NUL, COM1, ...), a trailing dot or space, or any of < > : \" / \\ | ? *";
+
+/// Verdict on the new name of `rename_file` (TR-FS-10, ADR-0017 §19).
+///
+/// The tool changes the last path component, so the name must be a name and not a
+/// path: a separator, a `.`/`..` component, a device name, an invalid character, a
+/// trailing dot or space, and a wildcard are all refused before the network.
+#[must_use]
+pub fn decide_new_name(name: &str) -> PolicyDecision {
+    if name.is_empty() {
+        return PolicyDecision::deny(
+            "the new name is empty; pass one file name".to_owned(),
+            "RENAME_NAME_INVALID",
+        );
+    }
+    let invalid_char = name.chars().any(|c| {
+        c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+    });
+    if name == "." || name == ".." || invalid_char || name.ends_with(['.', ' ']) {
+        return PolicyDecision::deny(
+            format!("the new name {name:?} is not valid; expected {NEW_NAME_FORM}"),
+            "RENAME_NAME_INVALID",
+        );
+    }
+    if short_name_component(name).is_some() {
+        return PolicyDecision::deny(
+            format!(
+                "the new name {name:?} has an 8.3 component; pass the long name so it can be \
+                 compared against the protected paths"
+            ),
+            "RENAME_NAME_INVALID",
+        );
+    }
+    if is_reserved_new_name(name) {
+        return PolicyDecision::deny(
+            format!("the new name {name:?} is a reserved device name; expected {NEW_NAME_FORM}"),
+            "RENAME_NAME_INVALID",
+        );
+    }
+    PolicyDecision::allow("the new name is one valid file name")
+}
+
+/// The volume a path sits on: `C:` for a drive path, `\\SERVER\SHARE` for a UNC path.
+///
+/// The value is the normalized, case-folded root, so two paths on one volume compare
+/// equal (ADR-0017 §18). A relative path and a bare drive letter give `None`, and the
+/// caller then treats the move as cross-volume.
+#[must_use]
+pub fn volume_of(path: &str) -> Option<String> {
+    let norm = normalize_windows_path(path);
+    let bytes = norm.as_bytes();
+    if bytes.len() >= 3 && bytes[0].is_ascii_uppercase() && bytes[1] == b':' && bytes[2] == b'\\' {
+        return Some(norm[..2].to_owned());
+    }
+    let rest = norm.strip_prefix("\\\\")?;
+    let mut parts = rest.split('\\');
+    let server = parts.next().unwrap_or_default();
+    let share = parts.next().unwrap_or_default();
+    (!server.is_empty() && !share.is_empty()).then(|| format!("\\\\{server}\\{share}"))
+}
+
+/// Two paths on one drive or on one UNC share sit on one volume; an undetermined
+/// volume is never equal to another (ADR-0017 §18).
+#[must_use]
+pub fn same_volume(source: &str, target: &str) -> bool {
+    match (volume_of(source), volume_of(target)) {
+        (Some(from), Some(to)) => from == to,
+        _ => false,
+    }
+}
+
+/// Verdict on the volume relation of `move_file` (TR-FS-10, ADR-0017 §18).
+///
+/// One volume renames the object. Across volumes a file is copied and then deleted;
+/// a directory is refused, because the implied recursive delete falls under DR-6 and
+/// a partial move would leave two trees. The operator copies the directory and deletes
+/// the source with two calls.
+#[must_use]
+pub fn decide_move_volume(source: &str, target: &str, is_directory: bool) -> PolicyDecision {
+    let same = same_volume(source, target);
+    if is_directory && !same {
+        return PolicyDecision::deny(
+            "the tool refuses a cross-volume move of a directory: the implied recursive delete \
+             falls under DR-6 (ADR-0017 §18). Copy the directory and delete the source with two \
+             calls."
+                .to_owned(),
+            "CROSS_VOLUME_MOVE",
+        );
+    }
+    if same {
+        PolicyDecision::allow("the move stays on one volume and renames the object")
+    } else {
+        PolicyDecision::allow("the move crosses volumes and copies then deletes the source")
+    }
+}
+
+/// Verdict on a `create_directory` target (TR-FS-11, ADR-0017 §20).
+///
+/// An existing file or directory is refused with a clear message: the tool creates
+/// only a missing directory. Otherwise the final path and the shallowest absent level
+/// (`top_missing`) pass the write boundary, because every created level must lie
+/// inside it. The strict-descendant rule of the boundary applies to the shallowest
+/// level, so a created ancestor outside an allowlist entry is refused.
+#[must_use]
+pub fn decide_create_directory(
+    scan: &WriteScan,
+    requested: &str,
+    top_missing: Option<&str>,
+    allowed: &[String],
+) -> PolicyDecision {
+    if scan.exists {
+        let kind = if scan.is_directory {
+            "directory"
+        } else {
+            "file"
+        };
+        return PolicyDecision::deny(
+            format!(
+                "the {kind} {requested} already exists; create_directory creates only a missing \
+                 directory"
+            ),
+            "TARGET_EXISTS",
+        );
+    }
+    let boundary = decide_write_boundary(
+        requested,
+        &[&scan.full_name, &scan.dotnet_full_name],
+        &scan.roots,
+        scan.link_type.as_deref(),
+        false,
+        "create a directory at",
+        allowed,
+    );
+    if !boundary.allow {
+        return boundary;
+    }
+    let Some(top) = top_missing.filter(|top| *top != requested) else {
+        return boundary;
+    };
+    let top_decision = boundary_decide(
+        top,
+        &[top],
+        &scan.roots,
+        None,
+        false,
+        "create a directory at",
+        allowed,
+    );
+    if !top_decision.allow {
+        return top_decision;
+    }
+    match (&boundary.matched, &top_decision.matched) {
+        (None, Some(entry)) => PolicyDecision::allow("the created levels are inside the allowlist")
+            .allowed_by(entry.clone(), top_decision.class),
+        _ => boundary,
+    }
+}
+
+/// True when two paths name the same object in a different case, so a move is a
+/// case-only rename and needs two steps (TR-FS-10).
+///
+/// The comparison uses the normalized paths, so `a.txt` and `A.TXT` are one object;
+/// the raw strings must differ, or it is the same path and not a rename.
+#[must_use]
+pub fn is_case_only_change(source: &str, target: &str) -> bool {
+    let from = normalize_windows_path(source);
+    let to = normalize_windows_path(target);
+    !from.is_empty() && from == to && source != target
+}
+
+/// Verdict on the relation of a file-operation source and target (TR-FS-09/10).
+///
+/// A copy or a move onto the same path, into the source's own subtree, or (for a
+/// directory) out of the target's subtree would recurse or overwrite the source in a
+/// way the run-time checks cannot make safe. The comparison uses the normalized and
+/// case-folded paths.
+#[must_use]
+pub fn decide_path_relation(source: &str, target: &str, is_directory: bool) -> PolicyDecision {
+    let from = normalize_windows_path(source);
+    let to = normalize_windows_path(target);
+    if from.is_empty() || to.is_empty() {
+        return PolicyDecision::allow("the relation cannot be decided from an empty path");
+    }
+    if from == to {
+        return PolicyDecision::deny(
+            "the tool refuses the operation: the source and the target are the same path"
+                .to_owned(),
+            "SAME_PATH",
+        );
+    }
+    if to.starts_with(&format!("{from}\\")) {
+        return PolicyDecision::deny(
+            "the tool refuses the operation: the target is inside the source".to_owned(),
+            "TARGET_INSIDE_SOURCE",
+        );
+    }
+    if is_directory && from.starts_with(&format!("{to}\\")) {
+        return PolicyDecision::deny(
+            "the tool refuses the operation: the source is inside the target".to_owned(),
+            "SOURCE_INSIDE_TARGET",
+        );
+    }
+    PolicyDecision::allow("the source and the target are separate")
+}
+
+/// Result of the pre-scan of a source of a file operation, from the host (ADR-0017
+/// §16–20).
+///
+/// The counts describe a directory source for the prompt; a file source reports one
+/// file and its length in `byte_count`. `nested_link` marks a symbolic link or a
+/// junction anywhere in the subtree, which a recursive copy would follow. `truncated`
+/// marks a tree larger than the scan cap, so the counts are lower bounds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceScan {
+    /// Canonical path returned by the host.
+    pub full_name: String,
+    pub is_directory: bool,
+    /// `LinkType` of the final component (ADR-0017 §10).
+    pub link_type: Option<String>,
+    /// The subtree holds a symbolic link or a junction (ADR-0017 §17).
+    pub nested_link: bool,
+    /// The scan hit the item cap, so the counts are lower bounds.
+    pub truncated: bool,
+    /// The walk of a directory source reported an error, so the tree is not fully
+    /// readable and a recursive copy would be partial.
+    pub unreadable: bool,
+    pub file_count: i64,
+    pub dir_count: i64,
+    /// Sum of the file lengths under the source, or the length of a file source.
+    pub byte_count: i64,
+    pub roots: HostRoots,
+}
+
+impl SourceScan {
+    ///
+    /// # Errors
+    ///
+    /// Error text if the answer is not a JSON object or lacks the mandatory fields
+    /// `FullName`, `IsDirectory`, `NestedLink`, `Truncated`, `Unreadable`, and `Roots`
+    /// with a non-empty `SystemRoot` (fail-closed). `LinkType` is optional.
+    pub fn from_json(raw: &str) -> Result<Self, String> {
+        let object = scan_object(raw)?;
+        Ok(Self {
+            full_name: required_str(&object, "FullName")?,
+            is_directory: required_bool(&object, "IsDirectory")?,
+            link_type: optional_str(&object, "LinkType"),
+            nested_link: required_bool(&object, "NestedLink")?,
+            truncated: required_bool(&object, "Truncated")?,
+            unreadable: required_bool(&object, "Unreadable")?,
+            file_count: object
+                .get("FileCount")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
+            dir_count: object
+                .get("DirCount")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
+            byte_count: object
+                .get("ByteCount")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
+            roots: HostRoots::from_scan(&object)?,
+        })
+    }
+}
+
+/// Verdict on the source of a file operation (TR-FS-09, TR-FS-10).
+///
+/// A copy reads the source, so a source under a protected root is allowed (§16). The
+/// source is still refused when it is a device volume path, an 8.3 name or a name
+/// surrogate, because the tool would act on the link target. A directory source that
+/// holds a name surrogate is refused when the operation recurses (`reject_nested_link`),
+/// because a recursive copy would follow it. A move or a rename removes the source, so
+/// `removes_source` makes the source obey the write boundary and its allowlist.
+#[must_use]
+pub fn decide_file_op_source(
+    scan: &SourceScan,
+    requested: &str,
+    removes_source: bool,
+    reject_nested_link: bool,
+    allowed: &[String],
+) -> PolicyDecision {
+    let verb = if removes_source { "move" } else { "copy" };
+    for candidate in std::iter::once(requested).chain([scan.full_name.as_str()]) {
+        if let Some(refusal) = refuse_device_volume(candidate, requested, verb) {
+            return refusal;
+        }
+        if let Some(refusal) = refuse_short_name(candidate, requested, verb) {
+            return refusal;
+        }
+    }
+    if is_name_surrogate(scan.link_type.as_deref()) {
+        return PolicyDecision::deny(
+            format!(
+                "the tool refuses to {verb} {requested:?}: the source is a symbolic link or a \
+                 junction, and the operation would act on its target. Pass the real source path."
+            ),
+            "PATH_REPARSE_POINT",
+        );
+    }
+    if reject_nested_link && scan.is_directory && scan.nested_link {
+        return PolicyDecision::deny(
+            format!(
+                "the tool refuses to {verb} {requested:?}: the source tree contains a symbolic \
+                 link or a junction, and a recursive copy would follow it. Remove the link, or use \
+                 run_command."
+            ),
+            "NESTED_REPARSE_POINT",
+        );
+    }
+    if reject_nested_link && scan.is_directory && scan.unreadable {
+        return PolicyDecision::deny(
+            format!(
+                "the tool refuses to {verb} {requested:?}: the source tree is not fully readable, \
+                 and a recursive copy would be partial. Check the access rights, or use \
+                 run_command."
+            ),
+            "SOURCE_UNREADABLE",
+        );
+    }
+    if removes_source {
+        return boundary_decide(
+            requested,
+            &[&scan.full_name],
+            &scan.roots,
+            None,
+            false,
+            verb,
+            allowed,
+        );
+    }
+    PolicyDecision::allow("the source is read-only")
+}
+
+/// Overwrite verdict of a file operation target (TR-FS-08, ADR-0017 §15).
+///
+/// A missing target is allowed. A directory source never replaces an existing target:
+/// the operator deletes it first with `delete_directory`, which carries the DR-6
+/// protection. A file target exists only with `overwrite`.
+#[must_use]
+pub fn decide_file_op_overwrite(
+    path: &str,
+    exists: bool,
+    source_is_directory: bool,
+    overwrite: bool,
+) -> PolicyDecision {
+    if !exists {
+        return PolicyDecision::allow("the target does not exist");
+    }
+    if source_is_directory {
+        return PolicyDecision::deny(
+            format!(
+                "the tool refuses {path:?}: the target already exists and a directory copy does \
+                 not replace an existing target. Delete the target first with delete_directory."
+            ),
+            "FILE_EXISTS",
+        );
+    }
+    if !overwrite {
+        return PolicyDecision::deny(
+            format!("{path} already exists; pass overwrite=true to replace it"),
+            "FILE_EXISTS",
+        );
+    }
+    PolicyDecision::allow("the target may be replaced")
+}
+
+/// Verdict on the target of `copy_file`, `move_file` or `create_directory`
+/// (TR-FS-08, ADR-0017 §15–16).
+///
+/// The target obeys the write boundary and the operator allowlist, exactly as
+/// `write_file`; the entry that permitted a protected target travels on the decision
+/// for the warning line and the audit. An existing directory target is refused by the
+/// boundary, and an existing file target is refused without `overwrite`.
+#[must_use]
+pub fn decide_file_op_target(
+    scan: &WriteScan,
+    requested: &str,
+    source_is_directory: bool,
+    overwrite: bool,
+    verb: &str,
+    allowed: &[String],
+) -> PolicyDecision {
+    let boundary = decide_write_boundary(
+        requested,
+        &[&scan.full_name, &scan.dotnet_full_name],
+        &scan.roots,
+        scan.link_type.as_deref(),
+        scan.is_directory,
+        verb,
+        allowed,
+    );
+    if !boundary.allow {
+        return boundary;
+    }
+    let decision = decide_file_op_overwrite(requested, scan.exists, source_is_directory, overwrite);
+    if !decision.allow {
+        return decision;
+    }
+    match boundary.matched {
+        Some(entry) => decision.allowed_by(entry, boundary.class),
+        None => decision,
+    }
+}
+
 /// Fail-closed: an unreadable answer is a refusal reason, not "safe by default".
 fn scan_object(raw: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     let value: serde_json::Value = serde_json::from_str(raw.trim())
@@ -1135,6 +1594,31 @@ pub fn decide_write_boundary(
     verb: &str,
     allowed: &[String],
 ) -> PolicyDecision {
+    boundary_decide(
+        requested,
+        resolutions,
+        roots,
+        link_type,
+        is_directory,
+        verb,
+        allowed,
+    )
+}
+
+/// The shared body of [`decide_write_boundary`] with the directory rule as a flag.
+///
+/// The write-side tools (`write_file`, the target of a copy or a move) refuse a
+/// directory target; a move checks its source, which may be a directory, so it calls
+/// this function with `reject_directory` false.
+fn boundary_decide(
+    requested: &str,
+    resolutions: &[&str],
+    roots: &HostRoots,
+    link_type: Option<&str>,
+    reject_directory: bool,
+    verb: &str,
+    allowed: &[String],
+) -> PolicyDecision {
     for candidate in std::iter::once(requested).chain(resolutions.iter().copied()) {
         if let Some(refusal) = refuse_device_volume(candidate, requested, verb) {
             return refusal;
@@ -1152,7 +1636,7 @@ pub fn decide_write_boundary(
             "PATH_REPARSE_POINT",
         );
     }
-    if is_directory {
+    if reject_directory {
         return PolicyDecision::deny(
             format!(
                 "the tool refuses to {verb} {requested:?}: the target is a directory. Pass a file \
@@ -2779,5 +3263,303 @@ mod tests {
             decide_delete_scan(&scan, "C:\\ProgramData\\Vendor", 5000).code,
             "PATH_PROTECTED"
         );
+    }
+
+    fn win_scan(full: &str, exists: bool, is_directory: bool) -> WriteScan {
+        WriteScan {
+            full_name: full.to_owned(),
+            dotnet_full_name: full.to_owned(),
+            exists,
+            is_directory,
+            link_type: None,
+            roots: HostRoots::default(),
+        }
+    }
+
+    fn source_scan(full: &str, is_directory: bool) -> SourceScan {
+        SourceScan {
+            full_name: full.to_owned(),
+            is_directory,
+            link_type: None,
+            nested_link: false,
+            truncated: false,
+            unreadable: false,
+            file_count: 3,
+            dir_count: 2,
+            byte_count: 100,
+            roots: HostRoots::default(),
+        }
+    }
+
+    /// AC-FS-10: an existing file target needs `overwrite`; a second copy without the
+    /// flag is refused `FILE_EXISTS`, and with the flag it passes.
+    #[test]
+    fn copy_refuses_an_existing_target_without_overwrite() {
+        let target = "D:\\Backup\\a.txt";
+        let scan = win_scan(target, true, false);
+        let refused = decide_file_op_target(&scan, target, false, false, "copy to", &[]);
+        assert!(!refused.allow, "{}", refused.reason);
+        assert_eq!(refused.code, "FILE_EXISTS");
+        assert!(decide_file_op_target(&scan, target, false, true, "copy to", &[]).allow);
+        // No flag is needed when the target path is free.
+        let missing = win_scan(target, false, false);
+        assert!(decide_file_op_target(&missing, target, true, false, "copy to", &[]).allow);
+    }
+
+    /// AC-FS-10, ADR-0017 §15: an existing directory target is refused in all cases,
+    /// with or without `overwrite`, because the boundary rejects a directory target.
+    #[test]
+    fn copy_refuses_a_directory_overwrite_before_the_network() {
+        let target = "D:\\Backup\\logs";
+        let scan = win_scan(target, true, true);
+        for overwrite in [false, true] {
+            let decision = decide_file_op_target(&scan, target, true, overwrite, "copy to", &[]);
+            assert!(!decision.allow, "overwrite={overwrite}");
+            assert_eq!(decision.code, "PATH_IS_DIRECTORY");
+        }
+    }
+
+    /// TR-FS-09, ADR-0017 §16: a copy reads the source, so a source under a protected
+    /// root is allowed, while the target still needs the allowlist.
+    #[test]
+    fn copy_source_may_be_under_a_protected_root() {
+        let source = "C:\\Windows\\Logs\\app.log";
+        let scan = source_scan(source, false);
+        assert!(
+            decide_file_op_source(&scan, source, false, false, &[]).allow,
+            "a read-only source under a protected root must be allowed"
+        );
+
+        let target = "C:\\ProgramData\\Vendor\\app.log";
+        let protected = roots(&[("ProgramData", "C:\\ProgramData")]);
+        let scan = win_scan(target, false, false);
+        let scan = WriteScan {
+            roots: protected,
+            ..scan
+        };
+        assert_eq!(
+            decide_file_op_target(&scan, target, false, false, "copy to", &[]).code,
+            "PATH_PROTECTED"
+        );
+        assert!(
+            decide_file_op_target(
+                &scan,
+                target,
+                false,
+                false,
+                "copy to",
+                &paths(&["C:\\ProgramData\\Vendor"])
+            )
+            .allow
+        );
+    }
+
+    /// TR-FS-09, ADR-0017 §17: a directory source that holds a name surrogate is
+    /// refused, because `Copy-Item -Recurse` would follow it; a move that does not
+    /// recurse is not blocked by a nested link.
+    #[test]
+    fn copy_source_tree_with_a_nested_link_is_refused() {
+        let source = "D:\\Data\\tree";
+        let linked = SourceScan {
+            nested_link: true,
+            ..source_scan(source, true)
+        };
+        assert_eq!(
+            decide_file_op_source(&linked, source, false, true, &[]).code,
+            "NESTED_REPARSE_POINT"
+        );
+        assert!(decide_file_op_source(&linked, source, false, false, &[]).allow);
+
+        let link = SourceScan {
+            link_type: Some("Junction".to_owned()),
+            is_directory: false,
+            ..source_scan(source, false)
+        };
+        assert_eq!(
+            decide_file_op_source(&link, source, false, true, &[]).code,
+            "PATH_REPARSE_POINT"
+        );
+    }
+
+    /// TR-FS-09, item 2: a recursive copy refuses a directory source whose tree is not
+    /// fully readable; a move that does not recurse is not blocked by it.
+    #[test]
+    fn copy_source_tree_that_is_unreadable_is_refused() {
+        let source = "D:\\Data\\tree";
+        let unreadable = SourceScan {
+            unreadable: true,
+            ..source_scan(source, true)
+        };
+        let refused = decide_file_op_source(&unreadable, source, false, true, &[]);
+        assert!(!refused.allow, "{}", refused.reason);
+        assert_eq!(refused.code, "SOURCE_UNREADABLE");
+        assert!(decide_file_op_source(&unreadable, source, false, false, &[]).allow);
+    }
+
+    /// TR-FS-10, item 4: a case-only change names the same object, so it is a rename
+    /// and not the same path.
+    #[test]
+    fn case_only_change_is_detected() {
+        assert!(is_case_only_change("D:\\Data\\a.txt", "D:\\Data\\A.txt"));
+        assert!(is_case_only_change("D:\\Data\\A.TXT", "D:\\Data\\a.txt"));
+        assert!(!is_case_only_change("D:\\Data\\a.txt", "D:\\Data\\a.txt"));
+        assert!(!is_case_only_change("D:\\Data\\a.txt", "D:\\Data\\b.txt"));
+        assert!(!is_case_only_change("D:\\Data\\a.txt", "D:\\Other\\A.txt"));
+        assert!(!is_case_only_change("", "D:\\Data\\a.txt"));
+    }
+
+    /// AC-FS-11, ADR-0017 §18: one volume renames; across volumes a file is copied
+    /// and deleted, and a directory is refused.
+    #[test]
+    fn move_volume_decides_rename_copy_delete_and_refuses_a_directory() {
+        assert!(decide_move_volume("C:\\a.txt", "C:\\b.txt", false).allow);
+        assert!(decide_move_volume("C:\\a.txt", "D:\\b.txt", false).allow);
+        assert_eq!(
+            decide_move_volume("C:\\dir", "D:\\dir", true).code,
+            "CROSS_VOLUME_MOVE"
+        );
+        assert!(decide_move_volume("C:\\dir", "C:\\dir2", true).allow);
+        assert!(
+            decide_move_volume("\\\\srv\\share1\\a.txt", "\\\\srv\\share1\\b.txt", false).allow
+        );
+        assert!(!same_volume("\\\\srv\\share1\\a", "\\\\srv\\share2\\b"));
+        assert_eq!(volume_of("c:/logs/a").as_deref(), Some("C:"));
+        assert_eq!(volume_of("C:"), None);
+    }
+
+    /// TR-FS-10, ADR-0017 §19: a new name is one file name, not a path. A separator,
+    /// a `.`/`..` component, a reserved device name, a trailing dot or space and an
+    /// invalid character are refused.
+    #[test]
+    fn new_name_refuses_a_separator_reserved_name_and_trailing_dot() {
+        assert!(decide_new_name("app.log").allow);
+        for bad in [
+            "sub\\app.log",
+            "sub/app.log",
+            "..",
+            ".",
+            "NUL",
+            "con.txt",
+            "COM1",
+            "COM0",
+            "LPT0",
+            "CONIN$",
+            "CONOUT$",
+            "NUL .txt",
+            "COM\u{00b9}",
+            "LPT\u{00b3}.log",
+            "app.log.",
+            "app.log ",
+            "a:b",
+            "a*b",
+            "a\u{1}b",
+            "",
+        ] {
+            let decision = decide_new_name(bad);
+            assert!(!decision.allow, "{bad:?} must be refused");
+            assert_eq!(decision.code, "RENAME_NAME_INVALID", "{bad:?}");
+        }
+    }
+
+    /// TR-FS-09/10: a copy or a move onto the same path, into the source's subtree,
+    /// or out of the target's subtree is refused before the network.
+    #[test]
+    fn path_relation_refuses_recursion_and_the_same_path() {
+        assert_eq!(
+            decide_path_relation("D:\\a", "D:\\a", true).code,
+            "SAME_PATH"
+        );
+        assert_eq!(
+            decide_path_relation("D:\\a", "D:\\a\\b", true).code,
+            "TARGET_INSIDE_SOURCE"
+        );
+        assert_eq!(
+            decide_path_relation("D:\\a\\b", "D:\\a", true).code,
+            "SOURCE_INSIDE_TARGET"
+        );
+        assert!(decide_path_relation("D:\\a", "D:\\b", true).allow);
+        // A file source cannot contain a target, but the same path is still refused.
+        assert_eq!(
+            decide_path_relation("D:\\a.txt", "D:\\a.txt", false).code,
+            "SAME_PATH"
+        );
+        assert!(decide_path_relation("c:\\A", "D:\\a", true).allow);
+        assert_eq!(
+            decide_path_relation("c:\\A", "C:\\a\\b", true).code,
+            "TARGET_INSIDE_SOURCE"
+        );
+    }
+
+    /// TR-FS-11, ADR-0017 §20: a create checks the shallowest absent level under the
+    /// strict-descendant rule, and an existing target is refused with a clear message.
+    #[test]
+    fn create_directory_refuses_a_missing_ancestor_outside_the_entry() {
+        let requested = "C:\\ProgramData\\X\\Y\\a";
+        let scan = WriteScan {
+            full_name: requested.to_owned(),
+            dotnet_full_name: requested.to_owned(),
+            exists: false,
+            is_directory: false,
+            link_type: None,
+            roots: roots(&[("ProgramData", "C:\\ProgramData")]),
+        };
+        // The entry covers the final path but not the shallowest absent level
+        // `C:\ProgramData\X`, so the create is refused.
+        let decision = decide_create_directory(
+            &scan,
+            requested,
+            Some("C:\\ProgramData\\X"),
+            &paths(&["C:\\ProgramData\\X\\Y"]),
+        );
+        assert!(!decision.allow, "{}", decision.reason);
+        assert_eq!(decision.code, "PATH_PROTECTED");
+        // An entry that covers the shallowest level also covers the whole chain.
+        let decision = decide_create_directory(
+            &scan,
+            requested,
+            Some("C:\\ProgramData\\X"),
+            &paths(&["C:\\ProgramData"]),
+        );
+        assert!(decision.allow, "{}", decision.reason);
+        // An existing target is refused with a message that names the tool.
+        let existing = WriteScan {
+            exists: true,
+            is_directory: true,
+            ..scan
+        };
+        let decision = decide_create_directory(&existing, requested, None, &[]);
+        assert!(!decision.allow);
+        assert_eq!(decision.code, "TARGET_EXISTS");
+        assert!(
+            decision.reason.contains("already exists"),
+            "{}",
+            decision.reason
+        );
+    }
+
+    /// TR-FS-10, item 6: a move or a rename removes its source from a protected place,
+    /// so a protected source without an allowlist entry is refused.
+    #[test]
+    fn move_source_under_a_protected_root_needs_the_allowlist() {
+        let source = "C:\\Windows\\System32\\x.dll";
+        let scan = SourceScan {
+            roots: roots(&[("SystemRoot", "C:\\Windows")]),
+            ..source_scan(source, false)
+        };
+        let refused = decide_file_op_source(&scan, source, true, false, &[]);
+        assert!(!refused.allow, "{}", refused.reason);
+        assert_eq!(refused.code, "PATH_PROTECTED");
+        assert!(
+            decide_file_op_source(
+                &scan,
+                source,
+                true,
+                false,
+                &paths(&["C:\\Windows\\System32"])
+            )
+            .allow
+        );
+        // A copy only reads the source, so the same path is allowed without an entry.
+        assert!(decide_file_op_source(&scan, source, false, false, &[]).allow);
     }
 }

@@ -247,6 +247,65 @@ fn run_script_appears_only_when_enabled() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// TR-FS-08, AC-FS-13: the wire shows exactly the set the operator allowed. The four
+/// file operations are absent by default and appear with the setting on. The flag is
+/// independent, so the file operations and `write_file` together give 48, and all
+/// four flags give 50.
+#[test]
+fn file_ops_appear_only_when_enabled() {
+    let dir = temp_dir("fileops");
+    let path = dir.join("corp.json");
+    let token =
+        profile::create(&path, "corp", "domain\\alice", "s3cret-pass", false).expect("profile");
+
+    let names = |extra: &[(&str, &str)]| -> Vec<String> {
+        let (out_lines, _) = run_stdio_with(&dir, &token, extra);
+        let line = out_lines
+            .iter()
+            .find(|line| line.contains("\"id\":2"))
+            .expect("tools/list response");
+        let value: serde_json::Value = serde_json::from_str(line).expect("json");
+        value["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    };
+
+    let off = names(&[]);
+    assert_eq!(off.len(), 43, "expected 43 tools by default");
+    for tool in ["copy_file", "move_file", "rename_file", "create_directory"] {
+        assert!(!off.iter().any(|name| name == tool));
+    }
+
+    let on = names(&[("WINRIG_ALLOW_FILE_OPS", "true")]);
+    assert_eq!(on.len(), 47, "expected 47 tools once file ops is allowed");
+    for tool in ["copy_file", "move_file", "rename_file", "create_directory"] {
+        assert!(on.iter().any(|name| name == tool), "{tool} is missing");
+    }
+
+    let with_write = names(&[
+        ("WINRIG_ALLOW_FILE_OPS", "true"),
+        ("WINRIG_ALLOW_FILE_WRITE", "true"),
+    ]);
+    assert_eq!(
+        with_write.len(),
+        48,
+        "expected 48 tools with write_file too"
+    );
+
+    let all = names(&[
+        ("WINRIG_ALLOW_FILE_OPS", "true"),
+        ("WINRIG_ALLOW_FILE_WRITE", "true"),
+        ("WINRIG_ALLOW_COMMAND_EXEC", "true"),
+        ("WINRIG_ALLOW_SCRIPT_EXEC", "true"),
+    ]);
+    assert_eq!(all.len(), 50, "expected 50 tools with all four flags on");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// AC-PRF-42: without WINRIG_TOKEN the process refuses and writes nothing to stdout.
 #[test]
 fn stdio_without_token_refuses() {

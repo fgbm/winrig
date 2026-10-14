@@ -42,6 +42,10 @@ struct RecordingTransport {
     /// Canned stdout per substring: the first entry whose key is in the script
     /// wins. Without a match the host prints [`HOST_STDOUT`].
     responses: Mutex<Vec<(String, String)>>,
+    /// When set, the temp-directory probe is answered with `<dir>\<name>`, where
+    /// the name is the file the probe asked for. A test sets it to satisfy the
+    /// staging-path validation.
+    staging_dir: Mutex<Option<String>>,
 }
 
 #[async_trait::async_trait]
@@ -52,6 +56,16 @@ impl WinRmTransport for RecordingTransport {
         script: &str,
     ) -> Result<RemoteOutput, TransportError> {
         self.calls.lock().expect("lock").push(script.to_owned());
+        if let Some(dir) = self.staging_dir.lock().expect("lock").clone()
+            && script.contains("[IO.Path]::Combine")
+        {
+            let name = probe_file_name(script).unwrap_or_default();
+            return Ok(RemoteOutput {
+                stdout: format!("{dir}\\{name}").into_bytes(),
+                stderr: Vec::new(),
+                exit_code: 0,
+            });
+        }
         let stdout = self
             .responses
             .lock()
@@ -66,6 +80,14 @@ impl WinRmTransport for RecordingTransport {
             exit_code: 0,
         })
     }
+}
+
+/// The `winrig-<suffix>.ps1` name that the temp-directory probe script asks for.
+fn probe_file_name(script: &str) -> Option<String> {
+    let start = script.find("'winrig-")? + 1;
+    let rest = &script[start..];
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_owned())
 }
 
 impl RecordingTransport {
@@ -241,6 +263,7 @@ async fn started(answer: Answer, overrides: &[(&str, &str)]) -> Harness {
     let transport = Arc::new(RecordingTransport {
         calls: Mutex::new(Vec::new()),
         responses: Mutex::new(Vec::new()),
+        staging_dir: Mutex::new(None),
     });
     let registry = Arc::new(SessionRegistry::new(
         Arc::clone(&transport) as Arc<dyn WinRmTransport>,
@@ -2752,5 +2775,261 @@ async fn proceed_runs_a_deleting_tool_and_marks_the_audit() {
     assert!(
         text.contains("CONFIRMATION UNSUPPORTED"),
         "the fallback deletion is not marked in the audit: {text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// run_script
+// ---------------------------------------------------------------------------
+
+/// One `run_script` call in an open session.
+fn run_script_call(script: &str) -> CallToolRequestParams {
+    CallToolRequestParams::new("run_script").with_arguments(args(&serde_json::json!({
+        "session_id": HOST,
+        "script": script
+    })))
+}
+
+/// The staging directory the fake host reports for the temp-directory probe.
+const STAGING_DIR: &str = "C:\\Windows\\Temp";
+
+/// Makes the fake host answer the temp-directory probe with the requested
+/// `winrig-<suffix>.ps1` name and answer the staging cleanup, so the staging path
+/// and the cleanup outcome are deterministic.
+fn arm_staging(harness: &Harness) {
+    *harness.transport.staging_dir.lock().expect("lock") = Some(STAGING_DIR.to_owned());
+    harness
+        .transport
+        .respond("Test-Path -LiteralPath", "removed");
+}
+
+/// TR-EXE-05, AC-EXE-05: `run_script` is absent by default and appears when the
+/// operator enables it.
+#[tokio::test]
+async fn run_script_appears_only_when_enabled() {
+    let off = started(Answer::Accept, &[]).await;
+    assert!(
+        !tool_names(&off)
+            .await
+            .iter()
+            .any(|name| name == "run_script"),
+        "run_script must not be advertised while disabled"
+    );
+    off.client.cancel().await.ok();
+
+    let on = started(Answer::Accept, &[("WINRIG_ALLOW_SCRIPT_EXEC", "true")]).await;
+    assert!(
+        tool_names(&on)
+            .await
+            .iter()
+            .any(|name| name == "run_script"),
+        "run_script must appear once enabled"
+    );
+    on.client.cancel().await.ok();
+}
+
+/// TR-EXE-05, AC-EXE-05: the prefix list `WINRIG_ALLOWED_COMMANDS` does not
+/// filter a script, so a script whose text is not in the list still reaches the
+/// host.
+#[tokio::test]
+async fn run_script_ignores_the_command_allowlist() {
+    let harness = connected(
+        Answer::Accept,
+        &[
+            ("WINRIG_ALLOW_SCRIPT_EXEC", "true"),
+            ("WINRIG_ALLOWED_COMMANDS", "Get-Service"),
+        ],
+    )
+    .await;
+    arm_staging(&harness);
+    let result = harness
+        .call(run_script_call("whoami; Write-Output 'not in the list'"))
+        .await;
+
+    assert_eq!(error_of(&result), None, "{:?}", result.structured_content);
+    assert!(
+        harness.transport.saw("FromBase64String"),
+        "the script never reached the host: the allowlist must not filter it"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// DR-5, TR-EXE-06: without a confirmation channel nothing modifying reaches the
+/// host and the tool refuses (fail-closed).
+#[tokio::test]
+async fn run_script_without_channel_is_refused() {
+    let harness = connected(Answer::NoChannel, &[("WINRIG_ALLOW_SCRIPT_EXEC", "true")]).await;
+    arm_staging(&harness);
+    let result = harness
+        .call(run_script_call("Remove-Item C:\\ -Recurse"))
+        .await;
+
+    for needle in ["FromBase64String", "[ScriptBlock]::Create", "Remove-Item"] {
+        assert!(
+            !harness.transport.saw(needle),
+            "a modifying command ({needle}) reached the host without a confirmation"
+        );
+    }
+    assert!(
+        error_of(&result).is_some_and(|error| error.contains("cannot ask for confirmation")),
+        "{:?}",
+        result.structured_content
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// TR-EXE-06, AC-EXE-06: a confirmed `run_script` uploads the staging file in
+/// chunks, verifies and runs it as a script block and removes it, in that order,
+/// and the result carries the cleanup outcome.
+#[tokio::test]
+async fn run_script_writes_runs_and_deletes_the_temp_file() {
+    let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_SCRIPT_EXEC", "true")]).await;
+    arm_staging(&harness);
+    let before = harness.transport.calls.lock().expect("lock").len();
+    let result = harness
+        .call(run_script_call("Write-Output 'hi'; Get-Service"))
+        .await;
+
+    assert_eq!(error_of(&result), None, "{:?}", result.structured_content);
+    assert_eq!(number(&result, "status_code"), Some(0), "{:?}", result);
+    assert_eq!(field(&result, "temp_file").as_deref(), Some("removed"));
+    assert_eq!(field(&result, "warning"), None);
+
+    let calls = calls_from(&harness, before);
+    let chunk = calls.iter().position(|c| c.contains("FromBase64String"));
+    let run_at = calls
+        .iter()
+        .position(|c| c.contains("[ScriptBlock]::Create"));
+    let delete = calls
+        .iter()
+        .position(|c| c.contains("Remove-Item") && c.contains(STAGING_DIR));
+    assert!(chunk.is_some(), "the chunk write is missing: {calls:?}");
+    assert!(run_at.is_some(), "the run is missing: {calls:?}");
+    assert!(delete.is_some(), "the delete is missing: {calls:?}");
+    assert!(
+        chunk < run_at && run_at < delete,
+        "the order must be write, run, delete: {calls:?}"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// TR-EXE-07, TR-SEC-22, AC-EXE-07, AC-SEC22-1: one confirmation shows the whole
+/// script, line by line and without the 200-character cap, and it names the
+/// staging path.
+#[tokio::test]
+async fn run_script_confirmation_shows_the_whole_script() {
+    let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_SCRIPT_EXEC", "true")]).await;
+    arm_staging(&harness);
+    let long_line = format!("Get-ChildItem C:\\Logs # {}", "x".repeat(300));
+    let script = format!("$a = 1\n$b = 2\n{long_line}");
+    let result = harness.call(run_script_call(&script)).await;
+    let message = harness.last_confirmation();
+
+    assert_eq!(
+        harness.elicitations(),
+        1,
+        "run_script must ask one confirmation"
+    );
+    assert_header(&message, "run_script");
+    assert!(
+        message.contains(&format!("Temporary path: {STAGING_DIR}\\winrig-")),
+        "{message}"
+    );
+    assert!(message.contains("SHA-256: "), "{message}");
+    assert!(
+        message.contains("Command allowlist: does not filter a script"),
+        "{message}"
+    );
+    assert!(message.contains("Script:\n  | $a = 1"), "{message}");
+    assert!(
+        message.contains(&format!("  | {long_line}")),
+        "the whole script must appear: {message}"
+    );
+    assert!(
+        !message.contains("..."),
+        "the body must not be cut: {message}"
+    );
+    assert!(
+        message.contains(
+            "This uploads and runs an arbitrary PowerShell script, then tries to delete the file. \
+             You cannot undo it."
+        ),
+        "{message}"
+    );
+    assert_eq!(error_of(&result), None, "{:?}", result.structured_content);
+    harness.client.cancel().await.ok();
+}
+
+/// TR-EXE-06: a probe that returns an unexpected path is refused before the
+/// confirmation, and nothing is written.
+#[tokio::test]
+async fn run_script_refuses_an_unexpected_staging_path() {
+    let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_SCRIPT_EXEC", "true")]).await;
+    // The host returns a system file, not the requested `winrig-<suffix>.ps1`.
+    harness
+        .transport
+        .respond("[IO.Path]::Combine", "C:\\Windows\\System32\\x.ps1");
+    let result = harness.call(run_script_call("Write-Output 1")).await;
+
+    assert_eq!(
+        harness.elicitations(),
+        0,
+        "the tool must refuse before the confirmation"
+    );
+    assert!(
+        !harness.transport.saw("FromBase64String"),
+        "nothing must be written"
+    );
+    assert!(
+        error_of(&result).is_some_and(|error| error.contains("unexpected staging path")),
+        "{:?}",
+        result.structured_content
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// DR-5, TR-EXE-06: a declined confirmation writes nothing to the host.
+#[tokio::test]
+async fn run_script_decline_writes_nothing() {
+    let harness = connected(Answer::Decline, &[("WINRIG_ALLOW_SCRIPT_EXEC", "true")]).await;
+    arm_staging(&harness);
+    let result = harness.call(run_script_call("Write-Output 1")).await;
+
+    for needle in ["FromBase64String", "[ScriptBlock]::Create", "Remove-Item"] {
+        assert!(
+            !harness.transport.saw(needle),
+            "a declined call still wrote ({needle})"
+        );
+    }
+    assert_eq!(
+        status_of(&result).as_deref(),
+        Some("cancelled"),
+        "{result:?}"
+    );
+    harness.client.cancel().await.ok();
+}
+
+/// DR-4: the audit holds the script text, indented, and the confirmed SHA-256, and
+/// no chunk base64 reaches any record.
+#[tokio::test]
+async fn run_script_audit_holds_the_script_and_the_hash() {
+    let buffer = capture();
+    let harness = connected(Answer::Accept, &[("WINRIG_ALLOW_SCRIPT_EXEC", "true")]).await;
+    arm_staging(&harness);
+    let script = "Write-Output 'audit-line'";
+    harness.call(run_script_call(script)).await;
+    harness.client.cancel().await.ok();
+
+    let text = take_audit(&buffer);
+    assert!(
+        text.contains("Write-Output 'audit-line'"),
+        "the script text must be in the audit: {text}"
+    );
+    let hash = winrig::ps::script_sha256(script);
+    assert!(text.contains(&hash), "the hash must be recorded: {text}");
+    let base64 = winrig::ps::encode_base64(script.as_bytes());
+    assert!(
+        !text.contains(&base64),
+        "the chunk base64 leaked into the audit: {text}"
     );
 }

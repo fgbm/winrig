@@ -69,7 +69,7 @@ Call a read-only tool, for example `get_system_info` or `list_directory`. The se
 Call a modifying tool, for example `restart_service`. The tool asks the operator for confirmation through MCP elicitation. It runs only after the explicit "yes". Without a confirmation channel, the tool refuses to run (fail-closed).
 
 :::note
-`write_file` is off by default. Set `WINRIG_ALLOW_FILE_WRITE=true` to declare it. `run_command` is off by default too: set `WINRIG_ALLOW_COMMAND_EXEC=true` to declare it. See the [tool reference](/winrig/reference/tools/).
+`write_file` is off by default. Set `WINRIG_ALLOW_FILE_WRITE=true` to declare it. `run_command` is off by default too: set `WINRIG_ALLOW_COMMAND_EXEC=true` to declare it. `run_script` is off by default: set `WINRIG_ALLOW_SCRIPT_EXEC=true` to declare it. See the [tool reference](/winrig/reference/tools/).
 :::
 
 The full list of the environment variables is in the [configuration reference](/winrig/reference/configuration/).

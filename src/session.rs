@@ -78,6 +78,22 @@ impl UserIdentity {
     }
 }
 
+/// One confirmed `run_script` operation: the staging chunks, the command that
+/// verifies and runs the script, the command that removes the staging file, the
+/// script text for the audit and the confirmed SHA-256 (ADR-0017 §29–33).
+pub struct ScriptRun<'a> {
+    /// The write commands that create and append the staging `.ps1`.
+    pub chunks: &'a [String],
+    /// The command that verifies and executes the staging script as a script block.
+    pub run: &'a str,
+    /// The command that removes the staging file once the run has finished.
+    pub cleanup: &'a str,
+    /// The script text, shown redacted and indented in the audit (DR-4).
+    pub display: &'a str,
+    /// The confirmed SHA-256 of the script bytes, recorded in the audit.
+    pub hash: &'a str,
+}
+
 /// Result of a remote command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteOutput {
@@ -704,7 +720,13 @@ impl SessionRegistry {
         redactions: &[String],
     ) -> Value {
         self.run_ps_displayed(
-            username, session_id, command, command, tool_name, redactions,
+            username,
+            session_id,
+            command,
+            command,
+            tool_name,
+            redactions,
+            &[],
         )
         .await
     }
@@ -713,7 +735,9 @@ impl SessionRegistry {
     ///
     /// The executed script can be an encoded wrapper; the audit shows `display`, so
     /// the log holds the command the operator confirmed, not its encoding. Both go
-    /// through `redact`, and the body obeys `WINRIG_AUDIT_LOG_BODY`.
+    /// through `redact`, and the body obeys `WINRIG_AUDIT_LOG_BODY`. `extra_fields`
+    /// adds records such as a hash to the audit entry.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_ps_displayed(
         &self,
         username: &str,
@@ -722,6 +746,7 @@ impl SessionRegistry {
         display: &str,
         tool_name: &str,
         redactions: &[String],
+        extra_fields: &[(&'static str, String)],
     ) -> Value {
         let (target, command_number) = {
             let mut sessions = lock(&self.sessions);
@@ -826,6 +851,10 @@ impl SessionRegistry {
                     ("stdout_bytes", stdout.len().to_string()),
                     ("stderr_bytes", stderr.len().to_string()),
                 ];
+                let mut fields = fields;
+                for (key, value) in extra_fields {
+                    fields.push((key, value.clone()));
+                }
                 self.audit(&format!("COMMAND #{command_number}{label}"), &fields, &body);
 
                 let mut reply = Map::new();
@@ -864,6 +893,115 @@ impl SessionRegistry {
                 );
                 json!({ "error": message, "session_id": session_id })
             }
+        }
+    }
+
+    /// Uploads the staging file, verifies and runs it as a script block and
+    /// removes it in one confirmed operation (TR-EXE-06, ADR-0017 §29–33).
+    ///
+    /// A failed chunk tries to remove the partial staging file before the tool
+    /// returns; the error text names the cleanup outcome. A failed run or a
+    /// timeout still tries to remove the file, and a failed removal adds a
+    /// `warning`. The script text goes to the audit, not the encoded wrapper
+    /// (DR-4).
+    pub async fn run_script(
+        &self,
+        username: &str,
+        session_id: &str,
+        op: ScriptRun<'_>,
+        tool_name: &str,
+    ) -> Value {
+        for (index, chunk) in op.chunks.iter().enumerate() {
+            // DR-4: the content travels in the command as base64 and may be a
+            // secret, so exactly what the command carries is redacted.
+            let secrets = crate::ps::base64_payloads(chunk);
+            let reply = self
+                .run_ps(username, session_id, chunk, tool_name, &secrets)
+                .await;
+            if reply.get("error").is_some()
+                || reply.get("status_code").and_then(Value::as_i64) != Some(0)
+            {
+                let temp_file = self
+                    .remove_staging(username, session_id, op.cleanup, tool_name)
+                    .await;
+                let (message, warning) =
+                    staging_failure_message(index, op.chunks.len(), &temp_file);
+                let mut out = json!({
+                    "error": message,
+                    "step": reply,
+                    "temp_file": temp_file,
+                });
+                if let Some(warning) = warning {
+                    out["warning"] = json!(warning);
+                }
+                return out;
+            }
+        }
+        let run_secrets = crate::ps::base64_payloads(op.run);
+        let mut reply = self
+            .run_ps_displayed(
+                username,
+                session_id,
+                op.run,
+                op.display,
+                tool_name,
+                &run_secrets,
+                &[("sha256", op.hash.to_owned())],
+            )
+            .await;
+        // A 97 exit with the mismatch marker means the file changed between the
+        // upload and the run. The reply gets a plain error, because the run itself
+        // produced a message on stderr and no `error` field (TR-EXE-06).
+        let mismatch = reply.get("status_code").and_then(Value::as_i64)
+            == Some(i64::from(crate::ps::SCRIPT_HASH_MISMATCH_EXIT))
+            && reply
+                .get("stderr")
+                .and_then(Value::as_str)
+                .is_some_and(|stderr| stderr.contains(crate::ps::SCRIPT_HASH_MISMATCH_MARKER));
+        let temp_file = self
+            .remove_staging(username, session_id, op.cleanup, tool_name)
+            .await;
+        if let Some(object) = reply.as_object_mut() {
+            if mismatch {
+                object.insert(
+                    "error".to_owned(),
+                    json!("The staging file changed after the upload. The tool did not run the script."),
+                );
+            }
+            if let Some(warning) = staging_warning(&temp_file) {
+                object.insert("warning".to_owned(), json!(warning));
+            }
+            object.insert("temp_file".to_owned(), json!(temp_file));
+        }
+        reply
+    }
+
+    /// Deletes the staging file and reports the outcome: `removed`, `absent` or a
+    /// failure text (TR-EXE-06).
+    async fn remove_staging(
+        &self,
+        username: &str,
+        session_id: &str,
+        cleanup_command: &str,
+        tool_name: &str,
+    ) -> String {
+        let reply = self
+            .run_ps(username, session_id, cleanup_command, tool_name, &[])
+            .await;
+        if reply.get("error").is_some() {
+            return "cleanup failed".to_owned();
+        }
+        let stdout = reply
+            .get("stdout")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let code = reply.get("status_code").and_then(Value::as_i64);
+        if code == Some(0) && (stdout == "removed" || stdout == "absent") {
+            stdout
+        } else {
+            format!("cleanup failed: {stdout}")
         }
     }
 
@@ -1284,6 +1422,37 @@ fn indent(text: &str) -> String {
         .map(|line| format!("  {line}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The text for the `warning` field when the removal reported no definite outcome.
+fn staging_warning(temp_file: &str) -> Option<String> {
+    match temp_file {
+        "removed" | "absent" => None,
+        other => Some(format!(
+            "The temporary file may remain on the host: {other}"
+        )),
+    }
+}
+
+/// The error text of a failed chunk upload, tied to the cleanup outcome, and the
+/// matching `warning` text.
+fn staging_failure_message(step: usize, total: usize, temp_file: &str) -> (String, Option<String>) {
+    let warning = staging_warning(temp_file);
+    let message = if warning.is_some() {
+        format!(
+            "The upload of the script failed at step {} of {}. The staging file may remain on the \
+             host.",
+            step + 1,
+            total
+        )
+    } else {
+        format!(
+            "The upload of the script failed at step {} of {}. The tool removed the staging file.",
+            step + 1,
+            total
+        )
+    };
+    (message, warning)
 }
 
 fn timestamp() -> String {
@@ -2150,6 +2319,340 @@ Get-Item : the path under super_x000D__x000A_secretvalue123 was not found._x000D
             !audit.contains(&"x".repeat(100)),
             "the command body leaked: {audit}"
         );
+    }
+
+    /// A transport whose chunk, run and cleanup answers are set for each test.
+    struct ScriptTransport {
+        calls: StdMutex<Vec<String>>,
+        chunk_count: StdMutex<usize>,
+        /// The 0-based index of the write that fails, if any.
+        fail_chunk: Option<usize>,
+        fail_run: bool,
+        fail_cleanup: bool,
+        /// The run reports a SHA-256 that differs from the confirmed value.
+        mismatch: bool,
+    }
+
+    impl ScriptTransport {
+        fn new() -> Self {
+            Self {
+                calls: StdMutex::new(Vec::new()),
+                chunk_count: StdMutex::new(0),
+                fail_chunk: None,
+                fail_run: false,
+                fail_cleanup: false,
+                mismatch: false,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WinRmTransport for ScriptTransport {
+        async fn run_powershell(
+            &self,
+            _target: &SessionTarget,
+            script: &str,
+        ) -> Result<RemoteOutput, TransportError> {
+            self.calls.lock().expect("lock").push(script.to_owned());
+            if script.contains("Remove-Item") {
+                return Ok(if self.fail_cleanup {
+                    output("", "cleanup boom", 1)
+                } else {
+                    output("removed", "", 0)
+                });
+            }
+            if script.contains("[ScriptBlock]::Create") {
+                if self.mismatch {
+                    return Ok(output(
+                        "",
+                        crate::ps::SCRIPT_HASH_MISMATCH_MARKER,
+                        crate::ps::SCRIPT_HASH_MISMATCH_EXIT,
+                    ));
+                }
+                return Ok(if self.fail_run {
+                    output("", "run boom", 1)
+                } else {
+                    output("", "", 0)
+                });
+            }
+            let mut count = self.chunk_count.lock().expect("lock");
+            let index = *count;
+            *count += 1;
+            if self.fail_chunk == Some(index) {
+                return Ok(output("", "chunk boom", 1));
+            }
+            Ok(output("", "", 0))
+        }
+    }
+
+    /// Builds the chunk, run and cleanup commands of a staging write, so the tests
+    /// pass exactly what the tool builds.
+    fn script_steps(path: &str, chunk_count: usize) -> (Vec<String>, String, String, String) {
+        let script = "Write-Output 1";
+        let mut chunks = Vec::new();
+        for index in 0..chunk_count {
+            chunks.push(if index == 0 {
+                crate::ps::script_chunk_create(path, "QUJD")
+            } else {
+                crate::ps::write_chunk(path, "QUJD", false)
+            });
+        }
+        let hash = crate::ps::script_sha256(script);
+        (
+            chunks,
+            crate::ps::run_script_file(path, &hash).expect("fits"),
+            crate::ps::script_cleanup(path),
+            hash,
+        )
+    }
+
+    /// TR-EXE-06, AC-EXE-06: a failed run still removes the staging file, and the
+    /// removal runs after the run and the chunk write.
+    #[tokio::test]
+    async fn run_script_deletes_the_temp_file_on_failure() {
+        let transport = Arc::new(ScriptTransport {
+            fail_run: true,
+            ..ScriptTransport::new()
+        });
+        let registry = SessionRegistry::new(
+            Arc::clone(&transport) as Arc<dyn WinRmTransport>,
+            RegistryConfig::default(),
+        );
+        let identity = UserIdentity::with_password("alice", "s3cret");
+        let _ = registry.connect(&identity, "host1", None, None, true).await;
+
+        let path = "C:\\Temp\\winrig-abc.ps1";
+        let (chunks, run, cleanup, hash) = script_steps(path, 1);
+        let reply = registry
+            .run_script(
+                "alice",
+                "host1",
+                ScriptRun {
+                    chunks: &chunks,
+                    run: &run,
+                    cleanup: &cleanup,
+                    display: "Write-Output 1",
+                    hash: &hash,
+                },
+                "run_script",
+            )
+            .await;
+
+        assert_eq!(reply["temp_file"], "removed", "{reply}");
+        assert!(reply.get("warning").is_none(), "{reply}");
+        let calls = transport.calls.lock().expect("lock").clone();
+        let chunk = calls.iter().position(|c| c.contains("FromBase64String"));
+        let run_at = calls
+            .iter()
+            .position(|c| c.contains("[ScriptBlock]::Create"));
+        let delete = calls.iter().position(|c| c.contains("Remove-Item"));
+        assert!(
+            chunk.is_some(),
+            "the chunk did not reach the host: {calls:?}"
+        );
+        assert!(
+            run_at.is_some(),
+            "the run did not reach the host: {calls:?}"
+        );
+        assert!(
+            delete.is_some(),
+            "the failed run left the staging file: {calls:?}"
+        );
+        assert!(
+            chunk < run_at && run_at < delete,
+            "the order is wrong: {calls:?}"
+        );
+    }
+
+    /// TR-EXE-06: a middle chunk fails and the cleanup succeeds, so the cleanup
+    /// runs after the failure and the run never starts.
+    #[tokio::test]
+    async fn run_script_middle_chunk_failure_runs_the_cleanup() {
+        let transport = Arc::new(ScriptTransport {
+            fail_chunk: Some(1),
+            ..ScriptTransport::new()
+        });
+        let registry = SessionRegistry::new(
+            Arc::clone(&transport) as Arc<dyn WinRmTransport>,
+            RegistryConfig::default(),
+        );
+        let identity = UserIdentity::with_password("alice", "s3cret");
+        let _ = registry.connect(&identity, "host1", None, None, true).await;
+
+        let path = "C:\\Temp\\winrig-abc.ps1";
+        let (chunks, run, cleanup, hash) = script_steps(path, 2);
+        let reply = registry
+            .run_script(
+                "alice",
+                "host1",
+                ScriptRun {
+                    chunks: &chunks,
+                    run: &run,
+                    cleanup: &cleanup,
+                    display: "Write-Output 1",
+                    hash: &hash,
+                },
+                "run_script",
+            )
+            .await;
+
+        assert_eq!(reply["temp_file"], "removed", "{reply}");
+        assert!(
+            reply["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("The tool removed the staging file")),
+            "{reply}"
+        );
+        assert!(reply.get("warning").is_none(), "{reply}");
+        let calls = transport.calls.lock().expect("lock").clone();
+        assert!(
+            !calls.iter().any(|c| c.contains("[ScriptBlock]::Create")),
+            "the run must not start after a chunk failure: {calls:?}"
+        );
+        let delete = calls.iter().position(|c| c.contains("Remove-Item"));
+        assert!(
+            delete.is_some(),
+            "the cleanup did not run after the failure: {calls:?}"
+        );
+    }
+
+    /// TR-EXE-06: when the first chunk and the cleanup both fail, the error text
+    /// says the file may remain, and the result carries a warning.
+    #[tokio::test]
+    async fn run_script_failed_chunk_and_cleanup_says_it_may_remain() {
+        let transport = Arc::new(ScriptTransport {
+            fail_chunk: Some(0),
+            fail_cleanup: true,
+            ..ScriptTransport::new()
+        });
+        let registry = SessionRegistry::new(
+            Arc::clone(&transport) as Arc<dyn WinRmTransport>,
+            RegistryConfig::default(),
+        );
+        let identity = UserIdentity::with_password("alice", "s3cret");
+        let _ = registry.connect(&identity, "host1", None, None, true).await;
+
+        let path = "C:\\Temp\\winrig-abc.ps1";
+        let (chunks, run, cleanup, hash) = script_steps(path, 1);
+        let reply = registry
+            .run_script(
+                "alice",
+                "host1",
+                ScriptRun {
+                    chunks: &chunks,
+                    run: &run,
+                    cleanup: &cleanup,
+                    display: "Write-Output 1",
+                    hash: &hash,
+                },
+                "run_script",
+            )
+            .await;
+
+        assert!(
+            reply["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("may remain on the host")),
+            "{reply}"
+        );
+        assert!(
+            reply["warning"]
+                .as_str()
+                .is_some_and(|warning| warning.contains("may remain on the host")),
+            "{reply}"
+        );
+    }
+
+    /// TR-EXE-06: when the removal of the staging file fails, the tool says so
+    /// instead of losing the failure in silence.
+    #[tokio::test]
+    async fn run_script_reports_a_failed_cleanup() {
+        let transport = Arc::new(ScriptTransport {
+            fail_cleanup: true,
+            ..ScriptTransport::new()
+        });
+        let registry = SessionRegistry::new(
+            Arc::clone(&transport) as Arc<dyn WinRmTransport>,
+            RegistryConfig::default(),
+        );
+        let identity = UserIdentity::with_password("alice", "s3cret");
+        let _ = registry.connect(&identity, "host1", None, None, true).await;
+
+        let path = "C:\\Temp\\winrig-abc.ps1";
+        let (chunks, run, cleanup, hash) = script_steps(path, 1);
+        let reply = registry
+            .run_script(
+                "alice",
+                "host1",
+                ScriptRun {
+                    chunks: &chunks,
+                    run: &run,
+                    cleanup: &cleanup,
+                    display: "Write-Output 1",
+                    hash: &hash,
+                },
+                "run_script",
+            )
+            .await;
+
+        assert!(
+            reply["temp_file"]
+                .as_str()
+                .is_some_and(|value| value.contains("cleanup failed")),
+            "{reply}"
+        );
+        assert!(
+            reply["warning"]
+                .as_str()
+                .is_some_and(|warning| warning.contains("may remain on the host")),
+            "{reply}"
+        );
+    }
+
+    /// TR-EXE-06, AC-EXE-06: an exit code 97 with the mismatch marker means the
+    /// staging file changed after the upload, so the reply names it.
+    #[tokio::test]
+    async fn run_script_reports_a_hash_mismatch() {
+        let transport = Arc::new(ScriptTransport {
+            mismatch: true,
+            ..ScriptTransport::new()
+        });
+        let registry = SessionRegistry::new(
+            Arc::clone(&transport) as Arc<dyn WinRmTransport>,
+            RegistryConfig::default(),
+        );
+        let identity = UserIdentity::with_password("alice", "s3cret");
+        let _ = registry.connect(&identity, "host1", None, None, true).await;
+
+        let path = "C:\\Temp\\winrig-abc.ps1";
+        let (chunks, run, cleanup, hash) = script_steps(path, 1);
+        let reply = registry
+            .run_script(
+                "alice",
+                "host1",
+                ScriptRun {
+                    chunks: &chunks,
+                    run: &run,
+                    cleanup: &cleanup,
+                    display: "Write-Output 1",
+                    hash: &hash,
+                },
+                "run_script",
+            )
+            .await;
+
+        assert_eq!(
+            reply["status_code"],
+            crate::ps::SCRIPT_HASH_MISMATCH_EXIT,
+            "{reply}"
+        );
+        assert!(
+            reply["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("changed after the upload")),
+            "{reply}"
+        );
+        assert_eq!(reply["temp_file"], "removed", "{reply}");
     }
 
     #[tokio::test]

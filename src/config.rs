@@ -189,6 +189,8 @@ pub struct AppConfig {
     pub allow_command_exec: bool,
     /// Command prefixes the server admits; empty means any command (TR-EXE-02).
     pub allowed_commands: Vec<String>,
+    /// Whether running a long PowerShell script is allowed (TR-EXE-05, ADR-0017).
+    pub allow_script_exec: bool,
     /// What happens when the client declared no confirmation channel (TR-SEC-11).
     pub confirm_fallback: ConfirmFallback,
 }
@@ -227,6 +229,7 @@ impl fmt::Debug for AppConfig {
             .field("max_write_bytes", &self.max_write_bytes)
             .field("allow_command_exec", &self.allow_command_exec)
             .field("allowed_commands", &self.allowed_commands)
+            .field("allow_script_exec", &self.allow_script_exec)
             .field("confirm_fallback", &self.confirm_fallback)
             .field(
                 "sftp_cred_idle_ttl_seconds",
@@ -534,6 +537,7 @@ pub fn load_config_from(env: &Env) -> Result<AppConfig, ConfigError> {
         )?,
         allow_command_exec: read_bool(env, "WINRIG_ALLOW_COMMAND_EXEC", false)?,
         allowed_commands: read_allowed_commands(env)?,
+        allow_script_exec: read_bool(env, "WINRIG_ALLOW_SCRIPT_EXEC", false)?,
         confirm_fallback: read_confirm_fallback(env)?,
     })
 }
@@ -623,6 +627,10 @@ pub fn setting_pairs(config: &AppConfig) -> Vec<(&'static str, Option<String>)> 
         (
             "WINRIG_ALLOWED_COMMANDS",
             Some(canonical_command_list(&config.allowed_commands)),
+        ),
+        (
+            "WINRIG_ALLOW_SCRIPT_EXEC",
+            Some(config.allow_script_exec.to_string()),
         ),
         (
             "WINRIG_CONFIRM_FALLBACK",
@@ -718,6 +726,8 @@ mod tests {
         assert!(!config.allow_command_exec);
         // TR-EXE-02: an empty command list admits any command.
         assert!(config.allowed_commands.is_empty());
+        // TR-EXE-05: a long script is off until the operator turns it on.
+        assert!(!config.allow_script_exec);
         // TR-SEC-11: a missing confirmation channel is a refusal by default.
         assert_eq!(config.confirm_fallback, ConfirmFallback::Refuse);
     }
@@ -742,6 +752,20 @@ mod tests {
             load_config_from(&env).expect("valid").allowed_commands,
             ["Get-Service", "ipconfig"]
         );
+    }
+
+    /// TR-EXE-05: the setting is switched by the usual boolean values, and a bad
+    /// value refuses the start with the variable name (DR-8).
+    #[test]
+    fn script_exec_is_switched_by_the_operator() {
+        let env = source(&with(&[("WINRIG_ALLOW_SCRIPT_EXEC", "true")]));
+        assert!(load_config_from(&env).expect("valid").allow_script_exec);
+        let env = source(&with(&[("WINRIG_ALLOW_SCRIPT_EXEC", "0")]));
+        assert!(!load_config_from(&env).expect("valid").allow_script_exec);
+        let env = source(&with(&[("WINRIG_ALLOW_SCRIPT_EXEC", "maybe")]));
+        let error = load_config_from(&env).expect_err("must fail").to_string();
+        assert!(error.contains("WINRIG_ALLOW_SCRIPT_EXEC"), "{error}");
+        assert!(error.contains("boolean"), "{error}");
     }
 
     /// DR-8: a bad command entry refuses the start with the variable name.

@@ -68,8 +68,9 @@ A value with the wrong format stops the start with a message that names the vari
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `WINRIG_ALLOW_FILE_WRITE` | `false` | Whether the tool `write_file` exists. While the value is `false`, the server removes the tool from the router: it does not declare the tool and no call reaches it |
-| `WINRIG_MAX_WRITE_BYTES` | `65536` | The largest content that `write_file` accepts, in bytes. The server rejects it before any network activity. The value cannot be smaller than one 1536-byte chunk. The tool also refuses a path so long that its commands would not fit the WinRS command line of about 8191 characters. The limit is about 760 characters for UTF-8 and about 460 characters for the other encodings, for a path with no quote character |
+| `WINRIG_MAX_WRITE_BYTES` | `65536` | The largest content that `write_file` and the uploaded `run_script` script accept, in bytes. The server rejects it before any network activity. The value cannot be smaller than one 1536-byte chunk. The write tool also refuses a path so long that its commands would not fit the WinRS command line of about 8191 characters. The limit is about 760 characters for UTF-8 and about 460 characters for the other encodings, for a path with no quote character |
 | `WINRIG_ALLOW_COMMAND_EXEC` | `false` | Whether the tool `run_command` exists. While the value is `false`, the server removes the tool from the router: it does not declare the tool and no call reaches it |
+| `WINRIG_ALLOW_SCRIPT_EXEC` | `false` | Whether the tool `run_script` exists. While the value is `false`, the server removes the tool from the router: it does not declare the tool and no call reaches it |
 | `WINRIG_ALLOWED_COMMANDS` | *(empty)* | The command allowlist, comma-separated. An empty value admits any command. A non-empty value admits only a command that begins with one entry, matched without case after a trim. A prefix is not a boundary: a leading `&`, `.`, `powershell -c`, an alias and a script started by path all go around it. A bad entry refuses the start |
 
 ## Reserved

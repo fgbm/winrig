@@ -623,6 +623,26 @@ pub fn decide_command_length(command: &str, max_units: usize) -> PolicyDecision 
     }
 }
 
+/// Size verdict for one script, in bytes, against the write budget (TR-EXE-06).
+///
+/// The script travels to the host in the same chunks as `write_file`, so it obeys
+/// the same `WINRIG_MAX_WRITE_BYTES` limit. The refusal reaches the audit before
+/// the network and names the limit.
+#[must_use]
+pub fn decide_script_size(bytes: usize, max_bytes: usize) -> PolicyDecision {
+    if bytes > max_bytes {
+        PolicyDecision::deny(
+            format!(
+                "the script is {bytes} bytes, above the limit of {max_bytes}; raise \
+                 WINRIG_MAX_WRITE_BYTES or shorten the script"
+            ),
+            "SCRIPT_TOO_LONG",
+        )
+    } else {
+        PolicyDecision::allow("script fits the write budget")
+    }
+}
+
 #[must_use]
 pub fn decide_delete_path(path: &str) -> PolicyDecision {
     if let Some(refusal) = refuse_short_name(path, path, "delete") {

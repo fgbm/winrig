@@ -3,7 +3,7 @@ title: Tools
 description: The read-only tools and the modifying tools of winrig, with the switches that enable the modifying tools.
 ---
 
-The binary declares 43 tools, plus `write_file` and `run_command` when the operator enables them. The read-only tools need no confirmation. The modifying tools require the explicit confirmation of the operator (DR-5).
+The binary declares 43 tools, plus `write_file`, `run_command` and `run_script` when the operator enables them. The read-only tools need no confirmation. The modifying tools require the explicit confirmation of the operator (DR-5).
 
 ## Session
 
@@ -99,22 +99,26 @@ Each confirmation names the host of the session, the user of the request and the
 | `flush_dns` | Clear the DNS client cache |
 | `write_file` | Write a file with a full replacement. **Off by default**: set `WINRIG_ALLOW_FILE_WRITE=true`, or the server does not declare the tool and no call can reach it |
 | `run_command` | Run an arbitrary PowerShell command. **Off by default**: set `WINRIG_ALLOW_COMMAND_EXEC=true`, or the server does not declare the tool and no call can reach it. The confirmation shows the full command text. The server refuses a command outside a non-empty `WINRIG_ALLOWED_COMMANDS` before any network activity |
+| `run_script` | Run a PowerShell script that is longer than one WinRS command line. **Off by default**: set `WINRIG_ALLOW_SCRIPT_EXEC=true`, or the server does not declare the tool and no call can reach it. The server writes the script into a temporary `.ps1` in the session temp directory. It reads the file and runs its text as a script block, then tries to delete the file. The script has no `$PSScriptRoot`, no `$PSCommandPath` and no arguments. One confirmation covers the whole operation and shows the whole script and its SHA-256. The prefix list `WINRIG_ALLOWED_COMMANDS` does not filter a script |
 
 ## Switches that enable the modifying tools
 
 | Switch | Effect |
 |--------|--------|
 | `WINRIG_ALLOW_FILE_WRITE=true` | Declares the tool `write_file`. While the value is `false`, the server removes the tool from the router |
-| `WINRIG_MAX_WRITE_BYTES` | The largest content that `write_file` accepts, in bytes (64 KiB by default) |
+| `WINRIG_MAX_WRITE_BYTES` | The largest content that `write_file` and the uploaded `run_script` script accept, in bytes (64 KiB by default) |
 | `WINRIG_ALLOW_COMMAND_EXEC=true` | Declares the tool `run_command`. While the value is `false`, the server removes the tool from the router |
+| `WINRIG_ALLOW_SCRIPT_EXEC=true` | Declares the tool `run_script`. While the value is `false`, the server removes the tool from the router |
 | `WINRIG_ALLOWED_COMMANDS` | The command allowlist, comma-separated. An empty value admits any command. A prefix is not a boundary (ADR-0013 §18) |
 | `WINRIG_CONFIRM_FALLBACK` | `refuse` (default) or `proceed`. With `proceed` a client without elicitation runs a modifying operation, and the audit marks the run (TR-SEC-11) |
 | `WINRIG_ALLOW_INSECURE_TLS=true` | Permits `verify_cert=false` on `connect`. By default the server rejects it |
 
-`run_command` runs one PowerShell command that the operator confirms. The server encodes the command text as a base64 UTF-16 string. It decodes the string into a script block, so the text cannot break out of the generated wrapper. The command must fit one WinRS command line, so the text holds at most 976 characters. `WINRIG_ALLOWED_COMMANDS` is a prefix list, matched without case after a trim. An empty list admits any command. The list is not a boundary. A leading `&`, `.`, `powershell -c`, an alias, a call operator and an encoded command all go around it. Any text after an allowed prefix runs. So `;`, a newline, `|` and `$(...)` do not return control to the list. An entry of `&` or `.` alone admits every command. A script written with `write_file` and then started also goes around it. With `run_command` on and an empty list, the path protection of the other tools stops being a guarantee of the product (ADR-0013 §18).
+`run_command` runs one PowerShell command that the operator confirms. The server encodes the command text as a base64 UTF-16 string. It decodes the string into a script block, so the text cannot break out of the generated wrapper. The command must fit one WinRS command line, so the text holds at most 979 characters. `WINRIG_ALLOWED_COMMANDS` is a prefix list, matched without case after a trim. An empty list admits any command. The list is not a boundary. A leading `&`, `.`, `powershell -c`, an alias, a call operator and an encoded command all go around it. Any text after an allowed prefix runs. So `;`, a newline, `|` and `$(...)` do not return control to the list. An entry of `&` or `.` alone admits every command. A script written with `write_file` and then started also goes around it. With `run_command` on and an empty list, the path protection of the other tools stops being a guarantee of the product (ADR-0013 §18).
+
+`run_script` runs a PowerShell script that is longer than one WinRS command line. It is off by default (`WINRIG_ALLOW_SCRIPT_EXEC`). The server writes the script into a temporary `.ps1` in the session temp directory in chunks. It reads the file and runs its text as a script block, then tries to delete the file. The script has no `$PSScriptRoot`, no `$PSCommandPath` and no arguments. The tool shows the SHA-256 of the script in the confirmation and records it in the audit, and it verifies the hash before the run. One confirmation covers the whole operation and shows the whole script, line by line and without the 200-character cap. `WINRIG_ALLOWED_COMMANDS` does not filter a script, because the server cannot prefix-check the text of a script in a meaningful way; the confirmation states this. The script obeys `WINRIG_MAX_WRITE_BYTES`, and the output obeys the same limits as `run_command`. The result carries `temp_file` with the cleanup outcome, and a `warning` when the temporary file may remain. The tool can fail if the script produces no output for 60 seconds (ADR-0017 §29–34).
 
 :::danger
-`delete_file`, `delete_directory` and `write_file` reject protected paths and reparse points. Do not call them on a volume root or a system directory. Data loss can occur. `run_command` has no path protection at all: one command can delete or rewrite anything the account can reach.
+`delete_file`, `delete_directory` and `write_file` reject protected paths and reparse points. Do not call them on a volume root or a system directory. Data loss can occur. `run_command` and `run_script` have no path protection at all: one command or script can delete or rewrite anything the account can reach.
 :::
 
 :::note

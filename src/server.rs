@@ -22,10 +22,10 @@ use crate::identity::RequestIdentity;
 use crate::policy::{
     DeleteScan, FileScan, PolicyDecision, WriteScan, decide_command, decide_command_length,
     decide_delete_path, decide_delete_scan, decide_file_delete, decide_host, decide_port,
-    decide_service_target, decide_tls, decide_write_path, decide_write_scan,
+    decide_script_size, decide_service_target, decide_tls, decide_write_path, decide_write_scan,
 };
 use crate::ps;
-use crate::session::{SessionRegistry, UserIdentity};
+use crate::session::{ScriptRun, SessionRegistry, UserIdentity};
 
 #[derive(Clone)]
 pub struct WinrigServer {
@@ -159,6 +159,7 @@ const EFFECT_SET_START_TYPE: &str = "This changes the start type. The service st
                                      it, set the start type again.";
 const EFFECT_RUN_COMMAND: &str =
     "This runs an arbitrary PowerShell command on the host. You cannot undo it.";
+const EFFECT_RUN_SCRIPT: &str = "This uploads and runs an arbitrary PowerShell script, then tries to delete the file. You cannot undo it.";
 
 impl WinrigServer {
     #[must_use]
@@ -184,6 +185,9 @@ impl WinrigServer {
         }
         if !config.allow_command_exec {
             router.remove_route("run_command");
+        }
+        if !config.allow_script_exec {
+            router.remove_route("run_script");
         }
         router
     }
@@ -493,22 +497,28 @@ fn random_suffix() -> String {
     })
 }
 
-/// The written file body reaches the command only as `FromBase64String('...')`,
-/// so a list of one or two items covers the whole secret in the command (DR-4).
-fn base64_payloads(command: &str) -> Vec<String> {
-    const OPEN: &str = "FromBase64String('";
-    let mut out = Vec::new();
-    let mut rest = command;
-    while let Some(start) = rest.find(OPEN) {
-        rest = &rest[start + OPEN.len()..];
-        let Some(end) = rest.find('\'') else { break };
-        let payload = &rest[..end];
-        if !payload.is_empty() {
-            out.push(payload.to_owned());
-        }
-        rest = &rest[end..];
+/// Checks the staging path the host reported: one line, absolute, and exactly the
+/// file name the tool asked for (ADR-0017 §31).
+///
+/// The host resolves `$env:TEMP`, so the value is untrusted. A path with a line
+/// break, a relative path or another file name is refused before the confirmation
+/// and before any command carries it.
+fn validated_temp_path(raw: &str, suffix: &str) -> Option<String> {
+    let path = raw.trim();
+    if path.is_empty() || path.contains(['\n', '\r']) {
+        return None;
     }
-    out
+    let bytes = path.as_bytes();
+    let absolute = path.starts_with("\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'\\' || bytes[2] == b'/'));
+    if !absolute {
+        return None;
+    }
+    let name = path.rsplit(['\\', '/']).next().unwrap_or_default();
+    (name == format!("winrig-{suffix}.ps1")).then(|| path.to_owned())
 }
 
 fn cancelled(action: &str) -> CallToolResult {
@@ -1135,9 +1145,19 @@ struct RunCommandParams {
     #[schemars(description = "Session ID that connect returns.")]
     session_id: String,
     #[schemars(
-        description = "PowerShell command to run on the host. The confirmation shows the full text. The encoded wrapper must fit one WinRS command line, so the command holds at most 976 UTF-16 units; a longer script goes through write_file and then runs by path."
+        description = "PowerShell command to run on the host. The confirmation shows the full text. The encoded wrapper must fit one WinRS command line, so the command holds at most 979 UTF-16 units; a longer script goes through write_file and then runs by path."
     )]
     command: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RunScriptParams {
+    #[schemars(description = "Session ID that connect returns.")]
+    session_id: String,
+    #[schemars(
+        description = "PowerShell script to run on the host. The confirmation shows the whole script. The script obeys WINRIG_MAX_WRITE_BYTES and may be longer than one WinRS command line. The prefix list WINRIG_ALLOWED_COMMANDS does not filter a script."
+    )]
+    script: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2487,7 +2507,7 @@ impl WinrigServer {
         // reaches it.
         let steps = plan.len();
         for (index, command) in plan.iter().enumerate() {
-            let secrets = base64_payloads(command);
+            let secrets = ps::base64_payloads(command);
             let reply = self
                 .run_value_redacted(
                     &identity,
@@ -2526,7 +2546,7 @@ impl WinrigServer {
 
     #[tool(
         name = "run_command",
-        description = "Run an arbitrary PowerShell command on the host. This modifying operation prompts for confirmation and shows the full command text. The server refuses a command outside a non-empty WINRIG_ALLOWED_COMMANDS before the call. The encoded wrapper must fit one WinRS command line, so the command holds at most 976 UTF-16 units. For a longer script, write it with write_file and then run it by path. The status code is the exit code of the last native command when it is set, even if the script handled the failure."
+        description = "Run an arbitrary PowerShell command on the host. This modifying operation prompts for confirmation and shows the full command text. The server refuses a command outside a non-empty WINRIG_ALLOWED_COMMANDS before the call. The encoded wrapper must fit one WinRS command line, so the command holds at most 979 UTF-16 units. For a longer script, write it with write_file and then run it by path. The status code is the exit code of the last native command when it is set, even if the script handled the failure."
     )]
     async fn run_command(
         &self,
@@ -2573,7 +2593,7 @@ impl WinrigServer {
         );
         // DR-4, ADR-0013 §3: the audit redacts the session password and the
         // wrapper's base64, and records the rest of the command text as it is.
-        let secrets = base64_payloads(&command);
+        let secrets = ps::base64_payloads(&command);
         Ok(CallToolResult::structured(
             self.registry
                 .run_ps_displayed(
@@ -2583,6 +2603,111 @@ impl WinrigServer {
                     &params.command,
                     "run_command",
                     &secrets,
+                    &[],
+                )
+                .await,
+        ))
+    }
+
+    #[tool(
+        name = "run_script",
+        description = "Run a PowerShell script that is longer than one WinRS command line. The tool writes the script into a temporary .ps1 in the session temp directory, reads the file and runs its text as a script block, then tries to delete the file. The script has no $PSScriptRoot and no $PSCommandPath, and param() receives no arguments. This modifying operation prompts for one confirmation that shows the whole script and its SHA-256. The server declares the tool only with WINRIG_ALLOW_SCRIPT_EXEC; the prefix list WINRIG_ALLOWED_COMMANDS does not filter a script. The script obeys WINRIG_MAX_WRITE_BYTES. The tool can fail if the script produces no output for 60 seconds. The status code is the exit code of the last native command when it is set, even if the script handled the failure."
+    )]
+    async fn run_script(
+        &self,
+        Parameters(params): Parameters<RunScriptParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let identity = self.identity(&ctx)?;
+        if params.script.trim().is_empty() {
+            return Ok(CallToolResult::structured(
+                json!({ "error": "the script is empty" }),
+            ));
+        }
+        // TR-EXE-06, AC-EXE-07: the size limit is a policy refusal before any host
+        // call, so it reaches the audit and names the limit.
+        let size = decide_script_size(params.script.len(), self.config.max_write_bytes);
+        if !size.allow {
+            self.audit_refusal(&identity, "run_script", &size);
+            return Ok(CallToolResult::structured(json!({ "error": size.reason })));
+        }
+        if let Some(result) = self.missing_session(&identity, &params.session_id) {
+            return Ok(result);
+        }
+        // ADR-0017 §31: the staging file lives in the session temp directory with a
+        // random name, so two parallel calls or two users do not collide. The host
+        // resolves the directory; this read is not a write, so DR-5 is not touched.
+        let suffix = random_suffix();
+        let probed = self
+            .run_value(
+                &identity,
+                &params.session_id,
+                &ps::script_temp_path(&suffix),
+                "run_script",
+            )
+            .await;
+        let Some(raw) = Self::successful_stdout(&probed) else {
+            return Ok(CallToolResult::structured(json!({
+                "error": probed
+                    .get("stderr")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| probed.get("error").and_then(serde_json::Value::as_str))
+                    .unwrap_or("The host did not report its temp directory"),
+                "probe": probed,
+            })));
+        };
+        // The path comes from the host, so it is validated before it enters any
+        // command: one line, absolute, and the file name that the tool asked for.
+        let Some(temp_path) = validated_temp_path(&raw, &suffix) else {
+            return Ok(CallToolResult::structured(json!({
+                "error": "The host returned an unexpected staging path. The tool refused the run.",
+                "temp_path": raw.trim(),
+            })));
+        };
+        let hash = ps::script_sha256(&params.script);
+        // The whole plan and the run command are built before the confirmation, so
+        // a script that cannot run is refused instead of confirmed (AC-EXE-07).
+        let plan = match ps::script_plan(&temp_path, &params.script, self.config.max_write_bytes) {
+            Ok(plan) => plan,
+            Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
+        };
+        let run = match ps::run_script_file(&temp_path, &hash) {
+            Ok(command) => command,
+            Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
+        };
+        let cleanup = ps::script_cleanup(&temp_path);
+
+        // TR-EXE-07, DR-5: one confirmation covers the upload, the run and the
+        // delete, and it shows the whole script and its SHA-256 (TR-SEC-22). The
+        // staging file is not an operator target, so the write boundary does not
+        // apply (ADR-0017 §32); the prompt names its path.
+        require_confirmation!(
+            &self,
+            &ctx,
+            self.confirmation(&identity, &params.session_id, "run_script", "RUN SCRIPT")
+                .path("Temporary path", &temp_path)
+                .field("Bytes", &params.script.len().to_string())
+                .field("SHA-256", &hash)
+                .field("Command allowlist", "does not filter a script")
+                .body("Script", &params.script)
+                .effect(EFFECT_RUN_SCRIPT)
+        );
+        // DR-4: the audit shows the script text and the confirmed hash, and the
+        // chunk base64 is redacted; the staging file is removed on every outcome
+        // (TR-EXE-06).
+        Ok(CallToolResult::structured(
+            self.registry
+                .run_script(
+                    &identity.username,
+                    &params.session_id,
+                    ScriptRun {
+                        chunks: plan.as_slice(),
+                        run: run.as_str(),
+                        cleanup: cleanup.as_str(),
+                        display: params.script.as_str(),
+                        hash: &hash,
+                    },
+                    "run_script",
                 )
                 .await,
         ))
@@ -2978,6 +3103,55 @@ mod tests {
         assert!(on.tool_router.has_route("run_command"));
     }
 
+    /// TR-EXE-05, AC-EXE-05: a disabled `run_script` is not advertised and has no
+    /// route. Enabling it adds exactly one tool.
+    #[test]
+    fn run_script_is_absent_until_the_operator_enables_it() {
+        let off = server_with(&[]);
+        let names: Vec<String> = off
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert!(
+            !names.iter().any(|name| name == "run_script"),
+            "run_script must not be advertised while disabled"
+        );
+        assert_eq!(names.len(), 43, "expected 43 tools without run_script");
+        assert!(!off.tool_router.has_route("run_script"));
+
+        let on = server_with(&[("WINRIG_ALLOW_SCRIPT_EXEC", "true")]);
+        let names: Vec<String> = on
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert!(names.iter().any(|name| name == "run_script"));
+        assert_eq!(names.len(), 44, "expected 44 tools with run_script");
+        assert!(on.tool_router.has_route("run_script"));
+    }
+
+    /// TR-EXE-06, AC-EXE-07: a script above the byte limit is refused before the
+    /// network with the real size and the limit. The plan carries the same
+    /// refusal.
+    #[test]
+    fn run_script_refuses_a_script_above_the_limit() {
+        let limit = 64 * 1024;
+        let over = "a".repeat(limit + 1);
+        let decision = decide_script_size(over.len(), limit);
+        assert!(!decision.allow);
+        assert_eq!(decision.code, "SCRIPT_TOO_LONG");
+        assert!(decision.reason.contains(&(limit + 1).to_string()));
+        assert!(decision.reason.contains(&limit.to_string()));
+        assert!(
+            ps::script_plan("C:\\Temp\\winrig-a.ps1", &over, limit).is_err(),
+            "the plan must refuse the over-long script"
+        );
+        assert!(ps::script_plan("C:\\Temp\\winrig-a.ps1", "Write-Output 1", limit).is_ok());
+    }
+
     /// TR-EXE-02, AC-EXE-02: a command inside a non-empty allowlist reaches the
     /// transport; a command outside it is refused by the policy before the
     /// network. The confirmation branch is covered through the MCP harness in
@@ -3116,16 +3290,36 @@ mod tests {
         assert!(first.chars().all(|c| c.is_ascii_hexdigit()), "{first}");
     }
 
+    /// TR-EXE-06: the staging path the host reports is validated before it enters
+    /// any command. A relative path, a line break or another file name is refused.
+    #[test]
+    fn staging_path_is_validated_against_the_requested_name() {
+        assert_eq!(
+            validated_temp_path("C:\\Windows\\Temp\\winrig-abc.ps1", "abc").as_deref(),
+            Some("C:\\Windows\\Temp\\winrig-abc.ps1")
+        );
+        assert_eq!(
+            validated_temp_path("\\\\host\\share\\winrig-abc.ps1", "abc").as_deref(),
+            Some("\\\\host\\share\\winrig-abc.ps1")
+        );
+        // Another file, a relative path and a line break are all refused.
+        assert!(validated_temp_path("C:\\Windows\\System32\\x.ps1", "abc").is_none());
+        assert!(validated_temp_path("Temp\\winrig-abc.ps1", "abc").is_none());
+        assert!(validated_temp_path("C:\\Temp\\winrig-abc.ps1\nX", "abc").is_none());
+        assert!(validated_temp_path("C:\\Temp\\winrig-other.ps1", "abc").is_none());
+        assert!(validated_temp_path("  ", "abc").is_none());
+    }
+
     /// DR-4: the file body travels in the command as base64 and must not reach
     /// the audit. Exactly what the command carries is redacted.
     #[test]
     fn base64_payload_is_extracted_for_redaction() {
         let command = ps::write_chunk("C:\\Temp\\p", "c2VjcmV0", true);
-        assert_eq!(base64_payloads(&command), vec!["c2VjcmV0".to_owned()]);
+        assert_eq!(ps::base64_payloads(&command), vec!["c2VjcmV0".to_owned()]);
         // A command with no payload yields no false secrets: an empty string
         // would redact the whole output.
-        assert!(base64_payloads(&ps::write_scan("C:\\a")).is_empty());
-        assert!(base64_payloads(&ps::write_chunk("C:\\Temp\\p", "", true)).is_empty());
+        assert!(ps::base64_payloads(&ps::write_scan("C:\\a")).is_empty());
+        assert!(ps::base64_payloads(&ps::write_chunk("C:\\Temp\\p", "", true)).is_empty());
     }
 
     /// TR-FS-02: a write to a protected path is refused by the policy before the network.
@@ -3152,16 +3346,18 @@ mod tests {
         );
         assert!(tools.iter().any(|tool| tool.name == "delete_directory"));
         assert!(tools.iter().any(|tool| tool.name == "run_command"));
+        assert!(tools.iter().any(|tool| tool.name == "run_script"));
         // An exact count: "at least 30" would catch neither a lost tool nor a
         // duplicate. These are all declared tools; the configuration decides
-        // how many the agent sees (TR-FS-01, TR-EXE-01), and
-        // `write_file_is_absent_until_the_operator_enables_it` and
-        // `run_command_is_absent_until_the_operator_enables_it` check that.
-        assert_eq!(tools.len(), 45, "expected 45 declared tools");
+        // how many the agent sees (TR-FS-01, TR-EXE-01, TR-EXE-05), and
+        // `write_file_is_absent_until_the_operator_enables_it`,
+        // `run_command_is_absent_until_the_operator_enables_it` and
+        // `run_script_is_absent_until_the_operator_enables_it` check that.
+        assert_eq!(tools.len(), 46, "expected 46 declared tools");
         let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 45, "tool names must be unique");
+        assert_eq!(names.len(), 46, "tool names must be unique");
     }
 
     #[test]
@@ -3179,6 +3375,7 @@ mod tests {
             "kill_process",
             "restart_service",
             "run_command",
+            "run_script",
             "set_registry",
             "set_service_start_type",
             "start_service",
@@ -3215,6 +3412,7 @@ mod tests {
             EFFECT_DELETE_DIRECTORY,
             EFFECT_SET_START_TYPE,
             EFFECT_RUN_COMMAND,
+            EFFECT_RUN_SCRIPT,
         ] {
             assert!(!effect.is_empty(), "an effect line is empty");
             assert!(

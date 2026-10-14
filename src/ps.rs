@@ -90,12 +90,19 @@ fn fits_command_line(script: &str) -> bool {
 ///
 /// The escaped temporary path is fixed, so only the chunk decides the length.
 fn max_chunk_bytes(temp_path: &str) -> usize {
+    max_chunk_bytes_with(temp_path, |path, chunk| write_chunk(path, chunk, false))
+}
+
+/// The largest chunk whose command, built by `command`, still fits one command
+/// line. The command varies (create, append, `CreateNew`), so the search uses the
+/// real builder instead of an estimate.
+fn max_chunk_bytes_with(temp_path: &str, command: impl Fn(&str, &str) -> String) -> usize {
     let mut lo = 0usize;
     let mut hi = WRITE_CHUNK_BYTES;
     while lo < hi {
         let mid = lo + (hi - lo).div_ceil(2);
         let bytes = vec![0u8; mid];
-        if fits_command_line(&write_chunk(temp_path, &encode_base64(&bytes), false)) {
+        if fits_command_line(&command(temp_path, &encode_base64(&bytes))) {
             lo = mid;
         } else {
             hi = mid - 1;
@@ -232,11 +239,7 @@ pub fn write_plan(
         && fits_command_line(&commit)
         && fits_command_line(&write_abort(temp_path));
     if !fits {
-        return Err(format!(
-            "path is {} characters; the write must fit one WinRS command line of \
-             {WINRS_COMMAND_LINE_LIMIT} characters; shorten the path",
-            path.chars().count()
-        ));
+        return Err(path_too_long(path));
     }
     let mut plan: Vec<String> = bytes
         .chunks(chunk)
@@ -265,18 +268,200 @@ pub fn write_abort(temp_path: &str) -> String {
     )
 }
 
+/// The refusal for a path whose commands cannot fit one WinRS command line.
+fn path_too_long(path: &str) -> String {
+    format!(
+        "path is {} characters; the write must fit one WinRS command line of \
+         {WINRS_COMMAND_LINE_LIMIT} characters; shorten the path",
+        path.chars().count()
+    )
+}
+
+/// The base64 strings that a generated write command carries in
+/// `FromBase64String('...')`, so exactly what the command holds is redacted from
+/// the audit and the reply (DR-4).
+#[must_use]
+pub fn base64_payloads(command: &str) -> Vec<String> {
+    const OPEN: &str = "FromBase64String('";
+    let mut out = Vec::new();
+    let mut rest = command;
+    while let Some(start) = rest.find(OPEN) {
+        rest = &rest[start + OPEN.len()..];
+        let Some(end) = rest.find('\'') else { break };
+        let payload = &rest[..end];
+        if !payload.is_empty() {
+            out.push(payload.to_owned());
+        }
+        rest = &rest[end..];
+    }
+    out
+}
+
+/// A host command that returns the full path of a staging `.ps1` in the session
+/// temp directory (ADR-0017 §31). `$env:TEMP` comes from the environment, so the
+/// path agrees with the host locale.
+#[must_use]
+pub fn script_temp_path(suffix: &str) -> String {
+    let safe = escape(suffix);
+    format!(
+        "$d = $env:TEMP; if ([string]::IsNullOrEmpty($d)) {{ $d = [IO.Path]::GetTempPath() }}; \
+         [IO.Path]::Combine($d, 'winrig-{safe}.ps1')"
+    )
+}
+
+/// The lowercase hex SHA-256 of the script bytes, exactly the content that reaches
+/// the staging file (TR-EXE-06). The run step compares it against the hash of the
+/// bytes it reads, so a change between the confirmation and the run stops the
+/// script.
+#[must_use]
+pub fn script_sha256(script: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(script.as_bytes())
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            use std::fmt::Write;
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
+/// The first staging chunk. `CreateNew` refuses an existing file, so a stale or
+/// racing temporary file is not overwritten (TR-EXE-06). The later chunks append.
+#[must_use]
+pub fn script_chunk_create(path: &str, chunk_base64: &str) -> String {
+    let safe = escape(path);
+    let safe_chunk = escape(chunk_base64);
+    format!(
+        "$bytes=[Convert]::FromBase64String('{safe_chunk}'); \
+         $f=[IO.File]::Open('{safe}','CreateNew'); \
+         $f.Write($bytes,0,$bytes.Length); $f.Close()"
+    )
+}
+
+/// The exit code of the run step when the staging file does not match the
+/// confirmed SHA-256 (TR-EXE-06).
+pub const SCRIPT_HASH_MISMATCH_EXIT: i32 = 97;
+
+/// The marker in the run stderr that names a SHA-256 mismatch (TR-EXE-06). The
+/// caller looks for it to add a plain error to the reply.
+pub const SCRIPT_HASH_MISMATCH_MARKER: &str = "does not match the confirmed SHA-256";
+
+/// The wrapper that verifies and runs the staging script (ADR-0017 §31,
+/// TR-EXE-06).
+///
+/// The bytes are read once into `$b`, so the check and the run use the same
+/// content and no gap stands between them. The SHA-256 is computed inside
+/// `try`/`catch`, so an exception (for example under a strict FIPS policy) leaves
+/// `$h` empty and the guard refuses; a bare computation inside the `if` would end
+/// only that statement and the script would still run. The guard exits with
+/// [`SCRIPT_HASH_MISMATCH_EXIT`] when `$h` differs from the confirmed value. The
+/// text is decoded from the same `$b` and its leading U+FEFF is dropped.
+///
+/// The text becomes a script block instead of being started by path: a host with
+/// the `Restricted` execution policy still runs a script block built from text.
+/// The block runs from the expression, so no variable holds the text or the
+/// block. The consequence is that `$PSScriptRoot` and `$PSCommandPath` are empty
+/// inside the script and `param()` receives no arguments. A native command sets
+/// `$LASTEXITCODE`; the wrapper exits with it, so `status_code` agrees with
+/// `run_command`.
+///
+/// # Errors
+///
+/// An error text when the run command does not fit one WinRS command line.
+pub fn run_script_file(path: &str, expected_sha256: &str) -> Result<String, String> {
+    let safe = escape(path);
+    let safe_hash = escape(expected_sha256);
+    let script = format!(
+        "$global:LASTEXITCODE=$null; \
+         $b=[IO.File]::ReadAllBytes('{safe}'); \
+         try {{ $h=[BitConverter]::ToString([Security.Cryptography.SHA256CryptoServiceProvider]::new()\
+         .ComputeHash($b)).Replace('-','').ToLowerInvariant() }} catch {{ $h='' }}; \
+         if ($h -ne '{safe_hash}') {{ Write-Error 'The uploaded script {SCRIPT_HASH_MISMATCH_MARKER}. \
+         The tool did not run it.'; exit {SCRIPT_HASH_MISMATCH_EXIT} }}; \
+         &([ScriptBlock]::Create(([Text.Encoding]::UTF8.GetString($b)).TrimStart([char]0xFEFF))); \
+         $ok=$?; if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; if (-not $ok) {{ exit 1 }}"
+    );
+    if !fits_command_line(&script) {
+        return Err(path_too_long(path));
+    }
+    Ok(script)
+}
+
+/// The command that removes the staging file and reports the outcome (TR-EXE-06).
+///
+/// `-ErrorAction Stop` makes a failed removal a nonzero exit, so the caller can
+/// report it instead of losing it in silence.
+#[must_use]
+pub fn script_cleanup(path: &str) -> String {
+    let safe = escape(path);
+    format!(
+        "if (Test-Path -LiteralPath '{safe}') {{ Remove-Item -LiteralPath '{safe}' -Force \
+         -ErrorAction Stop; Write-Output 'removed' }} else {{ Write-Output 'absent' }}"
+    )
+}
+
+/// The full plan of a `run_script` staging write: the content chunks that create
+/// and append the `.ps1` file (TR-EXE-06, ADR-0017 §31).
+///
+/// The plan is built entirely before the confirmation, so the size limit and a
+/// path too long are refused without a call to the host (AC-EXE-07). The first
+/// chunk creates the file with `CreateNew` and the rest append. Unlike
+/// `write_plan` there is no rename, because the staging file is written in place
+/// and thrown away.
+///
+/// # Errors
+///
+/// An error text when the script exceeds `max_bytes`, when a chunk would fall
+/// below the minimum, or when the run or the cleanup command does not fit one
+/// WinRS command line.
+pub fn script_plan(path: &str, script: &str, max_bytes: usize) -> Result<Vec<String>, String> {
+    let bytes = script.as_bytes();
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "script is {} bytes, above the limit of {max_bytes}; \
+             raise WINRIG_MAX_WRITE_BYTES or shorten the script",
+            bytes.len()
+        ));
+    }
+    run_script_file(path, &script_sha256(script))?;
+    if !fits_command_line(&script_cleanup(path)) {
+        return Err(path_too_long(path));
+    }
+    // The first chunk uses the longer `CreateNew` command, so the chunk is sized
+    // by the smaller of the create and the append budget.
+    let chunk = max_chunk_bytes_with(path, script_chunk_create).min(max_chunk_bytes(path));
+    if chunk < MIN_WRITE_CHUNK_BYTES {
+        return Err(path_too_long(path));
+    }
+    let mut plan: Vec<String> = bytes
+        .chunks(chunk)
+        .enumerate()
+        .map(|(index, part)| {
+            if index == 0 {
+                script_chunk_create(path, &encode_base64(part))
+            } else {
+                write_chunk(path, &encode_base64(part), false)
+            }
+        })
+        .collect();
+    if plan.is_empty() {
+        plan.push(script_chunk_create(path, ""));
+    }
+    Ok(plan)
+}
+
 /// The generated wrapper that decodes the base64 command text, runs it as a script
 /// block and returns its exit code (TR-EXE-04).
 ///
 /// A native command sets `$LASTEXITCODE`; the wrapper exits with it. Otherwise a
 /// failed command (`$?` false) exits with 1, so `status_code` shows the failure.
 /// `$global:LASTEXITCODE` is cleared first, so a value from the preamble cannot leak.
+/// The block runs from the expression, so no variable holds the command text.
 fn run_command_wrapper(encoded: &str) -> String {
     format!(
         "$global:LASTEXITCODE=$null; \
-         $c=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{encoded}')); \
-         &([ScriptBlock]::Create($c)); $ok=$?; \
-         if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; if (-not $ok) {{ exit 1 }}"
+         &([ScriptBlock]::Create([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{encoded}')))); \
+         $ok=$?; if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; if (-not $ok) {{ exit 1 }}"
     )
 }
 
@@ -4271,7 +4456,7 @@ mod tests {
     /// and fails this test on purpose, and the docs must move with it.
     #[test]
     fn max_command_length_is_the_stated_limit() {
-        assert_eq!(max_command_chars(), 976);
+        assert_eq!(max_command_chars(), 979);
     }
 
     /// TR-FS-05: for a short path the full chunk fits one command line, measured
@@ -4468,6 +4653,132 @@ mod tests {
         assert!(command.contains("SilentlyContinue"), "{command}");
     }
 
+    /// TR-EXE-06: the staging plan refuses a script above the byte limit and one
+    /// that does not fit the command line, and the refusal names both numbers.
+    #[test]
+    fn script_plan_refuses_above_the_limit() {
+        let over = "x".repeat(5000);
+        let error = script_plan("C:\\Temp\\winrig-a.ps1", &over, 4096).expect_err("above");
+        assert!(error.contains("5000"), "{error}");
+        assert!(error.contains("4096"), "{error}");
+        assert!(script_plan("C:\\Temp\\winrig-a.ps1", "Write-Output 1", 4096).is_ok());
+    }
+
+    /// TR-EXE-06: the first staging chunk creates the file with `CreateNew` and the
+    /// rest append, and the plan carries no rename (the staging file is written in
+    /// place).
+    #[test]
+    fn script_plan_chunks_create_and_append_without_a_rename() {
+        let content = "x".repeat(WRITE_CHUNK_BYTES + 10);
+        let plan = script_plan("C:\\Temp\\winrig-a.ps1", &content, 64 * 1024).expect("valid");
+        assert_eq!(plan.len(), 2, "two chunks, no commit: {plan:#?}");
+        assert!(plan[0].contains("'CreateNew'"), "{}", plan[0]);
+        assert!(!plan[0].contains("Append"), "{}", plan[0]);
+        assert!(plan[1].contains("Append"), "{}", plan[1]);
+        assert!(
+            !plan.iter().any(|step| step.contains("Move-Item")),
+            "the staging write must not rename: {plan:#?}"
+        );
+    }
+
+    /// TR-EXE-06, ADR-0017 §31: the run verifies the SHA-256, reads the bytes once
+    /// and runs the text as a script block from the expression, so the `Restricted`
+    /// execution policy does not block it and no variable holds the text.
+    #[test]
+    fn script_run_uses_a_script_block_not_a_path() {
+        let hash = script_sha256("Write-Output 1");
+        let command = run_script_file("C:\\Temp\\winrig-a.ps1", &hash).expect("fits");
+        assert!(command.contains("[ScriptBlock]::Create"), "{command}");
+        assert!(
+            command.contains("ReadAllBytes('C:\\Temp\\winrig-a.ps1')"),
+            "{command}"
+        );
+        // The hash is computed inside try/catch, and the guard follows it, so an
+        // exception (empty `$h`) refuses instead of running the script (fail-closed).
+        assert!(
+            command.contains("try { $h=["),
+            "the hash must be computed inside try: {command}"
+        );
+        assert!(command.contains("catch { $h='' }"), "{command}");
+        assert!(command.contains("SHA256CryptoServiceProvider"), "{command}");
+        assert!(
+            command.contains(&format!("if ($h -ne '{hash}')")),
+            "{command}"
+        );
+        assert!(command.contains("UTF8.GetString($b)"), "{command}");
+        assert!(command.contains("TrimStart([char]0xFEFF)"), "{command}");
+        assert!(
+            command.contains(&format!("exit {SCRIPT_HASH_MISMATCH_EXIT}")),
+            "{command}"
+        );
+        assert!(
+            command.contains(SCRIPT_HASH_MISMATCH_MARKER),
+            "the mismatch path must carry a clear message: {command}"
+        );
+        // The comparison and the guard come before any script block, so the script
+        // cannot run unless `$h` equals the confirmed value.
+        let catch = command.find("catch { $h='' }").expect("catch");
+        let guard = command.find("if ($h -ne").expect("guard");
+        let block = command.find("[ScriptBlock]::Create").expect("block");
+        assert!(
+            catch < guard && guard < block,
+            "the guard must stand between the check and the run: {command}"
+        );
+        assert!(
+            !command.contains("[IO.File]::ReadAllText"),
+            "the file must be read as bytes: {command}"
+        );
+        assert!(
+            !command.contains("$c="),
+            "the command text must come from the expression: {command}"
+        );
+    }
+
+    /// TR-EXE-06: the first staging chunk refuses an existing file with
+    /// `CreateNew`, and the later chunks append.
+    #[test]
+    fn script_first_chunk_uses_create_new() {
+        let first = script_chunk_create("C:\\Temp\\winrig-a.ps1", "QUJD");
+        assert!(first.contains("'CreateNew'"), "{first}");
+        assert!(!first.contains("WriteAllBytes"), "{first}");
+        let next = write_chunk("C:\\Temp\\winrig-a.ps1", "QUJD", false);
+        assert!(next.contains("'Append'"), "{next}");
+    }
+
+    /// TR-EXE-06: the SHA-256 is stable and lowercase hex.
+    #[test]
+    fn script_sha256_is_lowercase_hex() {
+        let hash = script_sha256("abc");
+        assert_eq!(
+            hash,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(hash.len(), 64);
+        assert_ne!(script_sha256("a"), script_sha256("b"));
+    }
+
+    /// TR-EXE-06: the cleanup reports `removed` or `absent`, and a failed removal
+    /// stops the script so the caller sees it.
+    #[test]
+    fn script_cleanup_reports_the_outcome() {
+        let command = script_cleanup("C:\\Temp\\winrig-a.ps1");
+        assert!(command.contains("Remove-Item"), "{command}");
+        assert!(command.contains("-ErrorAction Stop"), "{command}");
+        assert!(
+            command.contains("'removed'") && command.contains("'absent'"),
+            "{command}"
+        );
+    }
+
+    /// TR-EXE-06: the staging temp path comes from the host environment, so the
+    /// command is independent of the host locale.
+    #[test]
+    fn script_temp_path_reads_the_temp_directory() {
+        let command = script_temp_path("abc");
+        assert!(command.contains("$env:TEMP"), "{command}");
+        assert!(command.contains("'winrig-abc.ps1'"), "{command}");
+    }
+
     /// TR-SEC-12: PowerShell ends a single-quoted string at any of the five
     /// characters, not only at the ASCII apostrophe.
     #[test]
@@ -4595,10 +4906,16 @@ mod tests {
             delete_file_scan(text),
             delete_directory_scan(text, 10),
             run_command(text).expect("valid"),
+            script_temp_path(text),
+            run_script_file(text, &script_sha256(text)).expect("valid"),
+            script_cleanup(text),
+            script_chunk_create(text, text),
+            script_sha256(text),
         ];
         // write_plan returns every command of a whole plan, so the plan is
         // flattened into the list.
         commands.extend(write_plan(text, text, text, "utf8", 1_000_000).expect("valid"));
+        commands.extend(script_plan(text, text, 1_000_000).expect("valid"));
         commands
     }
 

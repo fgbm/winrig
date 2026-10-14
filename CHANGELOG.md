@@ -20,6 +20,13 @@ A release goes out under the tag `vX.Y.Z`; the tag starts `.github/workflows/rel
 - The read-only tool `get_service_config` and the modifying tool `set_service_start_type`; `stop_service` verifies the stop (#10).
 - The subcommand `winrig doctor`, which compares the settings of the winrig servers in the client configuration (#24).
 - The `summary` mode and the `pid` and `process` filters of `get_tcp_connections` (#20).
+- The modifying tool `run_command`, behind `WINRIG_ALLOW_COMMAND_EXEC`. The command goes in an encoded wrapper, holds at most 979 UTF-16 units, and the confirmation shows its full text. The optional prefix list `WINRIG_ALLOWED_COMMANDS` filters it (#14).
+- `WINRIG_CONFIRM_FALLBACK=proceed`, which runs a modifying tool without a confirmation only when the client declared no elicitation capability (#14).
+- The modifying tool `run_script`, behind `WINRIG_ALLOW_SCRIPT_EXEC`. It stages a temporary script on the host, checks its SHA-256 and runs it as a script block (#14).
+- The operator allowlist `WINRIG_WRITE_ALLOW_PATHS`, which permits a write under a protected path. The confirmation warns for a system directory, a volume root or a share root (#13).
+- The modifying tools `copy_file`, `move_file`, `rename_file` and `create_directory`, behind `WINRIG_ALLOW_FILE_OPS` (#12).
+- The modifying tools `download_file` and `upload_file`, behind `WINRIG_ALLOW_FILE_DOWNLOAD` and `WINRIG_ALLOW_FILE_UPLOAD`. They move files between the host and `WINRIG_TRANSFER_DIR` and check the SHA-256 on both sides (#11).
+- The setting `WINRIG_MAX_TRANSFER_BYTES`, with the default of 256 MiB.
 
 ### Changed
 
@@ -30,18 +37,24 @@ A release goes out under the tag `vX.Y.Z`; the tag starts `.github/workflows/rel
 - The confirmation form describes its field in English.
 - Every confirmation names the tool, the host and the user, and states the effect and whether the operator can undo it (TR-SEC-16..20).
 - Every generated script carries a preamble that silences the PowerShell progress stream, and `write_file` sizes each chunk by the WinRS command-line budget.
-- The tool list holds 44 declared tools, 43 of them visible by default.
+- The tool list holds 52 declared tools, 43 of them visible by default. Each flag adds its tools.
+- `write_file` reaches the host with literal .NET calls, so a wildcard in a path does not expand (#12).
 
 ### Fixed
 
 - Two tests that capture the tracing output failed about one time in 300 runs. The capture now rebuilds the tracing interest cache (#9).
 - The CLIXML progress record that PowerShell wrote to stderr no longer appears in the result of a tool call (#22).
+- `write_file` expanded a wildcard in the destination path (#12).
 
 ### Security
 
 - The result parser drops the CLIXML position lines that can hold a fragment of a secret (DR-4).
 - The confirmation sanitizes every field that the host provides, so a value cannot forge the dialog (DR-4).
 - `set_registry` hides the old value next to the new value, and `kill_process` shows the executable path and never the command line (DR-4).
+- The dependency `rustls` is 0.23.46. It fixes RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348 and RUSTSEC-2026-0349.
+- `write_file` no longer expands a wildcard in the destination, so a name with a wildcard cannot write to several files (#12).
+- The certificate listing and `set_registry` pass the path with `-LiteralPath`, so a wildcard in the store name or the key name does not expand.
+- The audit holds the text of a command and of a script with the secrets masked (DR-4). It never holds the base64 of the encoded wrapper or of a chunk.
 
 ## [0.2.0] - 2026-09-22
 

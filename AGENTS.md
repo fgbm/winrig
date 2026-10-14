@@ -41,7 +41,7 @@ The product is multi-user: several operators at the same time in the HTTP mode. 
 ## 4. External systems and writes
 
 - The Windows host is an external system. A write is permitted only through the tools that the README lists as modifying, and only after confirmation (DR-5). The only exception outside the tools is the write of the MCP server definition into the configuration of the selected client. The explicit flag `setup --write-config` with the level `--scope global|project` permits this write (ADR-0009, ADR-0012). The code makes no other write to an external system.
-- The file transfer tools write a downloaded file into `WINRIG_TRANSFER_DIR` on the computer that runs winrig (ADR-0017). This is the only local write outside the profile, the state and the logs. It obeys DR-5 and the private modes of `src/private_fs.rs`.
+- The file transfer tools write a downloaded file into `WINRIG_TRANSFER_DIR` on the computer that runs winrig (ADR-0017). This is the only local write outside the profile, the state and the logs. `upload_file` reads only from `WINRIG_TRANSFER_DIR` and writes nothing locally. It obeys DR-5 and the private modes of `src/private_fs.rs`.
 - There is no test Windows host in the environment. The automatic tests run on a fake transport that implements `WinRmTransport` and records the commands that it gets. They do not touch the network (see `src/session.rs::tests`).
 
 ## 5. Configuration
@@ -50,7 +50,7 @@ All parameters go through environment variables (ADR-0004). The full table is in
 
 ## 6. Tests and quality
 
-- Run: `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `cargo deny check` and `scripts/check-comments.sh`. The full run must be green. Clippy must have no warnings, the formatting must have no differences, cargo-deny must have no refusals, and the comment check must report no findings.
+- Run: `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `cargo deny check`, `scripts/check-comments.sh`, `cargo xwin clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings` and `vale --minAlertLevel=error README.md README.ru.md AGENTS.md CONTRIBUTING.md SECURITY.md CHANGELOG.md docs/IMPLEMENTATION_CYCLE.md docs/QUESTIONS.md docs/REQUIREMENTS.md docs/ROADMAP.md docs/adr docs/style docs/site/src/content .github/PULL_REQUEST_TEMPLATE.md`. The full run must be green. Clippy must have no warnings on both targets. The formatting must have no differences. Cargo-deny must have no refusals. The comment check must report no findings, and Vale must report no errors.
 - First the test that fails, then the code.
 - The checks that are sensitive to the locale of the host run in the code, and a test covers them. PowerShell commands must not depend on the language of the system.
 - A green full run is a mandatory condition of a commit.

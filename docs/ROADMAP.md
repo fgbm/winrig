@@ -19,7 +19,7 @@ Product: `winrig`. Canon: `AGENTS.md`. Cycle: `docs/IMPLEMENTATION_CYCLE.md`. St
 | W13 | The level of the client configuration write: global or project | TR-PRF-13, ADR-0012 | no | accepted |
 | W14 | A field incident: the client configuration write, the state directory, the account form, the classification of transport errors | TR-SEC-10, TR-PRF-14/15/16 | yes | in progress |
 | W15 | A file write to the host | TR-FS-01..05, ADR-0013 | yes | accepted |
-| W16 | Execution of arbitrary commands | TR-EXE-01..04, ADR-0013 | yes | in progress (W33) |
+| W16 | Execution of arbitrary commands | TR-EXE-01..04, ADR-0013 | yes | accepted (W33) |
 | W17 | Executable coverage of the tools and the confirmation channel | TR-REL-09 | no | accepted |
 | W18 | Removal of the `winrm-rs` pin and a toolchain upgrade | Q-07 | yes | pending |
 | W19 | Active Directory read and domain maintenance | TR-AD-01..05/16, ADR-0014 | no | pending |
@@ -36,12 +36,12 @@ Product: `winrig`. Canon: `AGENTS.md`. Cycle: `docs/IMPLEMENTATION_CYCLE.md`. St
 | W30 | Service configuration, the start type and a verified stop (GitHub #10) | TR-REL-17/18, TR-SEC-15, AC-REL17-1, AC-REL18-1/2, AC-SEC15-1/2/3 | yes | accepted |
 | W31 | Check that the environment agrees across project servers (`doctor`, GitHub #24) | TR-PRF-18, AC-PRF-69 | no | accepted |
 | W32 | Clear confirmation text (the wording of the prompts, no issue) | TR-SEC-16..20, AC-SEC16-1, AC-SEC17-1/2, AC-SEC18-1, AC-SEC19-1, AC-SEC20-1 | no | accepted |
-| W33 | W16 `run_command` (GitHub #14) | TR-EXE-01..04, TR-SEC-21/22, AC-EXE-01..04, AC-SEC21-1, AC-SEC22-1, ADR-0013 | yes | pending |
-| W34 | `run_script` (GitHub #14) | TR-EXE-05..07, TR-SEC-22, AC-EXE-05..07, AC-SEC22-1, ADR-0017 | yes | pending |
-| W35 | The write allowlist under the protected roots (GitHub #13) | TR-FS-07, AC-FS-08/09, ADR-0017 | yes | pending |
-| W36 | Copy, move, rename and create a directory (GitHub #12) | TR-FS-08..11, TR-SEC-21, AC-FS-10..13, AC-SEC21-1, ADR-0017 | yes | pending |
-| W37 | Download a file from the host (GitHub #11) | TR-XFER-01/02/03/05, TR-SEC-21, AC-XFER-01/02/03/05, AC-SEC21-1, ADR-0017 | yes | pending |
-| W38 | Upload a file to the host (GitHub #11) | TR-XFER-04, TR-SEC-21, AC-XFER-04, AC-SEC21-1, ADR-0017 | yes | pending |
+| W33 | W16 `run_command` (GitHub #14) | TR-EXE-01..04/08, TR-SEC-11/21/22, AC-EXE-01..04/08, AC-SEC21-1, AC-SEC22-1, ADR-0013 | yes | accepted |
+| W34 | `run_script` (GitHub #14) | TR-EXE-05..07, TR-SEC-22, AC-EXE-05..07, AC-SEC22-1, ADR-0017 | yes | accepted |
+| W35 | The write allowlist under the protected roots (GitHub #13) | TR-FS-07, AC-FS-08/09, ADR-0017 | yes | accepted |
+| W36 | Copy, move, rename and create a directory (GitHub #12) | TR-FS-08..12, TR-SEC-21, AC-FS-10..14, AC-SEC21-1, ADR-0017 | yes | accepted |
+| W37 | Download a file from the host (GitHub #11) | TR-XFER-01/02/03/05, TR-SEC-21, AC-XFER-01/02/03/05/06, AC-SEC21-1, ADR-0017 | yes | accepted |
+| W38 | Upload a file to the host (GitHub #11) | TR-XFER-04, TR-SEC-21, AC-XFER-04/07, AC-SEC21-1, ADR-0017 | yes | accepted |
 
 ## Phase criteria
 
@@ -76,20 +76,15 @@ This section comes from the traces of live operation: the agent hit a missing ca
 
 ### Execution of arbitrary commands
 
-There is no tool for arbitrary execution. All 44 tools carry a hard-coded PowerShell script from `src/ps.rs`. `SessionRegistry::run_ps` is an internal method and the server does not expose it as an MCP tool. Nothing can run: no third-party utility, no one-off script, no software installation.
+The tools `run_command` and `run_script` exist (slices W33 and W34, ADR-0013, ADR-0017). Both are off by default and ask a confirmation. Of the 52 declared tools, 43 are visible by default. Each other tool carries a hard-coded PowerShell script from `src/ps.rs`.
 
-The decision is to add it: slice W16, ADR-0013, and Q-14 has a decision. Before the operator made the decision, the absence of arbitrary execution was not a position of anybody, only a state of the code.
-
-Separately, WinRM runs commands in a non-interactive session without a desktop. Therefore no user can see a GUI application: it starts invisible or it hangs. This limit is a property of the protocol, not of winrig, and it stays after W16.
+Two limits stay. WinRM runs commands in a non-interactive session without a desktop. Therefore no user can see a GUI application: it starts invisible or it hangs. This limit is a property of the protocol, not of winrig. The WinRM operation timeout is about 60 seconds without output, so a command or a script that stays silent for that time can fail. A `Receive` loop with a retry on `w:TimedOut` would remove the limit (Q-35), and no slice owns it yet.
 
 ### Files
 
-The file tools only read: `list_directory`, `find_files`, `read_file`, `search_file_content`, `file_info`, `compare_files`. A delete is the only modifying tool.
+The file tools read (`list_directory`, `find_files`, `read_file`, `search_file_content`, `file_info`, `compare_files`), write (`write_file`, `copy_file`, `move_file`, `rename_file`, `create_directory`, `delete_file`, `delete_directory`) and transfer (`download_file`, `upload_file`). Each tool that changes data is modifying and asks a confirmation. Each write-side capability is off by default (ADR-0013, ADR-0017).
 
 Absent:
-- a write of file content (`write_file`) — the decision is to add it, slice W15, ADR-0013;
-- a creation of a directory, a copy, a move, a rename (`create_directory`, `copy_file`, `move_file`, `rename_file`);
-- a file transfer to the host and back (file transfer, `docs/IMPLEMENTATION_CYCLE.md` §unported);
 - work with archives (`compress_archive`, `expand_archive`).
 
 ### Active Directory
@@ -213,7 +208,7 @@ The grouping by `kind`/`direction` is the decision of ADR-0014 §10. Symmetric o
 
 The subject of the check is the frame, not the presence of the tools. TR-AD-01 checks the host role in the script, so a host that is a domain member gives a clear refusal, not a directory error. TR-AD-02 keeps a value inside the LDAP filter: an escape of RFC 4515 before the escape of PowerShell. TR-AD-03 names the result ceiling in the answer. TR-AD-04 makes the parse independent of the locale. TR-AD-05 gives no write to any tool.
 
-The invariant "the exact tool count" from W9 moves. The number of declared tools becomes 50 instead of 44, and the number visible by default becomes 49 instead of 43. The same slice corrects the criterion AC-PRF-48 and both tests (`server::tests::tool_router_lists_registered_tools`, `tests/stdio_mode.rs::stdio_serves_mcp_over_clean_stdout`).
+The invariant "the exact tool count" from W9 moves. The number of declared tools becomes 58 instead of 52, and the number visible by default becomes 49 instead of 43. The same slice corrects the criterion AC-PRF-48 and both tests (`server::tests::tool_router_lists_registered_tools`, `tests/stdio_mode.rs::stdio_serves_mcp_over_clean_stdout`).
 
 Outside the slice: a change of the topology of the domain and the forest (ADR-0014 §12) is not deferred. It does not belong to the product.
 
@@ -369,7 +364,7 @@ The slice changes no operation, only the text before the confirmation, so the ri
 
 Goal: implement slice W16 (the section above) and answer the field request of GitHub #14.
 
-The content: the tool `run_command`, as the W16 section describes (ADR-0013). The requirements are TR-EXE-01..04 and the ACs AC-EXE-01..04. The confirmation takes the W32 fields of TR-SEC-21 and the full body of TR-SEC-22.
+The content: the tool `run_command`, as the W16 section describes (ADR-0013). The requirements are TR-EXE-01..04 and TR-EXE-08, and the ACs are AC-EXE-01..04 and AC-EXE-08. The command holds at most 979 UTF-16 units, and the audit holds its text through the redaction. The confirmation takes the W32 fields of TR-SEC-21 and the full body of TR-SEC-22.
 
 The decision of GitHub #14: the slice keeps the prefix form of `WINRIG_ALLOWED_COMMANDS` (ADR-0013 §13). The issue asks for a match of an executable path and an argument pattern, and for a read-only mode. A pattern of arguments is a new parsing surface. The prefix form already covers the four field cases: a short call of a known executable. A read-only mode would remove the confirmation from an arbitrary run, and the operator cannot verify "read-only" from the text. The operator still decides the list, and an empty list means any command. Q-14 and ADR-0013 §13 stand.
 
@@ -381,7 +376,7 @@ The slice breaks the W9 invariant "the exact tool count". The number of declared
 
 Goal: run a PowerShell script that is longer than one WinRS command line, as one confirmed operation. GitHub #14.
 
-The content (ADR-0017 §29–34): the tool `run_script`, off by default through `WINRIG_ALLOW_SCRIPT_EXEC`. The server writes the script into a temporary `.ps1` in the session temp directory in chunks, runs it by name, and deletes the file. The server deletes the file on every failure and timeout too. One confirmation covers the whole operation and shows the whole script. The prefix list `WINRIG_ALLOWED_COMMANDS` does not filter the script, because the server cannot prefix-check the text of a script. The script obeys `WINRIG_MAX_WRITE_BYTES`, and the output obeys the limits of `run_command`.
+The content (ADR-0017 §29–34): the tool `run_script`, off by default through `WINRIG_ALLOW_SCRIPT_EXEC`. The server writes the script into a temporary `.ps1` with a random name in the session temp directory in chunks (the first chunk uses `CreateNew`). The host reads the file, checks its SHA-256 (exit code 97 on a mismatch) and runs its text as a script block. The `Restricted` execution policy blocks a run by name. Then the server tries to delete the file, also after a failure, and the reply reports the outcome of the cleanup. The parameter `timeout_seconds` is deferred (Q-35). One confirmation covers the whole operation and shows the whole script. The prefix list `WINRIG_ALLOWED_COMMANDS` does not filter the script, because the server cannot prefix-check the text of a script. The script obeys `WINRIG_MAX_WRITE_BYTES`, and the output obeys the limits of `run_command`.
 
 The subject of the check: TR-EXE-05 keeps the tool off by default and outside the prefix list. TR-EXE-06 covers the temporary file and the cleanup. TR-EXE-07 covers the one confirmation and the whole script. TR-SEC-22 shows the body in full. The ACs are AC-EXE-05..07.
 
@@ -399,15 +394,15 @@ The subject of the check: TR-FS-07 and AC-FS-08/09.
 
 Goal: back up, move and rename a file without RDP. GitHub #12.
 
-The content (ADR-0017 §14–20): the tools `copy_file`, `move_file`, `rename_file` and `create_directory`, off by default through `WINRIG_ALLOW_FILE_OPS`. All four are modifying and obey DR-5. Without `overwrite: true` the server refuses an existing target. The target obeys the write allowlist and the protected roots. A directory copy is recursive with the counts in the prompt. A move on one volume is a rename. A cross-volume move of a file is a copy and a delete. A cross-volume move of a directory is refused (DR-6). `create_directory` makes the missing parents.
+The content (ADR-0017 §14–20): the tools `copy_file`, `move_file`, `rename_file` and `create_directory`, off by default through `WINRIG_ALLOW_FILE_OPS`. All four are modifying and obey DR-5. Without `overwrite: true` the server refuses an existing target. The target obeys the write allowlist and the protected roots. A directory copy is recursive with the counts in the prompt. A move on one volume is a rename. A cross-volume move of a file is a copy and a delete. A cross-volume move of a directory is refused (DR-6). `create_directory` makes the missing parents. The file tools reach the host with literal .NET calls, and this also changed `write_file` (TR-FS-12).
 
-The subject of the check: TR-FS-08..11, TR-SEC-21 and AC-FS-10..13.
+The subject of the check: TR-FS-08..12, TR-SEC-21 and AC-FS-10..14.
 
 ## W37. Download a file from the host (GitHub #11)
 
 Goal: let the agent read a binary file from the host, for example a database snapshot. GitHub #11.
 
-The content (ADR-0017 §21–28): the tool `download_file`, off by default through `WINRIG_ALLOW_FILE_DOWNLOAD`. The local endpoint is `WINRIG_TRANSFER_DIR`, with a per-user subdirectory in HTTP mode (DR-3). The server reads the file on the host in chunks through a raw channel. It writes into the transfer directory and compares the SHA-256 of the two sides. The reply carries the name, the size and the hash. `WINRIG_MAX_TRANSFER_BYTES` (default 256 MiB) refuses a larger file. Every download needs a confirmation, because it moves data off the host.
+The content (ADR-0017 §21–28): the tool `download_file`, off by default through `WINRIG_ALLOW_FILE_DOWNLOAD`. The local endpoint is `WINRIG_TRANSFER_DIR`, with a per-user subdirectory in HTTP mode (DR-3). The scan returns the length only, and the server reads nothing before the confirmation and the size check. The server then reads windows of 16 MiB through a raw channel. It writes into the transfer directory and compares the SHA-256 of the two sides, and the host hashes exactly the scanned size. The reply carries the name, the size and the hash. `WINRIG_MAX_TRANSFER_BYTES` (default 256 MiB) refuses a larger file. Every download needs a confirmation, because it moves data off the host.
 
 The subject of the check: TR-XFER-01/02/03/05, TR-SEC-21 and AC-XFER-01/02/03/05.
 
@@ -415,7 +410,7 @@ The subject of the check: TR-XFER-01/02/03/05, TR-SEC-21 and AC-XFER-01/02/03/05
 
 Goal: let the operator put a file on the host from the local transfer directory. GitHub #11.
 
-The content (ADR-0017 §26): the tool `upload_file`, off by default through `WINRIG_ALLOW_FILE_UPLOAD`. The server reads the file from the transfer directory and writes it to the host in chunks with a temporary file and a rename (TR-FS-05). The server checks the SHA-256 of the two sides. The write allowlist, the protected-root refusal and the confirmation apply.
+The content (ADR-0017 §26): the tool `upload_file`, off by default through `WINRIG_ALLOW_FILE_UPLOAD`. The server reads the file from the transfer directory. It sends windows of 4 MiB through the standard input of a WinRS command into a host temporary file. The host hashes the file before it places it with `Move` or `Replace`. The standard input replaces the chunks of TR-FS-05 for throughput (ADR-0017 amendment). The write allowlist, the protected-root refusal and the confirmation apply.
 
 The subject of the check: TR-XFER-04, TR-SEC-21 and AC-XFER-04.
 
@@ -425,5 +420,7 @@ These issues wait for a later iteration. They have no slice and no requirement y
 
 - GitHub #23 (a clear result when the host restarts during a session) continues inside W14, which owns the classification of the transport errors (TR-SEC-10).
 - GitHub #15 (a read-only HTTP request to a loopback port) needs the secret redaction design of TR-SEC-08, which has no coverage yet.
+- The parameter `timeout_seconds` of `run_script` and the limit of about 60 seconds without output need a change. The transport needs a `Receive` loop with a retry on `w:TimedOut` (Q-35).
+- The live-host checks of the transfer and the file tools (Q-36).
 
 GitHub #13 (the write allowlist), #12 (copy, move and rename), #11 (file transfer) and #14 (`run_command` from the field) left this list. ADR-0017 and the slices W33 to W38 own them.

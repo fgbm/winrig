@@ -14,6 +14,9 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo deny check
+scripts/check-comments.sh
+cargo xwin clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings
+vale --minAlertLevel=error README.md README.ru.md AGENTS.md CONTRIBUTING.md SECURITY.md CHANGELOG.md docs/IMPLEMENTATION_CYCLE.md docs/QUESTIONS.md docs/REQUIREMENTS.md docs/ROADMAP.md docs/adr docs/style docs/site/src/content .github/PULL_REQUEST_TEMPLATE.md
 cargo build --release
 ```
 
@@ -61,9 +64,16 @@ Raw data goes to the file: <path>
 The queue and the statuses are in `docs/ROADMAP.md`. These stay outside the slice (recorded in `docs/QUESTIONS.md`):
 
 - there is no test Windows host, so the NTLM connection, the reparse check and the live parsing of output are not verified (Q-08);
-- the tools of the Python version that are not ported (file transfer, archives, `invoke_http_request`, SFTP);
+- the tools of the Python version that are not ported (archives, `invoke_http_request`, SFTP);
 - the move of the confirmation channel to `input_required` at the change to the revision `2026-07-28` (Q-10). Clients without elicitation (opencode 1.18.31) stay fail-closed on modifying tools;
 - the reuse of the WinRM client for a session and the duration in the audit record;
 - the OS keyring as an alternative to the profile file (Q-12);
 - the move of the inline PowerShell in `src/server.rs` (`set_registry`, `kill_process` and the others) into `src/ps.rs`, so the shared guard tests cover them;
-- the verification on a live Windows host of the `PrinterStatus` semantics, the Restart Manager through `Reflection.Emit`, `-ErrorVariable +var` on PowerShell 5.1 and the CLIXML stderr format (Q-08).
+- the verification on a live Windows host of the `PrinterStatus` semantics, the Restart Manager through `Reflection.Emit`, `-ErrorVariable +var` on PowerShell 5.1 and the CLIXML stderr format (Q-08);
+- the verification on a live Windows host that `upload_file` sends binary data safely through the standard input of WinRS. The same check covers the end of the remote shell at a cancel (Q-36);
+- the verification on a live Windows host that `download_file` reads windows of 16 MiB, and that no base64 line goes above 1 MiB (Q-36);
+- the verification on a live Windows host that `run_script` fails after 60 seconds without output. The same check covers the run of the temporary file text as a script block (Q-35, Q-36);
+- the verification on a live Windows host that the `[IO.File]` and `[IO.Directory]` calls of the file tools keep their semantics, also for `write_file` (Q-36);
+- the verification on a live Windows host of the `LinkType` value of a hard link, which the reparse check reads (Q-36);
+- the verification on a live Windows host that the host resolves a `Volume{GUID}` path to the volume that the policy expects (Q-36);
+- the WinRM operation timeout of 60 seconds without output limits long commands. A `Receive` loop with a retry on `w:TimedOut` is necessary (Q-35).

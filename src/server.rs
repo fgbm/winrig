@@ -4,6 +4,9 @@
 //! [`crate::identity`]). Mutating tools require confirmation through elicitation
 //! and do not run without it (DR-5, fail-closed).
 
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,7 +23,7 @@ use crate::config::{AppConfig, ConfirmFallback};
 use crate::executor::{sanitize_body_value, sanitize_path_value, sanitize_prompt_value};
 use crate::identity::RequestIdentity;
 use crate::policy::{
-    DeleteScan, FileScan, PolicyDecision, SourceScan, WriteScan, decide_command,
+    DeleteScan, FileScan, PolicyDecision, SourceScan, TransferScan, WriteScan, decide_command,
     decide_command_length, decide_create_directory, decide_delete_file_path, decide_delete_path,
     decide_delete_scan, decide_file_delete, decide_file_op_source, decide_file_op_target,
     decide_host, decide_move_volume, decide_new_name, decide_path_relation, decide_port,
@@ -28,7 +31,8 @@ use crate::policy::{
     is_case_only_change, same_volume,
 };
 use crate::ps;
-use crate::session::{ScriptRun, SessionRegistry, UserIdentity};
+use crate::session::{AuditTransfer, ScriptRun, SessionRegistry, UserIdentity};
+use sha2::{Digest, Sha256};
 
 #[derive(Clone)]
 pub struct WinrigServer {
@@ -171,6 +175,8 @@ const EFFECT_RENAME: &str =
     "This renames the object in its own directory. To undo it, rename it back.";
 const EFFECT_CREATE_DIRECTORY: &str =
     "This creates the directory and its missing parents. To undo it, delete the new directory.";
+const EFFECT_DOWNLOAD_FILE: &str = "This copies the file from the host into the local transfer \
+                                    directory. You cannot undo it.";
 
 impl WinrigServer {
     #[must_use]
@@ -205,6 +211,9 @@ impl WinrigServer {
             router.remove_route("move_file");
             router.remove_route("rename_file");
             router.remove_route("create_directory");
+        }
+        if !config.allow_file_download {
+            router.remove_route("download_file");
         }
         router
     }
@@ -598,6 +607,14 @@ enum ConfirmationOutcome {
 /// marks (TR-SEC-11, DR-5).
 macro_rules! require_confirmation {
     ($self:expr, $ctx:expr, $confirmation:expr) => {{
+        let _state = confirm_state!($self, $ctx, $confirmation);
+    }};
+}
+
+/// The same as [`require_confirmation`] but it yields the confirmation state
+/// (`confirmed` or `unsupported`) for the audit record of the tool (ADR-0017 §38).
+macro_rules! confirm_state {
+    ($self:expr, $ctx:expr, $confirmation:expr) => {{
         let confirmation = $confirmation;
         let tool = confirmation.tool.clone();
         let user = confirmation.user.clone();
@@ -611,11 +628,12 @@ macro_rules! require_confirmation {
         )
         .await
         {
-            ConfirmationOutcome::Confirmed => {}
+            ConfirmationOutcome::Confirmed => "confirmed",
             ConfirmationOutcome::Unsupported => {
                 $self
                     .registry
                     .audit_confirmation_unsupported(&user, &tool, &session, &host);
+                "unsupported"
             }
             ConfirmationOutcome::Refused(result) => return Ok(result),
         }
@@ -1284,6 +1302,23 @@ struct CreateDirectoryParams {
         description = "Absolute path of the directory to create. The tool also creates each missing parent."
     )]
     path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct DownloadFileParams {
+    #[schemars(description = "Session ID that connect returns.")]
+    session_id: String,
+    #[schemars(description = "Absolute path of the file to read on the host.")]
+    remote_path: String,
+    #[schemars(
+        description = "Local file name in the transfer directory. Pass one plain file name, not a path."
+    )]
+    name: String,
+    #[schemars(
+        description = "Replace the local file when it already exists. The default is false."
+    )]
+    #[serde(default)]
+    overwrite: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -3662,6 +3697,878 @@ impl WinrigServer {
                 .await,
         ))
     }
+
+    #[tool(
+        name = "download_file",
+        description = "Copy a file from the host into the local transfer directory. The tool reads the file on the host in windows through a raw channel, so the reply truncation does not apply, and it never returns the content inline: the reply carries the name, the size and the SHA-256. It hashes the bytes while it reads them, confirms the whole length with a separate host pass and refuses a mismatch. The confirmation shows the resolved remote path, the size, the modification time and the local destination. WINRIG_MAX_TRANSFER_BYTES refuses a larger file after the size scan and before any read (256 MiB by default). The local endpoint is WINRIG_TRANSFER_DIR, with one subdirectory per user in HTTP mode. The server declares the tool only with WINRIG_ALLOW_FILE_DOWNLOAD."
+    )]
+    async fn download_file(
+        &self,
+        Parameters(params): Parameters<DownloadFileParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let identity = self.identity(&ctx)?;
+        // TR-XFER-01: the local name is validated before any host call.
+        let name_decision = crate::policy::decide_transfer_name(&params.name);
+        if !name_decision.allow {
+            self.audit_refusal(&identity, "download_file", &name_decision);
+            return Ok(CallToolResult::structured(
+                json!({ "error": name_decision.reason }),
+            ));
+        }
+        // TR-XFER-02: a relative remote path is refused before the network.
+        let path_decision = crate::policy::decide_download_remote_path(&params.remote_path);
+        if !path_decision.allow {
+            self.audit_refusal(&identity, "download_file", &path_decision);
+            return Ok(CallToolResult::structured(
+                json!({ "error": path_decision.reason }),
+            ));
+        }
+        let root = match transfer_root(&self.config) {
+            Ok(root) => root,
+            Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
+        };
+        if let Some(result) = self.missing_session(&identity, &params.session_id) {
+            return Ok(result);
+        }
+        // The host pre-scan is read-only: the resolved path, the kind, the length of
+        // the opened stream and the modification time (TR-XFER-02). It runs before
+        // the confirmation and reads no content.
+        let raw = match self
+            .pre_scan(
+                &identity,
+                &params.session_id,
+                &ps::download_scan(&params.remote_path),
+                "download_file",
+            )
+            .await
+        {
+            Ok(raw) => raw,
+            Err(result) => return Ok(result),
+        };
+        let scan = match Self::parse_refusal(TransferScan::from_json(&raw), "download", &raw) {
+            Ok(scan) => scan,
+            Err(result) => return Ok(result),
+        };
+        let source_decision = crate::policy::decide_download_source(&scan, &params.remote_path);
+        if !source_decision.allow {
+            self.audit_refusal(&identity, "download_file", &source_decision);
+            return Ok(CallToolResult::structured(json!({
+                "error": source_decision.reason,
+                "scan": raw,
+            })));
+        }
+        // TR-XFER-05: the size limit is checked on the scanned length before the
+        // confirmation and before any read.
+        let size_decision =
+            crate::policy::decide_transfer_size(scan.size_bytes, self.config.max_transfer_bytes);
+        if !size_decision.allow {
+            self.audit_refusal(&identity, "download_file", &size_decision);
+            return Ok(CallToolResult::structured(
+                json!({ "error": size_decision.reason }),
+            ));
+        }
+        // DR-3: HTTP mode isolates each user in a subdirectory; stdio uses the root.
+        let isolated = self.local_identity.is_none();
+        let dir = transfer_user_dir(&root, &identity.username, isolated);
+        let local_path = dir.join(&params.name);
+        // TR-XFER-01: the directory is checked without creating it; the creation
+        // happens after the confirmation.
+        if let Err(error) = precheck_transfer_dir(&root, &dir, isolated) {
+            return Ok(CallToolResult::structured(json!({ "error": error })));
+        }
+        let (exists, is_symlink) = local_target_state(&local_path);
+        let target_decision =
+            crate::policy::decide_transfer_target(exists, is_symlink, params.overwrite);
+        if !target_decision.allow {
+            self.audit_refusal(&identity, "download_file", &target_decision);
+            return Ok(CallToolResult::structured(
+                json!({ "error": target_decision.reason }),
+            ));
+        }
+        let mut confirmation = self
+            .confirmation(
+                &identity,
+                &params.session_id,
+                "download_file",
+                "DOWNLOAD FILE",
+            )
+            .path("Remote path", &params.remote_path)
+            .path("Resolved remote", &scan.full_name)
+            .field("Size", &format!("{} bytes", scan.size_bytes))
+            // TR-XFER-02: the prompt shows the modification time; the hash is known
+            // only after the read.
+            .field(
+                "Last write",
+                scan.last_write_utc.as_deref().unwrap_or("unknown"),
+            )
+            .path("Local destination", &local_path.to_string_lossy())
+            .field("Overwrite", if params.overwrite { "yes" } else { "no" });
+        // ADR-0017 §28: a download under a protected or a system path warns.
+        if let Some(class) = source_decision.class {
+            confirmation = confirmation.field("Warning", class);
+        }
+        let confirmation_state =
+            confirm_state!(&self, &ctx, confirmation.effect(EFFECT_DOWNLOAD_FILE));
+        self.perform_download(
+            &identity,
+            &params.session_id,
+            &scan,
+            &local_path,
+            &root,
+            isolated,
+            params.overwrite,
+            confirmation_state,
+        )
+        .await
+    }
+
+    /// Copies the host file window by window, hashes it while reading, confirms the
+    /// whole length with a separate host pass and places the file (TR-XFER-02,
+    /// ADR-0017 §24). Runs after the confirmation.
+    #[allow(clippy::too_many_arguments)]
+    async fn perform_download(
+        &self,
+        identity: &RequestIdentity,
+        session_id: &str,
+        scan: &TransferScan,
+        local_path: &Path,
+        root: &Path,
+        isolated: bool,
+        overwrite: bool,
+        confirmation: &str,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let host = self
+            .registry
+            .session_host(&identity.username, session_id)
+            .unwrap_or_else(|| "(unknown)".to_owned());
+        let resolved_local = local_path.to_string_lossy().into_owned();
+        let dir = match local_path.parent() {
+            Some(dir) => dir.to_path_buf(),
+            None => {
+                return Ok(CallToolResult::structured(
+                    json!({ "error": "the local destination has no parent directory" }),
+                ));
+            }
+        };
+        // TR-XFER-01: the directories are created only here, after the confirmation.
+        if let Err(error) = ensure_transfer_dir(root, &dir, isolated) {
+            self.audit_failed(
+                &identity.username,
+                &host,
+                scan,
+                &resolved_local,
+                confirmation,
+                "",
+                "",
+            );
+            return Ok(CallToolResult::structured(json!({ "error": error })));
+        }
+        // TR-XFER-01: a stale half-written temp from an interrupted run does not
+        // accumulate; only entries older than one hour are removed.
+        clean_stale_parts(&dir);
+        let temp = dir.join(format!(".winrig-{}.part", random_suffix()));
+        let file = match open_transfer_temp(&temp) {
+            Ok(file) => file,
+            Err(error) => {
+                let message = format!("cannot create {}: {error}", temp.display());
+                self.audit_failed(
+                    &identity.username,
+                    &host,
+                    scan,
+                    &resolved_local,
+                    confirmation,
+                    "",
+                    "",
+                );
+                return Ok(CallToolResult::structured(json!({ "error": message })));
+            }
+        };
+        // The root and the user directory must be owned by this process; the probe
+        // file proves ownership, because it is created by the current effective user.
+        if let Err(error) = probe_dirs_owned_by_us(root, &dir, &temp) {
+            let _ = fs::remove_file(&temp);
+            self.audit_failed(
+                &identity.username,
+                &host,
+                scan,
+                &resolved_local,
+                confirmation,
+                "",
+                "",
+            );
+            return Ok(CallToolResult::structured(json!({ "error": error })));
+        }
+        // The guard owns the open file and the temp: it closes the file, removes the
+        // partial file and records a `cancelled` entry if the future is dropped before
+        // the file is placed (a client disconnect).
+        let mut guard = TransferGuard {
+            registry: self.registry.as_ref(),
+            username: &identity.username,
+            host: &host,
+            remote_path: &scan.full_name,
+            local_path: &resolved_local,
+            size: scan.size_bytes,
+            confirmation,
+            temp: temp.clone(),
+            file: Some(file),
+            armed: true,
+        };
+        let outcome = self
+            .copy_and_hash(&identity.username, session_id, scan, guard.file_mut())
+            .await;
+        match outcome {
+            Ok(digests) => {
+                if let Err(error) = guard.file_mut().sync_all() {
+                    let message = format!("cannot flush {}: {error}", temp.display());
+                    guard.close_file();
+                    let _ = fs::remove_file(&temp);
+                    guard.disarm();
+                    self.audit_failed(
+                        &identity.username,
+                        &host,
+                        scan,
+                        &resolved_local,
+                        confirmation,
+                        &digests.host_hash,
+                        &digests.local_hash,
+                    );
+                    return Ok(CallToolResult::structured(json!({ "error": message })));
+                }
+                guard.close_file();
+                if let Err(error) = replace_transfer_file(&temp, local_path, overwrite) {
+                    let _ = fs::remove_file(&temp);
+                    guard.disarm();
+                    self.audit_failed(
+                        &identity.username,
+                        &host,
+                        scan,
+                        &resolved_local,
+                        confirmation,
+                        &digests.host_hash,
+                        &digests.local_hash,
+                    );
+                    return Ok(CallToolResult::structured(json!({ "error": error })));
+                }
+                guard.disarm();
+                self.registry.audit_transfer(AuditTransfer {
+                    username: &identity.username,
+                    tool: "download_file",
+                    host: &host,
+                    remote_path: &scan.full_name,
+                    local_path: &resolved_local,
+                    size: scan.size_bytes,
+                    host_hash: &digests.host_hash,
+                    local_hash: &digests.local_hash,
+                    confirmation,
+                    status: "downloaded",
+                });
+                Ok(CallToolResult::structured(json!({
+                    "status": "downloaded",
+                    "name": local_path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default(),
+                    "size": scan.size_bytes,
+                    "sha256": digests.local_hash,
+                    "path": resolved_local,
+                })))
+            }
+            Err(failure) => {
+                guard.close_file();
+                let _ = fs::remove_file(&temp);
+                guard.disarm();
+                self.audit_failed(
+                    &identity.username,
+                    &host,
+                    scan,
+                    &resolved_local,
+                    confirmation,
+                    &failure.host_hash,
+                    &failure.local_hash,
+                );
+                Ok(CallToolResult::structured(
+                    json!({ "error": failure.message }),
+                ))
+            }
+        }
+    }
+
+    /// Reads the file window by window, hashes the bytes as they arrive and then
+    /// confirms the whole length with a separate host hash pass (TR-XFER-02).
+    ///
+    /// Every read and the host hash pass are bounded to the length the scan reported,
+    /// so an append-only log still yields a stable prefix. A mismatch or a short file
+    /// is a "the source changed during the transfer" failure.
+    async fn copy_and_hash(
+        &self,
+        username: &str,
+        session_id: &str,
+        scan: &TransferScan,
+        file: &mut fs::File,
+    ) -> Result<DownloadDigests, TransferFailure> {
+        let mut hasher = Sha256::new();
+        let total = scan.size_bytes.max(0);
+        let mut offset = 0i64;
+        while offset < total {
+            let window_len = ps::TRANSFER_WINDOW_BYTES.min(total - offset);
+            let command = ps::download_chunk(&scan.full_name, offset, window_len);
+            let reply = self
+                .registry
+                .read_transfer_chunk(username, session_id, &command)
+                .await;
+            let Some(stdout) = Self::successful_stdout(&reply) else {
+                return Err(TransferFailure::partial(
+                    format!(
+                        "The download failed at offset {offset}: {}",
+                        reply_error(&reply)
+                    ),
+                    &hasher,
+                ));
+            };
+            let mut produced = 0i64;
+            for line in stdout.lines() {
+                // The base64 of one line may carry separator whitespace; drop it.
+                let cleaned: String = line.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+                if cleaned.is_empty() {
+                    continue;
+                }
+                let decoded = match decode_base64(&cleaned) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        return Err(TransferFailure::partial(
+                            format!(
+                                "The host returned an unreadable line at offset {offset}: {error}"
+                            ),
+                            &hasher,
+                        ));
+                    }
+                };
+                // Any non-empty line is accepted as long as its payload does not
+                // exceed the window that remains; a short read in the middle (a
+                // network share may return less than asked) only moves the window
+                // total. Only the total is checked.
+                let remaining = window_len - produced;
+                if decoded.len() as i64 > remaining {
+                    return Err(TransferFailure::partial(
+                        format!(
+                            "The source changed during the transfer: {remaining} bytes remain at \
+                             offset {}, and a line carried {}.",
+                            offset + produced,
+                            decoded.len()
+                        ),
+                        &hasher,
+                    ));
+                }
+                hasher.update(&decoded);
+                if let Err(error) = file.write_all(&decoded) {
+                    return Err(TransferFailure::partial(
+                        format!("cannot write the local file: {error}"),
+                        &hasher,
+                    ));
+                }
+                produced += decoded.len() as i64;
+            }
+            if produced != window_len {
+                return Err(TransferFailure::partial(
+                    format!(
+                        "The source changed during the transfer: expected {window_len} bytes at \
+                         offset {offset}, got {produced}."
+                    ),
+                    &hasher,
+                ));
+            }
+            offset += window_len;
+        }
+        let local_hash = hex_sha256(&hasher.finalize());
+        // The host hashes exactly [0, total), so an append-only log still matches.
+        let command = ps::download_hash(&scan.full_name, total);
+        let reply = self
+            .registry
+            .read_transfer_chunk(username, session_id, &command)
+            .await;
+        if reply.get("status_code").and_then(serde_json::Value::as_i64)
+            == Some(i64::from(ps::HASH_SHORT_EXIT))
+        {
+            return Err(TransferFailure {
+                message: "The source changed during the transfer.".to_owned(),
+                host_hash: String::new(),
+                local_hash,
+            });
+        }
+        let Some(stdout) = Self::successful_stdout(&reply) else {
+            return Err(TransferFailure {
+                message: format!("The host hash pass failed: {}", reply_error(&reply)),
+                host_hash: String::new(),
+                local_hash,
+            });
+        };
+        let Some(host_hash) = parse_host_hash(&stdout) else {
+            return Err(TransferFailure {
+                message: "The host hash pass returned no digest.".to_owned(),
+                host_hash: String::new(),
+                local_hash,
+            });
+        };
+        if !host_hash.eq_ignore_ascii_case(&local_hash) {
+            return Err(TransferFailure {
+                message: "The source changed during the transfer.".to_owned(),
+                host_hash,
+                local_hash,
+            });
+        }
+        Ok(DownloadDigests {
+            host_hash,
+            local_hash,
+        })
+    }
+
+    /// Records a failed transfer with the paths, the size and whatever hashes are
+    /// known (TR-XFER-02, ADR-0017 §38).
+    #[allow(clippy::too_many_arguments)]
+    fn audit_failed(
+        &self,
+        username: &str,
+        host: &str,
+        scan: &TransferScan,
+        local_path: &str,
+        confirmation: &str,
+        host_hash: &str,
+        local_hash: &str,
+    ) {
+        self.registry.audit_transfer(AuditTransfer {
+            username,
+            tool: "download_file",
+            host,
+            remote_path: &scan.full_name,
+            local_path,
+            size: scan.size_bytes,
+            host_hash,
+            local_hash,
+            confirmation,
+            status: "failed",
+        });
+    }
+}
+
+/// The local endpoint of the file transfer, from `WINRIG_TRANSFER_DIR`
+/// (TR-XFER-01).
+///
+/// The server app sets the value before it builds the tool router, so a missing
+/// value is a configuration error, not "the default".
+fn transfer_root(config: &AppConfig) -> Result<PathBuf, String> {
+    config
+        .transfer_dir
+        .as_ref()
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            "WINRIG_TRANSFER_DIR is not set and no state directory is available; set the transfer \
+             directory explicitly"
+                .to_owned()
+        })
+}
+
+/// The local directory of one user in the transfer root (TR-XFER-01, DR-3).
+///
+/// HTTP mode isolates each user in a subdirectory of a sanitized identity with a
+/// hash suffix, so two identities never share a directory and their slugs cannot
+/// collide. Stdio mode uses the root directly (ADR-0017 §21).
+fn transfer_user_dir(root: &Path, username: &str, isolated: bool) -> PathBuf {
+    if isolated {
+        root.join(transfer_user_slug(username))
+    } else {
+        root.to_path_buf()
+    }
+}
+
+/// A collision-free directory name for one identity (DR-3).
+///
+/// The identity is brought to its canonical form (lowercased), kept to its ASCII
+/// alphanumerics and given a 128-bit hex suffix, so two identities never share a
+/// directory and a name cannot collide.
+fn transfer_user_slug(username: &str) -> String {
+    let canonical = crate::identity::canonical_username(username);
+    let mut slug = String::with_capacity(canonical.len() + 33);
+    for c in canonical.chars().take(32) {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+        } else {
+            slug.push('_');
+        }
+    }
+    if slug.is_empty() {
+        slug.push('_');
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(canonical.as_bytes());
+    let mut hex = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        use std::fmt::Write;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    format!("{slug}-{hex}")
+}
+
+/// Reports whether the destination file exists and whether it is a symbolic link
+/// (TR-XFER-01).
+///
+/// `symlink_metadata` does not follow the link, so a dangling symbolic link counts
+/// as existing and is refused.
+fn local_target_state(path: &Path) -> (bool, bool) {
+    let meta = fs::symlink_metadata(path).ok();
+    let is_symlink = meta
+        .as_ref()
+        .is_some_and(|meta| meta.file_type().is_symlink());
+    (meta.is_some() && !is_symlink, is_symlink)
+}
+
+/// Checks the transfer directory without creating it (TR-XFER-01, DR-8).
+///
+/// A path that exists must be a real directory that no other user can write. The
+/// check runs before the confirmation; the creation runs after it.
+fn precheck_transfer_dir(root: &Path, user_dir: &Path, isolated: bool) -> Result<(), String> {
+    let dirs: &[&Path] = if isolated { &[root, user_dir] } else { &[root] };
+    for dir in dirs {
+        let Ok(meta) = fs::symlink_metadata(dir) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "WINRIG_TRANSFER_DIR path {} is a symbolic link; the tool refuses",
+                dir.display()
+            ));
+        }
+        if !meta.is_dir() {
+            return Err(format!(
+                "WINRIG_TRANSFER_DIR path {} is not a directory; the tool refuses",
+                dir.display()
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & 0o022 != 0 {
+                return Err(format!(
+                    "WINRIG_TRANSFER_DIR directory {} is writable by group or other (mode {mode:o}); \
+                     own it and set mode 0700",
+                    dir.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Creates the transfer directories with the private modes after the confirmation
+/// (TR-XFER-01).
+fn ensure_transfer_dir(root: &Path, user_dir: &Path, isolated: bool) -> Result<(), String> {
+    ensure_private_transfer_dir(root)?;
+    if isolated && user_dir != root {
+        ensure_private_transfer_dir(user_dir)?;
+    }
+    Ok(())
+}
+
+/// Creates one private directory, or re-applies `0700` to an existing real one.
+///
+/// A symbolic link at the path is refused, so the write cannot land outside the
+/// transfer root.
+fn ensure_private_transfer_dir(dir: &Path) -> Result<(), String> {
+    if let Ok(meta) = fs::symlink_metadata(dir)
+        && (meta.file_type().is_symlink() || !meta.is_dir())
+    {
+        return Err(format!(
+            "WINRIG_TRANSFER_DIR path {} is not a real directory; the tool refuses",
+            dir.display()
+        ));
+    }
+    crate::private_fs::create_private_dir(dir)
+        .map_err(|error| format!("cannot use {}: {error}", dir.display()))
+}
+
+/// Requires the transfer root and the user directory to be owned by this process
+/// (TR-XFER-01).
+///
+/// The probe file is created by the current effective user, so its owner is the
+/// effective uid; a directory that a different user owns could be swapped under the
+/// tool. `chmod` is not used, because it needs libc and `unsafe_code` is forbidden.
+#[cfg(unix)]
+fn probe_dirs_owned_by_us(root: &Path, user_dir: &Path, probe: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = fs::symlink_metadata(probe)
+        .map_err(|error| format!("cannot probe {}: {error}", probe.display()))?
+        .uid();
+    for dir in [root, user_dir] {
+        let meta = fs::symlink_metadata(dir)
+            .map_err(|error| format!("cannot inspect {}: {error}", dir.display()))?;
+        if meta.uid() != uid {
+            return Err(format!(
+                "WINRIG_TRANSFER_DIR directory {} is not owned by the current user; own it or change \
+                 the variable",
+                dir.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Ownership by uid is a Unix concept; every other platform owns the file it just
+/// created, and the portable checks of [`precheck_transfer_dir`] apply.
+#[cfg(not(unix))]
+fn probe_dirs_owned_by_us(_root: &Path, _user_dir: &Path, _probe: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+/// Age after which a leftover transfer temp file is removed (TR-XFER-01).
+const STALE_PART_AGE: Duration = Duration::from_secs(3600);
+
+/// Removes the `.winrig-*.part` files an interrupted run of a previous process left
+/// in the user directory (TR-XFER-01). A recent one is kept: another call may still
+/// be writing it.
+fn clean_stale_parts(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !(name.starts_with(".winrig-") && name.ends_with(".part")) {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        if now
+            .duration_since(modified)
+            .map(|age| age >= STALE_PART_AGE)
+            .unwrap_or(false)
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Opens the temporary transfer file with `create_new` and the `0600` mode.
+///
+/// `create_new` uses `O_EXCL`, which refuses an existing file and does not follow a
+/// final symbolic link. `O_NOFOLLOW` is not set explicitly, because it needs libc
+/// and `unsafe_code` is forbidden; `O_EXCL` gives the same guarantee for the final
+/// component.
+fn open_transfer_temp(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// Places the assembled file at the target (TR-XFER-01).
+///
+/// Without `overwrite` a hard link refuses an existing target with `EEXIST`, so the
+/// placement never replaces a file that appeared during the transfer. With `overwrite`
+/// the rename is atomic. The directory is synced on Unix, so the placement survives a
+/// crash.
+fn replace_transfer_file(temp: &Path, target: &Path, overwrite: bool) -> Result<(), String> {
+    if overwrite {
+        fs::rename(temp, target)
+            .map_err(|error| format!("cannot place {}: {error}", target.display()))?;
+    } else {
+        place_without_replacing(temp, target)?;
+    }
+    fsync_dir(target.parent());
+    Ok(())
+}
+
+/// Places the temp without replacing an existing target (TR-XFER-01).
+///
+/// A hard link refuses an existing target with `EEXIST`. On a file system without
+/// hard links (`Unsupported`, `PermissionDenied`) it falls back to a rename after a
+/// `symlink_metadata` absence check. That check and the rename are not atomic, so a
+/// narrow race can still replace a target that appeared just after the check; the
+/// fallback is accepted because a file system that cannot link has no other way to
+/// place the file. After a successful link the placement is complete: a temp that
+/// cannot be removed only leaves a stale `.winrig-*.part`, which the next run cleans.
+fn place_without_replacing(temp: &Path, target: &Path) -> Result<(), String> {
+    match fs::hard_link(temp, target) {
+        Ok(()) => {
+            remove_temp_best_effort(temp);
+            Ok(())
+        }
+        Err(error) if placement_uses_rename_fallback(error.kind()) => {
+            if fs::symlink_metadata(target).is_ok() {
+                return Err(format!(
+                    "cannot place {}: the target already exists",
+                    target.display()
+                ));
+            }
+            fs::rename(temp, target)
+                .map_err(|error| format!("cannot place {}: {error}", target.display()))
+        }
+        Err(error) => Err(format!("cannot place {}: {error}", target.display())),
+    }
+}
+
+/// True for the `io::ErrorKind` values that mean a file system has no hard links:
+/// `Unsupported` and `PermissionDenied` (TR-XFER-01).
+fn placement_uses_rename_fallback(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+    )
+}
+
+/// Removes the temp after a successful placement (TR-XFER-01).
+///
+/// A failure only leaves a stale `.winrig-*.part`, which the next run cleans, so it
+/// never fails the finished transfer.
+fn remove_temp_best_effort(temp: &Path) {
+    if let Err(error) = fs::remove_file(temp) {
+        tracing::warn!(
+            path = %temp.display(),
+            error = %error,
+            "cannot remove the transfer temp file"
+        );
+    }
+}
+
+/// Flushes the directory entry of a placed file on Unix; other platforms have no
+/// directory handle (TR-XFER-01).
+fn fsync_dir(dir: Option<&Path>) {
+    #[cfg(unix)]
+    if let Some(dir) = dir
+        && let Ok(handle) = std::fs::File::open(dir)
+    {
+        let _ = handle.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
+
+/// Decodes the base64 payload of one line (TR-XFER-02).
+fn decode_base64(payload: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|error| error.to_string())
+}
+
+/// Formats a digest as lowercase hexadecimal text (TR-XFER-02).
+fn hex_sha256(digest: &[u8]) -> String {
+    digest
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            use std::fmt::Write;
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
+/// Reads the lowercase hex digest from the output of the host hash pass, skipping
+/// the `progress ...` lines (TR-XFER-02).
+fn parse_host_hash(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty() && !line.starts_with("progress "))
+        .filter(|line| line.len() == 64 && line.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(str::to_owned)
+}
+
+/// The host answer text of a failed transfer command (TR-XFER-02).
+fn reply_error(reply: &serde_json::Value) -> String {
+    reply
+        .get("stderr")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| reply.get("error").and_then(serde_json::Value::as_str))
+        .unwrap_or("the host returned no answer")
+        .to_owned()
+}
+
+/// The two SHA-256 values of a finished transfer (TR-XFER-02).
+struct DownloadDigests {
+    host_hash: String,
+    local_hash: String,
+}
+
+/// Why a transfer failed, with the hash of each side where it is known (TR-XFER-02).
+struct TransferFailure {
+    message: String,
+    host_hash: String,
+    local_hash: String,
+}
+
+impl TransferFailure {
+    /// A failure before the host hash pass, with the running local digest.
+    fn partial(message: String, hasher: &Sha256) -> Self {
+        Self {
+            message,
+            host_hash: String::new(),
+            local_hash: hex_sha256(&hasher.clone().finalize()),
+        }
+    }
+}
+
+/// Owns the open partial file and the temp path, and records a `cancelled` audit
+/// entry when the transfer future is dropped before the file is placed (TR-XFER-01,
+/// ADR-0017 §38).
+///
+/// The file lives here so it is closed before the temp is removed: on Windows an open
+/// handle would block the removal.
+struct TransferGuard<'a> {
+    registry: &'a SessionRegistry,
+    username: &'a str,
+    host: &'a str,
+    remote_path: &'a str,
+    local_path: &'a str,
+    size: i64,
+    confirmation: &'a str,
+    temp: PathBuf,
+    file: Option<fs::File>,
+    armed: bool,
+}
+
+impl TransferGuard<'_> {
+    /// The open partial file, for the read loop to write to.
+    fn file_mut(&mut self) -> &mut fs::File {
+        self.file.as_mut().expect("the partial file is open")
+    }
+
+    /// Closes the partial file, so a later rename or removal is not blocked by an
+    /// open handle.
+    fn close_file(&mut self) {
+        self.file = None;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TransferGuard<'_> {
+    fn drop(&mut self) {
+        // Close the file before the removal, whatever the exit path.
+        self.file = None;
+        if !self.armed {
+            return;
+        }
+        let _ = fs::remove_file(&self.temp);
+        self.registry.audit_transfer(AuditTransfer {
+            username: self.username,
+            tool: "download_file",
+            host: self.host,
+            remote_path: self.remote_path,
+            local_path: self.local_path,
+            size: self.size,
+            host_hash: "",
+            local_hash: "",
+            confirmation: self.confirmation,
+            status: "cancelled",
+        });
+    }
 }
 
 /// The service state as a plain string, so the prompt shows a word (`Running`,
@@ -4059,6 +4966,644 @@ mod tests {
             47,
             "expected 47 tools with the file operations"
         );
+    }
+
+    /// TR-XFER-02, AC-XFER-05: `download_file` is not advertised by default and
+    /// appears when the operator enables it. Enabling it adds exactly one tool.
+    #[test]
+    fn transfer_tools_are_absent_until_the_operator_enables_them() {
+        let off = server_with(&[]);
+        let names: Vec<String> = off
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert!(
+            !names.iter().any(|name| name == "download_file"),
+            "download_file must not be advertised while disabled"
+        );
+        assert!(!off.tool_router.has_route("download_file"));
+        // `upload_file` is not implemented, so it is never declared.
+        assert!(!names.iter().any(|name| name == "upload_file"));
+        assert_eq!(names.len(), 43, "expected 43 tools without download_file");
+
+        let on = server_with(&[("WINRIG_ALLOW_FILE_DOWNLOAD", "true")]);
+        let names: Vec<String> = on
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert!(names.iter().any(|name| name == "download_file"));
+        assert!(on.tool_router.has_route("download_file"));
+        assert_eq!(names.len(), 44, "expected 44 tools with download_file");
+    }
+
+    /// TR-XFER-05, AC-XFER-03: a file above `WINRIG_MAX_TRANSFER_BYTES` is refused
+    /// before the read, with the real size and the limit.
+    #[test]
+    fn download_refuses_a_file_above_the_transfer_limit() {
+        let limit: usize = 1024;
+        let decision = crate::policy::decide_transfer_size((limit + 1) as i64, limit);
+        assert!(!decision.allow);
+        assert_eq!(decision.code, "TRANSFER_TOO_LARGE");
+        assert!(decision.reason.contains(&(limit + 1).to_string()));
+        assert!(decision.reason.contains(&limit.to_string()));
+        assert!(crate::policy::decide_transfer_size(limit as i64, limit).allow);
+        assert!(
+            !crate::policy::decide_transfer_size(-1, limit).allow,
+            "a negative size must refuse"
+        );
+    }
+
+    /// TR-XFER-01, AC-XFER-01: a local name with a separator escape, a `..`
+    /// component or a leading dot is refused before any host call.
+    #[test]
+    fn transfer_path_traversal_is_refused() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "..\\escape",
+            "dir/file",
+            "dir\\file",
+            "/abs",
+            "C:evil",
+            ".hidden",
+            "CON",
+            "com1.txt",
+            "trail.",
+            "trail ",
+            "wild*",
+            "PROGRA~1",
+        ] {
+            let decision = crate::policy::decide_transfer_name(name);
+            assert!(!decision.allow, "{name:?} must be refused");
+            assert_eq!(decision.code, "TRANSFER_NAME_INVALID");
+        }
+        for name in ["db.sqlite", "CBS.log", "snapshot-2026.bin"] {
+            assert!(
+                crate::policy::decide_transfer_name(name).allow,
+                "{name:?} must pass"
+            );
+        }
+    }
+
+    /// TR-XFER-01, AC-XFER-01: a symbolic link at the local target is refused in
+    /// all cases, so the write cannot leave the transfer directory.
+    #[cfg(unix)]
+    #[test]
+    fn transfer_symlink_escape_is_refused() {
+        let dir = std::env::temp_dir().join(format!("winrig-transfer-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let link = dir.join("escape");
+        std::os::unix::fs::symlink("/etc/passwd", &link).expect("symlink");
+        let (exists, is_symlink) = local_target_state(&link);
+        assert!(!exists && is_symlink, "the link must read as a symlink");
+        let decision = crate::policy::decide_transfer_target(exists, is_symlink, true);
+        assert!(!decision.allow);
+        assert_eq!(decision.code, "TRANSFER_SYMLINK");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TR-XFER-01, DR-3: in HTTP mode two identities write into different
+    /// subdirectories, and the slug cannot collide.
+    #[test]
+    fn transfer_users_are_isolated() {
+        let root = Path::new("/transfer");
+        let alice = transfer_user_dir(root, "contoso\\alice", true);
+        let bob = transfer_user_dir(root, "contoso\\bob", true);
+        assert_ne!(alice, bob);
+        // The identity is canonicalized: the same name in another case gives the same
+        // directory.
+        assert_eq!(alice, transfer_user_dir(root, "CONTOSO\\ALICE", true));
+        // Two identities with the same sanitized slug still differ by the hash.
+        let one = transfer_user_dir(root, "corp/a b", true);
+        let two = transfer_user_dir(root, "corp a/b", true);
+        assert_ne!(one, two, "the hash suffix must keep the directories apart");
+        // Stdio mode uses the root directly.
+        assert_eq!(transfer_user_dir(root, "contoso\\alice", false), root);
+        assert_eq!(transfer_user_slug(""), "_-e3b0c44298fc1c149afbf4c8996fb924");
+        assert_eq!(
+            transfer_user_slug("contoso\\alice"),
+            "contoso_alice-".to_owned() + &hex_sha256(&Sha256::digest(b"contoso\\alice"))[..32]
+        );
+    }
+
+    /// TR-XFER-01: a symbolic link at the root or at the per-user directory is
+    /// refused before the confirmation and before any creation.
+    #[cfg(unix)]
+    #[test]
+    fn transfer_dir_symlink_is_refused() {
+        let base =
+            std::env::temp_dir().join(format!("winrig-transfer-root-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("base");
+        let real = base.join("real");
+        fs::create_dir_all(&real).expect("real");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let err = precheck_transfer_dir(&link, &link, false).expect_err("a symlink root refuses");
+        assert!(err.contains("WINRIG_TRANSFER_DIR"), "{err}");
+
+        // A per-user directory that is a symlink is refused in HTTP mode.
+        let user = base.join("user");
+        std::os::unix::fs::symlink(&real, &user).expect("symlink");
+        let err =
+            precheck_transfer_dir(&base, &user, true).expect_err("a symlink user dir refuses");
+        assert!(err.contains("WINRIG_TRANSFER_DIR"), "{err}");
+
+        // A root with a group-write bit makes the check refuse it.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o770)).expect("chmod");
+        let err = precheck_transfer_dir(&real, &real, false).expect_err("a wide root refuses");
+        assert!(err.contains("mode 770"), "{err}");
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// TR-XFER-02, AC-XFER-02: a download of a small file reads the source, the
+    /// reply carries the name, the size and the SHA-256, and the file on disk
+    /// matches the source bytes.
+    #[tokio::test]
+    async fn download_hash_matches_on_both_sides() {
+        let transport = Arc::new(TransferTransport::new());
+        let (server, identity) = download_server(Arc::clone(&transport)).await;
+        let dir = download_dir("hash");
+        let size: i64 = 4096;
+        let scan = download_scan_stub("C:\\Data\\db.bin", size);
+        let local = dir.join("db.bin");
+        let result = server
+            .perform_download(
+                &identity,
+                "host1",
+                &scan,
+                &local,
+                &dir,
+                false,
+                false,
+                "confirmed",
+            )
+            .await
+            .expect("download");
+        let value = result.structured_content.expect("structured");
+        assert_eq!(
+            value.get("error").and_then(serde_json::Value::as_str),
+            None,
+            "{value}"
+        );
+        let expected = hex_sha256(&Sha256::digest(pattern_bytes(size)));
+        assert_eq!(
+            value.get("sha256").and_then(serde_json::Value::as_str),
+            Some(expected.as_str()),
+            "{value}"
+        );
+        assert_eq!(
+            value.get("size").and_then(serde_json::Value::as_i64),
+            Some(size)
+        );
+        assert_eq!(fs::read(&local).expect("read"), pattern_bytes(size));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TR-XFER-02: a file larger than one window is read window by window at the
+    /// right offsets, and the last window is short.
+    #[tokio::test]
+    async fn download_reads_each_window_at_its_offset() {
+        let transport = Arc::new(TransferTransport::new());
+        let (server, identity) = download_server(Arc::clone(&transport)).await;
+        let dir = download_dir("windows");
+        let size = ps::TRANSFER_WINDOW_BYTES + 4096;
+        let scan = download_scan_stub("C:\\Data\\big.bin", size);
+        let local = dir.join("big.bin");
+        let result = server
+            .perform_download(
+                &identity,
+                "host1",
+                &scan,
+                &local,
+                &dir,
+                false,
+                false,
+                "confirmed",
+            )
+            .await
+            .expect("download");
+        let value = result.structured_content.expect("structured");
+        assert_eq!(
+            value.get("error").and_then(serde_json::Value::as_str),
+            None,
+            "{value}"
+        );
+        let windows = transport.windows.lock().expect("lock").clone();
+        assert_eq!(
+            windows,
+            vec![
+                (0, ps::TRANSFER_WINDOW_BYTES),
+                (ps::TRANSFER_WINDOW_BYTES, 4096)
+            ],
+            "the offsets and lengths of the two windows must be exact"
+        );
+        assert_eq!(fs::read(&local).expect("read"), pattern_bytes(size));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TR-XFER-02: a window split into lines of uneven size (a short read on a network
+    /// share) still assembles the right file, because only the window total is checked.
+    #[tokio::test]
+    async fn download_accepts_uneven_lines() {
+        let mut transport = TransferTransport::new();
+        transport.uneven = true;
+        let transport = Arc::new(transport);
+        let (server, identity) = download_server(Arc::clone(&transport)).await;
+        let dir = download_dir("uneven");
+        let size: i64 = 5000;
+        let scan = download_scan_stub("C:\\Data\\uneven.bin", size);
+        let local = dir.join("uneven.bin");
+        let result = server
+            .perform_download(
+                &identity,
+                "host1",
+                &scan,
+                &local,
+                &dir,
+                false,
+                false,
+                "confirmed",
+            )
+            .await
+            .expect("download");
+        let value = result.structured_content.expect("structured");
+        assert_eq!(
+            value.get("error").and_then(serde_json::Value::as_str),
+            None,
+            "{value}"
+        );
+        assert_eq!(fs::read(&local).expect("read"), pattern_bytes(size));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TR-XFER-02: a read that returns fewer bytes in total than the scanned length is
+    /// refused as "the source changed during the transfer".
+    #[tokio::test]
+    async fn download_refuses_a_short_window() {
+        let mut transport = TransferTransport::new();
+        transport.truncate_first = true;
+        let transport = Arc::new(transport);
+        let (server, identity) = download_server(Arc::clone(&transport)).await;
+        let dir = download_dir("short");
+        let size: i64 = 5000;
+        let scan = download_scan_stub("C:\\Data\\short.bin", size);
+        let local = dir.join("short.bin");
+        let result = server
+            .perform_download(
+                &identity,
+                "host1",
+                &scan,
+                &local,
+                &dir,
+                false,
+                false,
+                "confirmed",
+            )
+            .await
+            .expect("download");
+        let value = result.structured_content.expect("structured");
+        assert!(
+            value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|error| error.contains("source changed during the transfer")),
+            "{value}"
+        );
+        assert!(!local.exists(), "a refused download leaves no file");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TR-XFER-01: a file system without hard links falls back to a rename only for
+    /// `Unsupported` and `PermissionDenied`, never for a real error like `EEXIST`.
+    #[test]
+    fn hard_link_fallback_covers_the_unsupported_kinds() {
+        use std::io::ErrorKind;
+        assert!(placement_uses_rename_fallback(ErrorKind::Unsupported));
+        assert!(placement_uses_rename_fallback(ErrorKind::PermissionDenied));
+        assert!(!placement_uses_rename_fallback(ErrorKind::AlreadyExists));
+        assert!(!placement_uses_rename_fallback(ErrorKind::NotFound));
+        assert!(!placement_uses_rename_fallback(ErrorKind::Other));
+    }
+
+    /// TR-XFER-01: after a successful hard link the placement is done, so a temp that
+    /// cannot be removed does not fail the transfer; only a stale temp remains.
+    #[cfg(unix)]
+    #[test]
+    fn transfer_placement_succeeds_when_the_temp_cannot_be_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = download_dir("place-keep");
+        let temp_dir = base.join("a");
+        let target_dir = base.join("b");
+        fs::create_dir_all(&temp_dir).expect("a");
+        fs::create_dir_all(&target_dir).expect("b");
+        let temp = temp_dir.join(".winrig-x.part");
+        fs::write(&temp, b"new").expect("temp");
+        let target = target_dir.join("out.bin");
+        // The temp directory loses its write bit, so the temp cannot be removed; the
+        // link into the target directory still succeeds.
+        fs::set_permissions(&temp_dir, fs::Permissions::from_mode(0o500)).expect("chmod");
+        replace_transfer_file(&temp, &target, false).expect("the placement succeeds");
+        assert_eq!(fs::read(&target).expect("read"), b"new");
+        assert!(temp.exists(), "the temp stays when it cannot be removed");
+        fs::set_permissions(&temp_dir, fs::Permissions::from_mode(0o700)).ok();
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// TR-XFER-01: the best-effort removal tolerates a temp that is already gone.
+    #[test]
+    fn remove_temp_best_effort_tolerates_a_missing_file() {
+        let dir = download_dir("best-effort");
+        fs::create_dir_all(&dir).expect("dir");
+        remove_temp_best_effort(&dir.join("absent.part"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TR-XFER-01: a client disconnect drops the transfer future, removes the
+    /// partial file and records a `cancelled` audit entry.
+    #[tokio::test]
+    async fn download_cancellation_removes_the_temp_and_audits() {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let buffer = Arc::clone(&buffer);
+                move || BufferWriter(Arc::clone(&buffer))
+            })
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        let transport = Arc::new(TransferTransport::new());
+        *transport.hang_from.lock().expect("lock") = Some(ps::TRANSFER_WINDOW_BYTES);
+        let (server, identity) = download_server(Arc::clone(&transport)).await;
+        let dir = download_dir("cancel");
+        let size = ps::TRANSFER_WINDOW_BYTES + 4096;
+        let scan = download_scan_stub("C:\\Data\\big.bin", size);
+        let local = dir.join("big.bin");
+        let future = server.perform_download(
+            &identity,
+            "host1",
+            &scan,
+            &local,
+            &dir,
+            false,
+            false,
+            "confirmed",
+        );
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), future).await;
+
+        drop(guard);
+        let text = String::from_utf8_lossy(&buffer.lock().expect("lock")).into_owned();
+        assert!(!local.exists(), "the target must not exist after a cancel");
+        let leftovers: Vec<String> = fs::read_dir(&dir)
+            .expect("dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".winrig-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the partial file remains: {leftovers:?}"
+        );
+        assert!(
+            text.contains("FILE TRANSFER") && text.contains("cancelled"),
+            "the cancel is not audited: {text}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A writer that collects the log of one test into a buffer.
+    struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for BufferWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A deterministic byte of the fake source, so every offset is distinct.
+    fn pattern_byte(index: i64) -> u8 {
+        (index % 251) as u8
+    }
+
+    /// The fake source bytes of a range that starts at zero.
+    fn pattern_bytes(size: i64) -> Vec<u8> {
+        (0..size).map(pattern_byte).collect()
+    }
+
+    /// The base64 lines the fake host emits for `[offset, offset+length)`.
+    fn pattern_lines(offset: i64, length: i64) -> String {
+        let mut lines = Vec::new();
+        let mut done = 0i64;
+        while done < length {
+            let take = ps::TRANSFER_LINE_BYTES.min(length - done);
+            let bytes: Vec<u8> = (0..take).map(|i| pattern_byte(offset + done + i)).collect();
+            lines.push(ps::encode_base64(&bytes));
+            done += take;
+        }
+        lines.join("\n")
+    }
+
+    /// The same bytes as [`pattern_lines`], but split into lines of uneven size, to
+    /// model a host that returns short reads.
+    fn uneven_lines(offset: i64, length: i64) -> String {
+        let sizes = [1usize, 2, 3, 5, 7, 11, 13];
+        let mut lines = Vec::new();
+        let mut done = 0i64;
+        let mut index = 0usize;
+        while done < length {
+            let take = (sizes[index % sizes.len()] as i64).min(length - done);
+            let bytes: Vec<u8> = (0..take).map(|i| pattern_byte(offset + done + i)).collect();
+            lines.push(ps::encode_base64(&bytes));
+            done += take;
+            index += 1;
+        }
+        lines.join("\n")
+    }
+
+    /// The integer that follows `marker` in a generated script.
+    fn number_after(script: &str, marker: &str) -> Option<i64> {
+        let start = script.find(marker)? + marker.len();
+        let rest = &script[start..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        rest[..end].parse().ok()
+    }
+
+    /// A fake host for the download tests: it serves the deterministic pattern per
+    /// offset for a read command and the matching SHA-256 for the hash pass. It can
+    /// hang on a chosen read to exercise the cancellation guard, split a window into
+    /// uneven lines, and return one byte less than the window.
+    struct TransferTransport {
+        /// The `(offset, length)` of each read the fake was asked for.
+        windows: Mutex<Vec<(i64, i64)>>,
+        /// When set, a read at or above this offset never resolves.
+        hang_from: Mutex<Option<i64>>,
+        /// When true, each read returns lines of mixed size.
+        uneven: bool,
+        /// When true, the first read returns one byte less.
+        truncate_first: bool,
+    }
+
+    impl TransferTransport {
+        fn new() -> Self {
+            Self {
+                windows: Mutex::new(Vec::new()),
+                hang_from: Mutex::new(None),
+                uneven: false,
+                truncate_first: false,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WinRmTransport for TransferTransport {
+        async fn run_powershell(
+            &self,
+            _target: &SessionTarget,
+            script: &str,
+        ) -> Result<RemoteOutput, TransportError> {
+            if script.contains("TransformBlock") {
+                let size = number_after(script, "$remaining = ").unwrap_or(0);
+                let hex = hex_sha256(&Sha256::digest(pattern_bytes(size)));
+                return Ok(RemoteOutput {
+                    stdout: format!("progress 0\n{hex}").into_bytes(),
+                    stderr: Vec::new(),
+                    exit_code: 0,
+                });
+            }
+            if script.contains("Seek(") {
+                let offset = number_after(script, "Seek(").unwrap_or(0);
+                let length = number_after(script, "$remaining = ").unwrap_or(0);
+                self.windows.lock().expect("lock").push((offset, length));
+                let hang = *self.hang_from.lock().expect("lock");
+                if let Some(limit) = hang
+                    && offset >= limit
+                {
+                    std::future::pending::<()>().await;
+                }
+                let effective = if self.truncate_first && offset == 0 {
+                    (length - 1).max(0)
+                } else {
+                    length
+                };
+                let stdout = if self.uneven {
+                    uneven_lines(offset, effective)
+                } else {
+                    pattern_lines(offset, effective)
+                };
+                return Ok(RemoteOutput {
+                    stdout: stdout.into_bytes(),
+                    stderr: Vec::new(),
+                    exit_code: 0,
+                });
+            }
+            Ok(RemoteOutput {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                exit_code: 0,
+            })
+        }
+    }
+
+    /// A fresh local directory for one download test.
+    fn download_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("winrig-download-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// The scan a download uses for a file of `size` bytes.
+    fn download_scan_stub(full_name: &str, size: i64) -> TransferScan {
+        TransferScan {
+            full_name: full_name.to_owned(),
+            is_directory: false,
+            link_type: None,
+            size_bytes: size,
+            last_write_utc: Some("2026-01-02T03:04:05.0000000Z".to_owned()),
+            roots: crate::policy::HostRoots::default(),
+        }
+    }
+
+    /// TR-XFER-01: without `overwrite` a hard link refuses an existing target and
+    /// leaves it unchanged; with `overwrite` the rename replaces it.
+    #[test]
+    fn transfer_placement_refuses_an_existing_target_without_overwrite() {
+        let dir = download_dir("place");
+        fs::create_dir_all(&dir).expect("dir");
+        let temp = dir.join(".winrig-x.part");
+        fs::write(&temp, b"new").expect("temp");
+        let target = dir.join("out.bin");
+        fs::write(&target, b"old").expect("target");
+
+        let err = replace_transfer_file(&temp, &target, false).expect_err("must refuse");
+        assert!(err.contains("cannot place"), "{err}");
+        assert_eq!(fs::read(&target).expect("read"), b"old");
+        assert!(temp.exists(), "the temp stays for the caller to remove");
+
+        replace_transfer_file(&temp, &target, true).expect("overwrite places");
+        assert_eq!(fs::read(&target).expect("read"), b"new");
+        assert!(!temp.exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TR-XFER-01: a dangling symbolic link at the target counts as existing and is
+    /// refused with and without `overwrite`.
+    #[cfg(unix)]
+    #[test]
+    fn transfer_target_counts_a_dangling_symlink_as_existing() {
+        let dir = download_dir("dangling");
+        fs::create_dir_all(&dir).expect("dir");
+        let target = dir.join("link");
+        std::os::unix::fs::symlink(dir.join("nope"), &target).expect("symlink");
+        let (exists, is_symlink) = local_target_state(&target);
+        assert!(!exists && is_symlink);
+        assert!(!crate::policy::decide_transfer_target(exists, is_symlink, false).allow);
+        assert!(!crate::policy::decide_transfer_target(exists, is_symlink, true).allow);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A server with the fake host and one open session.
+    async fn download_server(transport: Arc<TransferTransport>) -> (WinrigServer, RequestIdentity) {
+        let registry = Arc::new(SessionRegistry::new(
+            transport as Arc<dyn WinRmTransport>,
+            RegistryConfig::default(),
+        ));
+        let lookup: Box<crate::config::Env> = Box::new(|name: &str| match name {
+            "WINRIG_AUTH_TOKEN" => Some("token".to_owned()),
+            "WINRIG_ALLOWED_HOSTS" => Some("host1".to_owned()),
+            _ => None,
+        });
+        let config = crate::config::load_config_from(lookup.as_ref()).expect("config");
+        let server = WinrigServer::new(registry, Arc::new(config));
+        let identity = RequestIdentity {
+            username: "contoso\\alice".to_owned(),
+            password: Some("s3cret".to_owned().into()),
+            source: crate::identity::IdentitySource::Headers,
+        };
+        let user = WinrigServer::user(&identity);
+        server
+            .registry
+            .connect(&user, "host1", None, None, true)
+            .await;
+        (server, identity)
     }
 
     /// AC-FS-10: the confirmation of a directory copy shows the file, directory
@@ -4470,6 +6015,7 @@ mod tests {
         assert!(tools.iter().any(|tool| tool.name == "move_file"));
         assert!(tools.iter().any(|tool| tool.name == "rename_file"));
         assert!(tools.iter().any(|tool| tool.name == "create_directory"));
+        assert!(tools.iter().any(|tool| tool.name == "download_file"));
         // An exact count: "at least 30" would catch neither a lost tool nor a
         // duplicate. These are all declared tools; the configuration decides
         // how many the agent sees (TR-FS-01, TR-FS-08, TR-EXE-01, TR-EXE-05), and
@@ -4477,11 +6023,11 @@ mod tests {
         // `file_ops_are_absent_until_the_operator_enables_them`,
         // `run_command_is_absent_until_the_operator_enables_it` and
         // `run_script_is_absent_until_the_operator_enables_it` check that.
-        assert_eq!(tools.len(), 50, "expected 50 declared tools");
+        assert_eq!(tools.len(), 51, "expected 51 declared tools");
         let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 50, "tool names must be unique");
+        assert_eq!(names.len(), 51, "tool names must be unique");
     }
 
     #[test]
@@ -4497,6 +6043,7 @@ mod tests {
             "create_directory",
             "delete_directory",
             "delete_file",
+            "download_file",
             "flush_dns",
             "kill_process",
             "move_file",
@@ -4546,6 +6093,7 @@ mod tests {
             EFFECT_MOVE,
             EFFECT_RENAME,
             EFFECT_CREATE_DIRECTORY,
+            EFFECT_DOWNLOAD_FILE,
         ] {
             assert!(!effect.is_empty(), "an effect line is empty");
             assert!(

@@ -3507,3 +3507,309 @@ async fn run_script_audit_holds_the_script_and_the_hash() {
         "the chunk base64 leaked into the audit: {text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// download_file
+// ---------------------------------------------------------------------------
+
+/// One `download_file` call in an open session.
+fn download_call(remote_path: &str, name: &str, overwrite: bool) -> CallToolRequestParams {
+    CallToolRequestParams::new("download_file").with_arguments(args(&serde_json::json!({
+        "session_id": HOST,
+        "remote_path": remote_path,
+        "name": name,
+        "overwrite": overwrite
+    })))
+}
+
+/// A unique local transfer directory for one test.
+fn transfer_dir(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("winrig-transfer-{name}-{}", std::process::id()))
+}
+
+/// The digest of `bytes` in lowercase hexadecimal notation.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            use std::fmt::Write;
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
+/// The scan JSON the fake host returns for one file source.
+fn download_scan_json(full_name: &str, size: i64, last_write: &str) -> String {
+    format!(
+        r#"{{"FullName":"{}","IsDirectory":false,"LinkType":null,"SizeBytes":{},"LastWriteTimeUtc":"{}","Roots":{{"SystemRoot":"C:\\Windows"}}}}"#,
+        full_name.replace('\\', "\\\\"),
+        size,
+        last_write
+    )
+}
+
+/// Arms the fake host for one download of `content`: the pre-scan, the read window
+/// and the host hash pass. The read returns the base64 of the content and the hash
+/// pass its digest, so the tool can verify both sides.
+fn arm_download(harness: &Harness, full_name: &str, content: &[u8]) {
+    let size = content.len() as i64;
+    harness.transport.respond(
+        "PSProvider.Name",
+        &download_scan_json(full_name, size, "2026-01-02T03:04:05.0000000Z"),
+    );
+    harness
+        .transport
+        .respond("Seek(", &winrig::ps::encode_base64(content));
+    harness.transport.respond(
+        "TransformBlock",
+        &format!("progress 0\n{}", sha256_hex(content)),
+    );
+}
+
+/// TR-XFER-02, AC-XFER-02: a confirmed download writes the file into the transfer
+/// directory, and the reply carries the name, the size and the hash, not the
+/// content.
+#[tokio::test]
+async fn download_writes_the_file_and_returns_the_hash() {
+    let root = transfer_dir(&format!("download-{}", line!()));
+    let _ = std::fs::remove_dir_all(&root);
+    let root_str = root.to_string_lossy().into_owned();
+    let content = b"hello world";
+    let sha = sha256_hex(content);
+    let harness = connected(
+        Answer::Accept,
+        &[
+            ("WINRIG_ALLOW_FILE_DOWNLOAD", "true"),
+            ("WINRIG_TRANSFER_DIR", root_str.as_str()),
+        ],
+    )
+    .await;
+    arm_download(&harness, "C:\\Windows\\Logs\\CBS\\CBS.log", content);
+    let result = harness
+        .call(download_call(
+            "C:\\Windows\\Logs\\CBS\\CBS.log",
+            "CBS.log",
+            false,
+        ))
+        .await;
+
+    assert_eq!(error_of(&result), None, "{:?}", result.structured_content);
+    assert_eq!(field(&result, "name").as_deref(), Some("CBS.log"));
+    assert_eq!(number(&result, "size"), Some(content.len() as i64));
+    assert_eq!(field(&result, "sha256").as_deref(), Some(sha.as_str()));
+    let written = std::fs::read(root.join("CBS.log")).expect("the file landed");
+    assert_eq!(written, content);
+    assert!(
+        harness
+            .transport
+            .saw("[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete"),
+        "the read does not use a shared read with delete"
+    );
+    assert!(
+        !result
+            .structured_content
+            .as_ref()
+            .expect("structured")
+            .to_string()
+            .contains(&winrig::ps::encode_base64(content)),
+        "the reply must not carry the content inline"
+    );
+    std::fs::remove_dir_all(&root).ok();
+    harness.client.cancel().await.ok();
+}
+
+/// TR-XFER-05, AC-XFER-03: a file above `WINRIG_MAX_TRANSFER_BYTES` is refused on the
+/// scanned length before any read or hash pass.
+#[tokio::test]
+async fn download_above_the_transfer_limit_reads_nothing() {
+    let root = transfer_dir(&format!("overlimit-{}", line!()));
+    let _ = std::fs::remove_dir_all(&root);
+    let root_str = root.to_string_lossy().into_owned();
+    let harness = connected(
+        Answer::Accept,
+        &[
+            ("WINRIG_ALLOW_FILE_DOWNLOAD", "true"),
+            ("WINRIG_TRANSFER_DIR", root_str.as_str()),
+            ("WINRIG_MAX_TRANSFER_BYTES", "1024"),
+        ],
+    )
+    .await;
+    harness.transport.respond(
+        "PSProvider.Name",
+        &download_scan_json("C:\\Data\\big.bin", 4096, "2026-01-02T03:04:05.0000000Z"),
+    );
+    let result = harness
+        .call(download_call("C:\\Data\\big.bin", "big.bin", false))
+        .await;
+
+    let error = error_of(&result).expect("a refusal");
+    assert!(error.contains("1024"), "the limit is not named: {error}");
+    assert!(error.contains("4096"), "the size is not named: {error}");
+    assert!(
+        !harness.transport.saw("Seek("),
+        "a read reached the host for an over-limit file"
+    );
+    assert!(
+        !harness.transport.saw("TransformBlock"),
+        "the hash pass reached the host for an over-limit file"
+    );
+    assert_eq!(
+        harness.elicitations(),
+        0,
+        "the server asked about an over-limit file"
+    );
+    std::fs::remove_dir_all(&root).ok();
+    harness.client.cancel().await.ok();
+}
+
+/// TR-XFER-03, AC-XFER-05: every download needs a confirmation. Without a channel
+/// the tool refuses and no read reaches the host (DR-5, fail-closed).
+#[tokio::test]
+async fn download_without_channel_is_refused() {
+    let root = transfer_dir(&format!("nochannel-{}", line!()));
+    let _ = std::fs::remove_dir_all(&root);
+    let root_str = root.to_string_lossy().into_owned();
+    let content = b"secret bytes";
+    let harness = connected(
+        Answer::NoChannel,
+        &[
+            ("WINRIG_ALLOW_FILE_DOWNLOAD", "true"),
+            ("WINRIG_TRANSFER_DIR", root_str.as_str()),
+        ],
+    )
+    .await;
+    // The read-only pre-scan runs before the prompt, so it is answered here.
+    harness.transport.respond(
+        "PSProvider.Name",
+        &download_scan_json(
+            "C:\\Data\\db.bin",
+            content.len() as i64,
+            "2026-01-02T03:04:05.0000000Z",
+        ),
+    );
+    let result = harness
+        .call(download_call("C:\\Data\\db.bin", "db.bin", false))
+        .await;
+
+    assert!(
+        !harness.transport.saw("Seek("),
+        "a read reached the host without a confirmation"
+    );
+    assert!(!root.join("db.bin").exists(), "nothing must land on disk");
+    assert!(
+        error_of(&result).is_some_and(|error| error.contains("cannot ask for confirmation")),
+        "{:?}",
+        result.structured_content
+    );
+    std::fs::remove_dir_all(&root).ok();
+    harness.client.cancel().await.ok();
+}
+
+/// TR-XFER-02, AC-SEC21-1: the confirmation names the host, the user and the tool,
+/// the resolved remote path, the size, the modification time and the local
+/// destination, and it warns for a system-directory source.
+#[tokio::test]
+async fn download_confirmation_shows_the_source_size_and_time() {
+    let root = transfer_dir(&format!("confirm-{}", line!()));
+    let _ = std::fs::remove_dir_all(&root);
+    let root_str = root.to_string_lossy().into_owned();
+    let content = b"hello world";
+    let harness = connected(
+        Answer::Accept,
+        &[
+            ("WINRIG_ALLOW_FILE_DOWNLOAD", "true"),
+            ("WINRIG_TRANSFER_DIR", root_str.as_str()),
+        ],
+    )
+    .await;
+    arm_download(&harness, "C:\\Windows\\Logs\\CBS\\CBS.log", content);
+    harness
+        .call(download_call(
+            "C:\\Windows\\Logs\\CBS\\CBS.log",
+            "CBS.log",
+            false,
+        ))
+        .await;
+
+    let message = harness.last_confirmation();
+    assert_header(&message, "download_file");
+    assert!(
+        message.contains("Resolved remote: C:\\Windows\\Logs\\CBS\\CBS.log"),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("Size: {} bytes", content.len())),
+        "{message}"
+    );
+    assert!(
+        message.contains("Last write: 2026-01-02T03:04:05.0000000Z"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("SHA-256:"),
+        "the prompt must not carry a hash: {message}"
+    );
+    assert!(message.contains("Local destination: "), "{message}");
+    assert!(message.contains("Overwrite: no"), "{message}");
+    assert!(
+        message.contains("Warning: the source lies in a system directory"),
+        "{message}"
+    );
+    assert!(
+        message.contains("This copies the file from the host into the local transfer directory."),
+        "{message}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+    harness.client.cancel().await.ok();
+}
+
+/// TR-XFER-02, DR-4: the audit records the resolved paths, the size, both hashes and
+/// the confirmation state, and never the content.
+#[tokio::test]
+async fn download_audit_holds_the_path_and_hash_not_the_content() {
+    let root = transfer_dir(&format!("audit-{}", line!()));
+    let _ = std::fs::remove_dir_all(&root);
+    let root_str = root.to_string_lossy().into_owned();
+    let content = b"hello world";
+    let sha = sha256_hex(content);
+    let payload = winrig::ps::encode_base64(content);
+    let buffer = capture();
+    let harness = connected(
+        Answer::Accept,
+        &[
+            ("WINRIG_ALLOW_FILE_DOWNLOAD", "true"),
+            ("WINRIG_TRANSFER_DIR", root_str.as_str()),
+        ],
+    )
+    .await;
+    arm_download(&harness, "C:\\Data\\db.bin", content);
+    harness
+        .call(download_call("C:\\Data\\db.bin", "db.bin", false))
+        .await;
+    harness.client.cancel().await.ok();
+
+    let audit = take_audit(&buffer);
+    assert!(audit.contains("FILE TRANSFER"), "{audit}");
+    assert!(
+        audit.contains("db.bin"),
+        "the local name is missing: {audit}"
+    );
+    assert!(
+        audit.contains(&format!("sha256_local  : {sha}")),
+        "the local hash is missing: {audit}"
+    );
+    assert!(
+        audit.contains(&format!("sha256_host   : {sha}")),
+        "the host hash is missing: {audit}"
+    );
+    assert!(
+        audit.contains("confirmation  : confirmed"),
+        "the confirmation state is missing: {audit}"
+    );
+    assert!(
+        !audit.contains(&payload),
+        "the chunk base64 leaked into the audit: {audit}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

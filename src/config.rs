@@ -197,6 +197,13 @@ pub struct AppConfig {
     /// Whether `copy_file`, `move_file`, `rename_file` and `create_directory` exist
     /// (TR-FS-08, ADR-0017 §14).
     pub allow_file_ops: bool,
+    /// Whether the tool `download_file` exists (TR-XFER-02, ADR-0017 §24).
+    pub allow_file_download: bool,
+    /// The local endpoint of the file transfer; `None` means the transfer
+    /// subdirectory of the state directory (TR-XFER-01, ADR-0017 §21).
+    pub transfer_dir: Option<String>,
+    /// Size ceiling of one transfer, in bytes (TR-XFER-05, ADR-0017 §25).
+    pub max_transfer_bytes: usize,
     /// What happens when the client declared no confirmation channel (TR-SEC-11).
     pub confirm_fallback: ConfirmFallback,
 }
@@ -238,6 +245,9 @@ impl fmt::Debug for AppConfig {
             .field("allowed_commands", &self.allowed_commands)
             .field("allow_script_exec", &self.allow_script_exec)
             .field("allow_file_ops", &self.allow_file_ops)
+            .field("allow_file_download", &self.allow_file_download)
+            .field("transfer_dir", &self.transfer_dir)
+            .field("max_transfer_bytes", &self.max_transfer_bytes)
             .field("confirm_fallback", &self.confirm_fallback)
             .field(
                 "sftp_cred_idle_ttl_seconds",
@@ -376,6 +386,23 @@ fn read_confirm_fallback(env: &Env) -> Result<ConfirmFallback, ConfigError> {
             "WINRIG_CONFIRM_FALLBACK={raw:?} is not valid; expected one of refuse, proceed"
         ))
     })
+}
+
+/// The local endpoint of the file transfer (TR-XFER-01, DR-8).
+///
+/// An explicit value must be an absolute path: a relative value would resolve from
+/// the process working directory and could land outside the intended directory, so it
+/// refuses the start and names the variable.
+fn read_transfer_dir(env: &Env) -> Result<Option<String>, ConfigError> {
+    let Some(raw) = read(env, "WINRIG_TRANSFER_DIR") else {
+        return Ok(None);
+    };
+    if !std::path::Path::new(&raw).is_absolute() {
+        return Err(ConfigError::new(format!(
+            "WINRIG_TRANSFER_DIR={raw:?} is not an absolute path; expected an absolute directory path"
+        )));
+    }
+    Ok(Some(raw))
 }
 
 fn load_auth_token(env: &Env) -> Option<String> {
@@ -564,6 +591,17 @@ pub fn load_config_from(env: &Env) -> Result<AppConfig, ConfigError> {
         allowed_commands: read_allowed_commands(env)?,
         allow_script_exec: read_bool(env, "WINRIG_ALLOW_SCRIPT_EXEC", false)?,
         allow_file_ops: read_bool(env, "WINRIG_ALLOW_FILE_OPS", false)?,
+        allow_file_download: read_bool(env, "WINRIG_ALLOW_FILE_DOWNLOAD", false)?,
+        transfer_dir: read_transfer_dir(env)?,
+        // The lower bound is one byte: even the smallest limit still allows an
+        // empty file, so the variable never means "a tool that always refuses".
+        max_transfer_bytes: read_uint(
+            env,
+            "WINRIG_MAX_TRANSFER_BYTES",
+            256 * 1024 * 1024,
+            Some(1),
+            None,
+        )?,
         confirm_fallback: read_confirm_fallback(env)?,
     })
 }
@@ -665,6 +703,15 @@ pub fn setting_pairs(config: &AppConfig) -> Vec<(&'static str, Option<String>)> 
         (
             "WINRIG_ALLOW_FILE_OPS",
             Some(config.allow_file_ops.to_string()),
+        ),
+        (
+            "WINRIG_ALLOW_FILE_DOWNLOAD",
+            Some(config.allow_file_download.to_string()),
+        ),
+        ("WINRIG_TRANSFER_DIR", config.transfer_dir.clone()),
+        (
+            "WINRIG_MAX_TRANSFER_BYTES",
+            Some(config.max_transfer_bytes.to_string()),
         ),
         (
             "WINRIG_CONFIRM_FALLBACK",
@@ -777,8 +824,35 @@ mod tests {
         assert!(!config.allow_script_exec);
         // TR-FS-08: the file operations are off until the operator turns them on.
         assert!(!config.allow_file_ops);
+        // TR-XFER-02: a download is off until the operator turns it on.
+        assert!(!config.allow_file_download);
+        // TR-XFER-01: no explicit transfer directory by default; the state
+        // directory is the endpoint.
+        assert_eq!(config.transfer_dir, None);
+        // TR-XFER-05: 256 MiB by default.
+        assert_eq!(config.max_transfer_bytes, 256 * 1024 * 1024);
         // TR-SEC-11: a missing confirmation channel is a refusal by default.
         assert_eq!(config.confirm_fallback, ConfirmFallback::Refuse);
+    }
+
+    /// TR-XFER-01, DR-8: `WINRIG_TRANSFER_DIR` must be absolute; a relative value
+    /// refuses the start and names the variable. A relative path is rejected on
+    /// every platform the tests run on by the leading-separator rule.
+    #[test]
+    fn transfer_dir_must_be_absolute() {
+        let env = source(&with(&[("WINRIG_TRANSFER_DIR", "relative/dir")]));
+        let error = load_config_from(&env).expect_err("must fail").to_string();
+        assert!(error.contains("WINRIG_TRANSFER_DIR"), "{error}");
+        assert!(error.contains("absolute"), "{error}");
+    }
+
+    /// TR-XFER-02: the download flag is switched by the usual boolean values.
+    #[test]
+    fn file_download_is_switched_by_the_operator() {
+        let env = source(&with(&[("WINRIG_ALLOW_FILE_DOWNLOAD", "true")]));
+        assert!(load_config_from(&env).expect("valid").allow_file_download);
+        let env = source(&with(&[("WINRIG_ALLOW_FILE_DOWNLOAD", "off")]));
+        assert!(!load_config_from(&env).expect("valid").allow_file_download);
     }
 
     /// TR-FS-08: the setting is switched by the usual boolean values, and a bad

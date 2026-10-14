@@ -73,6 +73,9 @@ A value with the wrong format stops the start with a message that names the vari
 | `WINRIG_ALLOW_COMMAND_EXEC` | `false` | Whether the tool `run_command` exists. While the value is `false`, the server removes the tool from the router: it does not declare the tool and no call reaches it |
 | `WINRIG_ALLOW_SCRIPT_EXEC` | `false` | Whether the tool `run_script` exists. While the value is `false`, the server removes the tool from the router: it does not declare the tool and no call reaches it |
 | `WINRIG_ALLOW_FILE_OPS` | `false` | Whether the tools `copy_file`, `move_file`, `rename_file` and `create_directory` exist. While the value is `false`, the server removes the tools from the router: it does not declare them and no call reaches them (ADR-0017 §14) |
+| `WINRIG_ALLOW_FILE_DOWNLOAD` | `false` | Whether the tool `download_file` exists. While the value is `false`, the server removes the tool from the router: it does not declare the tool and no call reaches it (ADR-0017 §24) |
+| `WINRIG_TRANSFER_DIR` | the transfer subdirectory of the state directory | The local endpoint of the file transfer. The value must be an absolute path; a relative value makes the start fail. The directory and its files use the private modes (`0700`/`0600`). In HTTP mode the server adds one subdirectory per user (DR-3) |
+| `WINRIG_MAX_TRANSFER_BYTES` | `268435456` | The largest file that `download_file` accepts, in bytes (256 MiB). The server refuses a larger file before the read (ADR-0017 §25) |
 | `WINRIG_ALLOWED_COMMANDS` | *(empty)* | The command allowlist, comma-separated. An empty value admits any command. A non-empty value admits only a command that begins with one entry, matched without case after a trim. A prefix is not a boundary: a leading `&`, `.`, `powershell -c`, an alias and a script started by path all go around it. A bad entry refuses the start |
 
 ## Reserved

@@ -975,6 +975,144 @@ pub fn is_reserved_new_name(name: &str) -> bool {
 /// The refusal text of `rename_file` states this grammar (DR-8).
 pub const NEW_NAME_FORM: &str = "one file name without a directory separator, a reserved device name (CON, NUL, COM1, ...), a trailing dot or space, or any of < > : \" / \\ | ? *";
 
+/// The refusal text of a file transfer states this grammar (DR-8).
+pub const TRANSFER_NAME_FORM: &str = "one plain file name in the transfer directory, without a directory separator, a '..' component, a leading dot, a reserved device name (CON, NUL, COM1, ...), a trailing dot or space, or any of < > : \" / \\ | ? *";
+
+/// Largest name a file transfer accepts, in bytes (the Windows file name limit).
+pub const TRANSFER_NAME_MAX_BYTES: usize = 255;
+
+/// Verdict on the relative name of a file transfer (TR-XFER-01, ADR-0017 §21).
+///
+/// A tool takes a relative name only, so the name must be a name and not a path: a
+/// separator escape, a `..` component, a leading dot, a reserved device name, an
+/// invalid character, a trailing dot or space and a wildcard are all refused before
+/// any write. A control or format character (Cc/Cf) is refused too, so the name
+/// cannot hide text or reorder the prompt. The check is a defence in depth: the name
+/// cannot leave the per-user directory even without it.
+#[must_use]
+pub fn decide_transfer_name(name: &str) -> PolicyDecision {
+    if name.is_empty() {
+        return PolicyDecision::deny(
+            "the name is empty; pass one file name".to_owned(),
+            "TRANSFER_NAME_INVALID",
+        );
+    }
+    let invalid_char = name.chars().any(|c| {
+        crate::executor::is_prompt_control(c)
+            || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+    });
+    if name == "."
+        || name == ".."
+        || name.starts_with('.')
+        || invalid_char
+        || name.ends_with(['.', ' '])
+    {
+        return PolicyDecision::deny(
+            format!("the name {name:?} is not valid; expected {TRANSFER_NAME_FORM}"),
+            "TRANSFER_NAME_INVALID",
+        );
+    }
+    if name.len() > TRANSFER_NAME_MAX_BYTES {
+        return PolicyDecision::deny(
+            format!(
+                "the name is {} bytes; the limit is {TRANSFER_NAME_MAX_BYTES}",
+                name.len()
+            ),
+            "TRANSFER_NAME_INVALID",
+        );
+    }
+    if is_reserved_new_name(name) {
+        return PolicyDecision::deny(
+            format!("the name {name:?} is a reserved device name; expected {TRANSFER_NAME_FORM}"),
+            "TRANSFER_NAME_INVALID",
+        );
+    }
+    if short_name_component(name).is_some() {
+        return PolicyDecision::deny(
+            format!("the name {name:?} has an 8.3 component; pass the long name"),
+            "TRANSFER_NAME_INVALID",
+        );
+    }
+    PolicyDecision::allow("the name is one plain file name")
+}
+
+/// True for an absolute Windows path: a drive path `C:\...` or a UNC `\\server\...`.
+///
+/// The download source is checked with this rule before any host call, so a relative
+/// path is refused without a network round trip.
+#[must_use]
+pub fn is_absolute_windows_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/'))
+        || path.starts_with("\\\\")
+}
+
+/// Verdict on the remote path of a download, before any host call (TR-XFER-02).
+///
+/// A relative path is refused before the network, so the host resolves only an
+/// explicit absolute path.
+#[must_use]
+pub fn decide_download_remote_path(path: &str) -> PolicyDecision {
+    if !is_absolute_windows_path(path.trim()) {
+        return PolicyDecision::deny(
+            format!(
+                "the remote path {path:?} is not absolute; expected a drive path such as C:\\... or a \
+                 UNC path such as \\\\server\\share\\..."
+            ),
+            "TRANSFER_PATH_NOT_ABSOLUTE",
+        );
+    }
+    PolicyDecision::allow("the remote path is absolute")
+}
+
+/// Size ceiling of one transfer (TR-XFER-05, ADR-0017 §25).
+///
+/// A larger file is refused before any read, and the refusal names the real size and
+/// the limit.
+#[must_use]
+pub fn decide_transfer_size(size: i64, limit: usize) -> PolicyDecision {
+    if size < 0 {
+        return PolicyDecision::deny(
+            "the host reported a negative file size; the tool refuses".to_owned(),
+            "TRANSFER_SIZE_INVALID",
+        );
+    }
+    if size as u128 > limit as u128 {
+        return PolicyDecision::deny(
+            format!(
+                "the file is {size} bytes, above the limit of {limit}; raise \
+                 WINRIG_MAX_TRANSFER_BYTES or download a smaller file"
+            ),
+            "TRANSFER_TOO_LARGE",
+        );
+    }
+    PolicyDecision::allow("the file is inside the transfer limit")
+}
+
+/// Overwrite verdict for the local file of a transfer (TR-XFER-01, ADR-0017 §21).
+///
+/// A symbolic link at the target is refused in all cases: writing through it would
+/// leave the transfer directory. An existing file needs `overwrite`.
+#[must_use]
+pub fn decide_transfer_target(exists: bool, is_symlink: bool, overwrite: bool) -> PolicyDecision {
+    if is_symlink {
+        return PolicyDecision::deny(
+            "the local target is a symbolic link; the tool refuses to write through it".to_owned(),
+            "TRANSFER_SYMLINK",
+        );
+    }
+    if exists && !overwrite {
+        return PolicyDecision::deny(
+            "the local file already exists; pass overwrite=true to replace it".to_owned(),
+            "FILE_EXISTS",
+        );
+    }
+    PolicyDecision::allow("the local target may be written")
+}
+
 /// Verdict on the new name of `rename_file` (TR-FS-10, ADR-0017 §19).
 ///
 /// The tool changes the last path component, so the name must be a name and not a
@@ -1237,6 +1375,105 @@ impl SourceScan {
             roots: HostRoots::from_scan(&object)?,
         })
     }
+}
+
+/// Result of the pre-scan of a download source, from the host (TR-XFER-02,
+/// ADR-0017 §24).
+///
+/// The host resolves the path, reports the kind, the link type and the size, and
+/// computes the SHA-256 of the file in a streaming way. `sha256` is the lowercase
+/// The length and the metadata of a download source from the host (TR-XFER-02,
+/// ADR-0017 §24).
+///
+/// The host reports the length of the opened stream without reading the content, the
+/// kind and the link type, and the modification time. The tool hashes the bytes as
+/// it reads them, so the scan carries no digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferScan {
+    /// Canonical path returned by the host.
+    pub full_name: String,
+    pub is_directory: bool,
+    /// `LinkType` of the final component (ADR-0017 §10).
+    pub link_type: Option<String>,
+    pub size_bytes: i64,
+    /// Modification time of the source, for the prompt.
+    pub last_write_utc: Option<String>,
+    pub roots: HostRoots,
+}
+
+impl TransferScan {
+    ///
+    /// # Errors
+    ///
+    /// Error text if the answer is not a JSON object or lacks the mandatory fields
+    /// `FullName`, `IsDirectory`, `SizeBytes`, and `Roots` with a non-empty
+    /// `SystemRoot` (fail-closed). `LinkType` and `LastWriteTimeUtc` are optional.
+    pub fn from_json(raw: &str) -> Result<Self, String> {
+        let object = scan_object(raw)?;
+        Ok(Self {
+            full_name: required_str(&object, "FullName")?,
+            is_directory: required_bool(&object, "IsDirectory")?,
+            link_type: optional_str(&object, "LinkType"),
+            size_bytes: object
+                .get("SizeBytes")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| "Pre-scan result is missing SizeBytes.".to_owned())?,
+            last_write_utc: optional_str(&object, "LastWriteTimeUtc"),
+            roots: HostRoots::from_scan(&object)?,
+        })
+    }
+}
+
+/// The warning line of a download, worded for a read (ADR-0017 §28, §36).
+fn source_class(path: &str, roots: &HostRoots) -> Option<&'static str> {
+    match protected_target_class(path, roots) {
+        Some("the target is a volume root") => Some("the source is a volume root"),
+        Some("the target lies in a system directory") => {
+            Some("the source lies in a system directory")
+        }
+        Some("the target is a share root") => Some("the source is a share root"),
+        other => other,
+    }
+}
+
+/// Verdict on a download source (TR-XFER-02, ADR-0017 §24).
+///
+/// A download reads the source, so a source under a system directory is allowed:
+/// downloading a log from `C:\Windows` is a main use. The path syntax stays guarded:
+/// a device volume path, an 8.3 name and a name surrogate are refused, and a
+/// directory source is refused. The protected class travels on the decision for the
+/// warning line, not as a refusal.
+#[must_use]
+pub fn decide_download_source(scan: &TransferScan, requested: &str) -> PolicyDecision {
+    for candidate in std::iter::once(requested).chain([scan.full_name.as_str()]) {
+        if let Some(refusal) = refuse_device_volume(candidate, requested, "download") {
+            return refusal;
+        }
+        if let Some(refusal) = refuse_short_name(candidate, requested, "download") {
+            return refusal;
+        }
+    }
+    if is_name_surrogate(scan.link_type.as_deref()) {
+        return PolicyDecision::deny(
+            format!(
+                "the tool refuses to download {requested:?}: the source is a symbolic link or a \
+                 junction, and the download would read its target. Pass the real source path."
+            ),
+            "PATH_REPARSE_POINT",
+        );
+    }
+    if scan.is_directory {
+        return PolicyDecision::deny(
+            format!(
+                "the tool refuses to download {requested:?}: the source is a directory. \
+                 download_file reads one file."
+            ),
+            "PATH_IS_DIRECTORY",
+        );
+    }
+    let mut decision = PolicyDecision::allow("the source is read-only");
+    decision.class = source_class(&scan.full_name, &scan.roots);
+    decision
 }
 
 /// Verdict on the source of a file operation (TR-FS-09, TR-FS-10).
@@ -3459,6 +3696,87 @@ mod tests {
             assert!(!decision.allow, "{bad:?} must be refused");
             assert_eq!(decision.code, "RENAME_NAME_INVALID", "{bad:?}");
         }
+    }
+
+    /// TR-XFER-01: the transfer name is one plain file name; a separator, a `..`
+    /// component, a leading dot, a reserved device name, a trailing dot or space, an
+    /// invalid character and a control or format character are refused.
+    #[test]
+    fn transfer_name_refuses_a_path_and_a_reserved_name() {
+        for good in ["db.sqlite", "CBS.log", "snapshot-2026.bin"] {
+            assert!(decide_transfer_name(good).allow, "{good:?}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "..\\x",
+            "a/b",
+            "a\\b",
+            "/abs",
+            "C:evil",
+            ".hidden",
+            "NUL",
+            "con.txt",
+            "COM1",
+            "trail.",
+            "trail ",
+            "a:b",
+            "a*b",
+            "a\u{1}b",
+            "PROGRA~1",
+            "a\u{200B}b",
+            "a\u{202E}b",
+            "a\u{FEFF}b",
+        ] {
+            let decision = decide_transfer_name(bad);
+            assert!(!decision.allow, "{bad:?} must be refused");
+            assert_eq!(decision.code, "TRANSFER_NAME_INVALID", "{bad:?}");
+        }
+        // A name of 255 bytes fits; a longer one is refused.
+        let long = "a".repeat(TRANSFER_NAME_MAX_BYTES + 1);
+        assert!(!decide_transfer_name(&long).allow);
+        assert!(decide_transfer_name(&"a".repeat(TRANSFER_NAME_MAX_BYTES)).allow);
+    }
+
+    /// TR-XFER-02, ADR-0017 §24: a download source may lie in a system directory,
+    /// but a directory and a name surrogate are refused.
+    #[test]
+    fn download_source_allows_a_protected_read_but_refuses_a_directory_and_a_link() {
+        let file = TransferScan {
+            full_name: "C:\\Windows\\Logs\\CBS\\CBS.log".to_owned(),
+            is_directory: false,
+            link_type: None,
+            size_bytes: 10,
+            last_write_utc: Some("2026-01-02T03:04:05.0000000Z".to_owned()),
+            roots: roots(&[("SystemRoot", "C:\\Windows")]),
+        };
+        let decision = decide_download_source(&file, "C:\\Windows\\Logs\\CBS\\CBS.log");
+        assert!(decision.allow, "{}", decision.reason);
+        assert_eq!(
+            decision.class,
+            Some("the source lies in a system directory"),
+            "a system-directory source warns but is not refused"
+        );
+
+        let directory = TransferScan {
+            is_directory: true,
+            ..file.clone()
+        };
+        assert_eq!(
+            decide_download_source(&directory, &directory.full_name).code,
+            "PATH_IS_DIRECTORY"
+        );
+
+        let link = TransferScan {
+            link_type: Some("SymbolicLink".to_owned()),
+            ..file
+        };
+        assert_eq!(
+            decide_download_source(&link, &link.full_name).code,
+            "PATH_REPARSE_POINT"
+        );
     }
 
     /// TR-FS-09/10: a copy or a move onto the same path, into the source's subtree,

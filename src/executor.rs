@@ -100,7 +100,8 @@ pub fn neutralize_separator(body: &str) -> String {
 /// Bidi controls (U+202A..U+202E, U+2066..U+2069), zero-width characters and the
 /// other format characters are in Cf, so a value cannot reorder or hide the text.
 /// `char::is_control` covers Cc, which holds NEL U+0085, ESC, VT and FF.
-fn is_prompt_control(c: char) -> bool {
+#[must_use]
+pub fn is_prompt_control(c: char) -> bool {
     c.is_control()
         || matches!(
             c,

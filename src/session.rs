@@ -94,6 +94,30 @@ pub struct ScriptRun<'a> {
     pub hash: &'a str,
 }
 
+/// The fields of one file-transfer audit record (ADR-0017 §38).
+///
+/// The record holds the resolved paths, the size, both SHA-256 values when they are
+/// known and the confirmation state; it never holds content (DR-4).
+pub struct AuditTransfer<'a> {
+    pub username: &'a str,
+    pub tool: &'a str,
+    /// WinRM target of the session, for the audit record.
+    pub host: &'a str,
+    /// Source location as the Windows host resolved it.
+    pub remote_path: &'a str,
+    /// Destination on this computer, as the server resolved it.
+    pub local_path: &'a str,
+    pub size: i64,
+    /// Digest of the source from the separate pass; empty until it returns.
+    pub host_hash: &'a str,
+    /// The SHA-256 the server computed while it read; empty until then.
+    pub local_hash: &'a str,
+    /// `confirmed`, `unsupported` or `cancelled`.
+    pub confirmation: &'a str,
+    /// `downloaded`, `failed` or `cancelled`.
+    pub status: &'a str,
+}
+
 /// Result of a remote command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteOutput {
@@ -894,6 +918,103 @@ impl SessionRegistry {
                 json!({ "error": message, "session_id": session_id })
             }
         }
+    }
+
+    /// Runs one host command of a download and returns its base64 payload without an
+    /// audit record (DR-4).
+    ///
+    /// The reply carries the raw base64 of the chunk. The audit records nothing here
+    /// because the payload may be personal data; the caller writes one summary record
+    /// with the path, the size and the hash (ADR-0017 §38).
+    pub async fn read_transfer_chunk(
+        &self,
+        username: &str,
+        session_id: &str,
+        command: &str,
+    ) -> Value {
+        let target = {
+            let mut sessions = lock(&self.sessions);
+            let Some(session) = sessions.get_mut(&(username.to_owned(), session_id.to_owned()))
+            else {
+                return json!({
+                    "error": format!("Session not found: {session_id}. Use connect first.")
+                });
+            };
+            session.last_used = SystemTime::now();
+            session.command_count += 1;
+            session.target.clone()
+        };
+
+        let command_chars = crate::ps::command_line_chars(command);
+        if command_chars > crate::ps::WINRS_COMMAND_LINE_LIMIT {
+            self.audit(
+                "COMMAND REFUSED",
+                &[
+                    ("user", username.to_owned()),
+                    ("session", session_id.to_owned()),
+                    ("tool", "download_file".to_owned()),
+                    ("chars", command_chars.to_string()),
+                    ("limit", crate::ps::WINRS_COMMAND_LINE_LIMIT.to_string()),
+                ],
+                "",
+            );
+            return json!({
+                "error": format!(
+                    "command is {command_chars} characters; the WinRS command line holds \
+                     {} characters",
+                    crate::ps::WINRS_COMMAND_LINE_LIMIT
+                )
+            });
+        }
+
+        let session_password = target.password.expose_secret().to_owned();
+        match self
+            .transport
+            .run_powershell(&target, &format!("{PREAMBLE}{command}"))
+            .await
+        {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                let stderr = strip_clixml(&String::from_utf8_lossy(&output.stderr), false);
+                json!({
+                    "status_code": output.exit_code,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                })
+            }
+            Err(error) => {
+                let message = redact(
+                    &error.to_string(),
+                    &[session_password],
+                    self.config.secret_redact_min_length,
+                );
+                tracing::error!(session = %sanitize_log_value(session_id), error = %message, "read_transfer_chunk failed");
+                json!({ "error": message, "session_id": session_id })
+            }
+        }
+    }
+
+    /// Records one file transfer: the resolved paths, the size, both hashes when
+    /// known and the confirmation state, never the content (TR-XFER-02, ADR-0017
+    /// §38, DR-4).
+    #[allow(clippy::too_many_arguments)]
+    pub fn audit_transfer(&self, transfer: AuditTransfer<'_>) {
+        self.audit(
+            "FILE TRANSFER",
+            &[
+                ("user", transfer.username.to_owned()),
+                ("tool", transfer.tool.to_owned()),
+                ("host", transfer.host.to_owned()),
+                ("remote", transfer.remote_path.to_owned()),
+                ("local", transfer.local_path.to_owned()),
+                ("size", transfer.size.to_string()),
+                ("sha256_host", transfer.host_hash.to_owned()),
+                ("sha256_local", transfer.local_hash.to_owned()),
+                ("confirmation", transfer.confirmation.to_owned()),
+                ("status", transfer.status.to_owned()),
+            ],
+            "",
+        );
     }
 
     /// Uploads the staging file, verifies and runs it as a script block and

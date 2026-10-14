@@ -218,6 +218,15 @@ fn resolve_log_dir(config: &AppConfig, profile_state: &std::path::Path) -> std::
         .map_or_else(|| profile_state.to_path_buf(), std::path::PathBuf::from)
 }
 
+/// The transfer endpoint without `WINRIG_TRANSFER_DIR` goes under the profile state
+/// directory (TR-XFER-01, ADR-0017 §21).
+fn resolve_transfer_dir(config: &AppConfig, profile_state: &std::path::Path) -> std::path::PathBuf {
+    config
+        .transfer_dir
+        .as_ref()
+        .map_or_else(|| profile_state.join("transfer"), std::path::PathBuf::from)
+}
+
 fn registry_for(config: &AppConfig) -> Arc<SessionRegistry> {
     let registry_config = RegistryConfig {
         password_idle_ttl: Duration::from_secs(config.ad_password_idle_ttl_seconds),
@@ -906,6 +915,14 @@ fn run_serve(
     setup_logging(&config, &log_dir)
         .map_err(|error| StartupError::Runtime(format!("logging error: {error}")))?;
 
+    // The transfer endpoint is resolved before the server is built, so the tool
+    // reads one absolute root (TR-XFER-01, ADR-0017 §21).
+    config.transfer_dir = Some(
+        resolve_transfer_dir(&config, &state_dir)
+            .to_string_lossy()
+            .into_owned(),
+    );
+
     let registry = registry_for(&config);
     let auth = AuthState {
         mcp_auth_token: config.mcp_auth_token.clone().map(Arc::new),
@@ -926,10 +943,16 @@ fn run_serve(
 }
 
 fn run_stdio(requested: Option<&str>) -> Result<(), StartupError> {
-    let (locations, config, name, _lock, state_dir) = prepare_profile(requested)?;
+    let (locations, mut config, name, _lock, state_dir) = prepare_profile(requested)?;
     let log_dir = resolve_log_dir(&config, &state_dir);
     setup_logging(&config, &log_dir)
         .map_err(|error| StartupError::Runtime(format!("logging error: {error}")))?;
+
+    config.transfer_dir = Some(
+        resolve_transfer_dir(&config, &state_dir)
+            .to_string_lossy()
+            .into_owned(),
+    );
 
     let bound = bind_profile(&locations, &name, &token_from(&config)?)?;
     let registry = registry_for(&config);
@@ -1180,6 +1203,30 @@ mod tests {
             load_config_from(&|name| (name == "WINRIG_AUTH_TOKEN").then(|| "t".to_owned()))
                 .expect("config");
         assert_eq!(resolve_log_dir(&config, &profile_state), profile_state);
+    }
+
+    /// TR-XFER-01: the transfer endpoint is `WINRIG_TRANSFER_DIR`, or the transfer
+    /// subdirectory of the profile state directory.
+    #[test]
+    fn transfer_dir_prefers_explicit_override() {
+        let profile_state = PathBuf::from("/tmp/profile-state");
+        let config = load_config_from(&|name| match name {
+            "WINRIG_TRANSFER_DIR" => Some("/tmp/explicit-transfer".to_owned()),
+            _ => None,
+        })
+        .expect("config");
+        assert_eq!(
+            resolve_transfer_dir(&config, &profile_state),
+            PathBuf::from("/tmp/explicit-transfer")
+        );
+
+        let config =
+            load_config_from(&|name| (name == "WINRIG_AUTH_TOKEN").then(|| "t".to_owned()))
+                .expect("config");
+        assert_eq!(
+            resolve_transfer_dir(&config, &profile_state),
+            profile_state.join("transfer")
+        );
     }
 
     /// AC-PRF-50: a shared secret equal to the profile token refuses startup.

@@ -665,6 +665,143 @@ pub fn copy_source_scan(path: &str) -> String {
     )
 }
 
+/// The pre-scan of a download source: the host path, the kind, the link type, the
+/// length of the opened stream and the modification time (TR-XFER-02, ADR-0017 §24).
+///
+/// The path must resolve on the file system provider. The host opens the file with
+/// `FileShare.ReadWrite` and `FileShare.Delete`, so a file that another process
+/// holds open (a live log) still reads, and it reports `$fs.Length` without reading
+/// the content. The tool hashes the bytes while it reads them, and it confirms the
+/// whole length with one `SHA-256` pass after the read.
+#[must_use]
+pub fn download_scan(path: &str) -> String {
+    let safe = escape(path);
+    format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $item = Get-Item -LiteralPath '{safe}' -Force -ErrorAction Stop; \
+         if ($item.PSProvider.Name -ne 'FileSystem') {{ throw 'The path is not a file system path' }}; \
+         $isDir = [bool]$item.PSIsContainer; \
+         $size = 0; $modified = $null; \
+         if (-not $isDir) {{ \
+         $fs = [IO.File]::Open($item.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)); \
+         try {{ $size = [long]$fs.Length }} finally {{ $fs.Close() }}; \
+         $modified = $item.LastWriteTimeUtc.ToString('o', [Globalization.CultureInfo]::InvariantCulture) \
+         }}; \
+         [PSCustomObject]@{{ FullName=$item.FullName; IsDirectory=$isDir; LinkType=$item.LinkType; SizeBytes=$size; LastWriteTimeUtc=$modified; {HOST_ROOTS} }} \
+         | ConvertTo-Json -Compress"
+    )
+}
+
+/// One window of the host file as base64 lines (TR-XFER-02, ADR-0017 §24).
+///
+/// The file is opened with `FileShare.ReadWrite` and `FileShare.Delete`. The stream
+/// seeks to `offset` and reads at most `length` bytes, one line of
+/// [`TRANSFER_LINE_BYTES`] at a time, so the tool never loads the whole file into
+/// the host memory and the call keeps producing output. The caller bounds the
+/// window by the length the scan reported, so an append-only log still yields a
+/// stable prefix.
+#[must_use]
+pub fn download_chunk(path: &str, offset: i64, length: i64) -> String {
+    let safe = escape(path);
+    format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $fs = [IO.File]::Open('{safe}', [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)); \
+         try {{ \
+         $null = $fs.Seek({offset}, [IO.SeekOrigin]::Begin); \
+         $remaining = {length}; \
+         $buf = [byte[]]::new({line}); \
+         while ($remaining -gt 0) {{ \
+         $take = [int][Math]::Min([long]$buf.Length, [long]$remaining); \
+         $n = $fs.Read($buf, 0, $take); \
+         if ($n -le 0) {{ break }}; \
+         Write-Output ([Convert]::ToBase64String($buf, 0, $n)); \
+         $remaining -= $n \
+         }} \
+         }} finally {{ $fs.Close() }}",
+        line = TRANSFER_LINE_BYTES
+    )
+}
+
+/// The exit code of the host hash pass when the file is shorter than the size the
+/// scan reported (TR-XFER-02).
+pub const HASH_SHORT_EXIT: i32 = 3;
+
+/// The host SHA-256 of exactly the first `size` bytes (TR-XFER-02, ADR-0017 §24).
+///
+/// The pass streams the bytes through `TransformBlock` in [`TRANSFER_HASH_READ_BYTES`]
+/// pieces, so the host memory stays small, and it prints a progress line every
+/// [`TRANSFER_HASH_PROGRESS_BYTES`] so a slow disk never makes the call sit without
+/// output. A shorter file prints `short` and exits with code 3; a longer file is
+/// hashed only up to `size`, so an append-only log still matches the read window.
+/// The final output line carries the digest in lowercase hex.
+#[must_use]
+pub fn download_hash(path: &str, size: i64) -> String {
+    let safe = escape(path);
+    format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $fs = [IO.File]::Open('{safe}', [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)); \
+         try {{ \
+         $h = [Security.Cryptography.SHA256]::Create(); \
+         try {{ \
+         $remaining = {size}; \
+         $buf = [byte[]]::new({read}); \
+         $done = 0; $mark = 0; \
+         while ($remaining -gt 0) {{ \
+         $take = [int][Math]::Min([long]$buf.Length, [long]$remaining); \
+         $n = $fs.Read($buf, 0, $take); \
+         if ($n -le 0) {{ break }}; \
+         $null = $h.TransformBlock($buf, 0, $n, $null, 0); \
+         $remaining -= $n; $done += $n; \
+         if (($done - $mark) -ge {progress}) {{ $mark = $done; Write-Output ('progress ' + $done) }} \
+         }}; \
+         if ($remaining -ne 0) {{ Write-Output 'short'; exit 3 }}; \
+         $null = $h.TransformFinalBlock([byte[]]::new(0), 0, 0); \
+         Write-Output ([BitConverter]::ToString($h.Hash).Replace('-','').ToLowerInvariant()) \
+         }} finally {{ $h.Dispose() }} \
+         }} finally {{ $fs.Close() }}",
+        read = TRANSFER_HASH_READ_BYTES,
+        progress = TRANSFER_HASH_PROGRESS_BYTES
+    )
+}
+
+/// The raw bytes read by one download read call (TR-XFER-02, ADR-0017 §24).
+///
+/// One window is emitted as base64 lines inside the text reply. winrm-rs caps one
+/// command's output at `max_output_bytes` (64 MiB by default), so the window is
+/// sized to stay well below it; see [`transfer_window_fits`].
+pub const TRANSFER_WINDOW_BYTES: i64 = 16 * 1024 * 1024;
+
+/// The raw bytes of one base64 output line of a download read call (TR-XFER-02).
+///
+/// A line of 1 MiB grows to about 1.4 MiB of base64. The host writes line by line,
+/// so the call keeps producing output and never sits idle long enough to time out.
+pub const TRANSFER_LINE_BYTES: i64 = 1024 * 1024;
+
+/// The read buffer of the host SHA-256 pass (TR-XFER-02).
+pub const TRANSFER_HASH_READ_BYTES: i64 = 1024 * 1024;
+
+/// The bytes between two progress lines of the host SHA-256 pass (TR-XFER-02).
+///
+/// The pass prints a progress line often enough that the call does not sit without
+/// output long enough for the transport to time out.
+pub const TRANSFER_HASH_PROGRESS_BYTES: i64 = 8 * 1024 * 1024;
+
+/// The output cap of one command on the winrm-rs side, in bytes (ADR-0017 §24).
+///
+/// winrm-rs fails a command whose output exceeds this value. It mirrors
+/// `WinrmConfig::default().max_output_bytes`.
+pub const WINRM_MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
+/// True when one full read window, as base64 lines and with the line and envelope
+/// overhead, stays under the winrm-rs output cap (TR-XFER-02).
+#[must_use]
+pub fn transfer_window_fits() -> bool {
+    let window = TRANSFER_WINDOW_BYTES as usize;
+    let base64 = 4 * window.div_ceil(3);
+    let line_overhead = window / (TRANSFER_LINE_BYTES as usize) * 2;
+    base64 + line_overhead + 4096 <= WINRM_MAX_OUTPUT_BYTES
+}
+
 /// The PowerShell boolean literal for a confirmation flag.
 fn ps_bool(value: bool) -> &'static str {
     if value { "$true" } else { "$false" }
@@ -5285,6 +5422,9 @@ mod tests {
             delete_file_scan(text),
             delete_directory_scan(text, 10),
             copy_source_scan(text),
+            download_scan(text),
+            download_chunk(text, 0, TRANSFER_WINDOW_BYTES),
+            download_hash(text, TRANSFER_WINDOW_BYTES),
             copy_command(text, text, false, false).expect("valid"),
             copy_command(text, text, true, true).expect("valid"),
             move_rename_command(text, text, false, false).expect("valid"),
@@ -5379,6 +5519,52 @@ mod tests {
             assert!(command.contains(HOST_ROOTS), "{command}");
             assert!(command.contains("ConvertTo-Json"), "{command}");
         }
+    }
+
+    /// TR-XFER-02: one read window stays under the winrm-rs output cap, and the
+    /// read and hash commands are bounded to the scanned length.
+    #[test]
+    fn transfer_window_fits_under_the_output_cap() {
+        assert!(transfer_window_fits());
+        let base64 = 4 * (TRANSFER_WINDOW_BYTES as usize).div_ceil(3);
+        assert!(
+            base64 + 4096 <= WINRM_MAX_OUTPUT_BYTES,
+            "one window is {base64} base64 bytes, too close to the cap"
+        );
+        let chunk = download_chunk("C:\\Logs\\CBS.log", 0, TRANSFER_WINDOW_BYTES);
+        assert!(fits_command_line(&chunk), "{chunk}");
+        assert!(
+            chunk.contains("[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete"),
+            "{chunk}"
+        );
+        assert!(chunk.contains("Seek(0, [IO.SeekOrigin]::Begin)"), "{chunk}");
+        assert!(
+            !chunk.contains("ReadAllBytes"),
+            "the whole file must not load into memory: {chunk}"
+        );
+    }
+
+    /// TR-XFER-02: the scan reads the length without hashing, and the read and the
+    /// hash are bounded to the scanned length, so an append-only log verifies.
+    #[test]
+    fn download_commands_are_bounded_to_the_scan_size() {
+        let scan = download_scan("C:\\Logs\\CBS.log");
+        assert!(scan.contains("PSProvider.Name -ne 'FileSystem'"), "{scan}");
+        assert!(scan.contains("$size = [long]$fs.Length"), "{scan}");
+        assert!(
+            !scan.contains("ComputeHash") && !scan.contains("TransformBlock"),
+            "the scan must not hash the whole file: {scan}"
+        );
+        let hash = download_hash("C:\\Logs\\CBS.log", 1234);
+        assert!(fits_command_line(&hash), "{hash}");
+        assert!(hash.contains("$remaining = 1234;"), "{hash}");
+        assert!(hash.contains("while ($remaining -gt 0)"), "{hash}");
+        assert!(hash.contains("if ($remaining -ne 0)"), "{hash}");
+        assert!(hash.contains("TransformBlock"), "{hash}");
+        assert!(hash.contains("TransformFinalBlock"), "{hash}");
+        let chunk = download_chunk("C:\\Logs\\CBS.log", 100, 500);
+        assert!(chunk.contains("$remaining = 500;"), "{chunk}");
+        assert!(chunk.contains("while ($remaining -gt 0)"), "{chunk}");
     }
 
     /// AC-FS-07: the write scan returns both path resolutions and stops at the

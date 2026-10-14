@@ -8,6 +8,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -177,6 +178,10 @@ const EFFECT_CREATE_DIRECTORY: &str =
     "This creates the directory and its missing parents. To undo it, delete the new directory.";
 const EFFECT_DOWNLOAD_FILE: &str = "This copies the file from the host into the local transfer \
                                     directory. You cannot undo it.";
+const EFFECT_UPLOAD_NEW: &str = "This creates the file on the host from the local transfer file. \
+                                 To undo it, delete the file.";
+const EFFECT_UPLOAD_REPLACE: &str = "This replaces the whole file on the host with the local \
+                                     transfer file. You cannot undo it; the previous content is lost.";
 
 impl WinrigServer {
     #[must_use]
@@ -214,6 +219,9 @@ impl WinrigServer {
         }
         if !config.allow_file_download {
             router.remove_route("download_file");
+        }
+        if !config.allow_file_upload {
+            router.remove_route("upload_file");
         }
         router
     }
@@ -1317,6 +1325,21 @@ struct DownloadFileParams {
     #[schemars(
         description = "Replace the local file when it already exists. The default is false."
     )]
+    #[serde(default)]
+    overwrite: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct UploadFileParams {
+    #[schemars(description = "Session ID that connect returns.")]
+    session_id: String,
+    #[schemars(
+        description = "Local file name in the transfer directory. Pass one plain file name, not a path."
+    )]
+    name: String,
+    #[schemars(description = "Absolute path of the file to write on the host.")]
+    remote_path: String,
+    #[schemars(description = "Replace the file on the host when it exists. The default is false.")]
     #[serde(default)]
     overwrite: bool,
 }
@@ -3717,7 +3740,7 @@ impl WinrigServer {
             ));
         }
         // TR-XFER-02: a relative remote path is refused before the network.
-        let path_decision = crate::policy::decide_download_remote_path(&params.remote_path);
+        let path_decision = crate::policy::decide_transfer_remote_path(&params.remote_path);
         if !path_decision.allow {
             self.audit_refusal(&identity, "download_file", &path_decision);
             return Ok(CallToolResult::structured(
@@ -4003,7 +4026,7 @@ impl WinrigServer {
         session_id: &str,
         scan: &TransferScan,
         file: &mut fs::File,
-    ) -> Result<DownloadDigests, TransferFailure> {
+    ) -> Result<TransferDigests, TransferFailure> {
         let mut hasher = Sha256::new();
         let total = scan.size_bytes.max(0);
         let mut offset = 0i64;
@@ -4012,7 +4035,7 @@ impl WinrigServer {
             let command = ps::download_chunk(&scan.full_name, offset, window_len);
             let reply = self
                 .registry
-                .read_transfer_chunk(username, session_id, &command)
+                .run_transfer_command(username, session_id, "download_file", &command, None)
                 .await;
             let Some(stdout) = Self::successful_stdout(&reply) else {
                 return Err(TransferFailure::partial(
@@ -4082,7 +4105,7 @@ impl WinrigServer {
         let command = ps::download_hash(&scan.full_name, total);
         let reply = self
             .registry
-            .read_transfer_chunk(username, session_id, &command)
+            .run_transfer_command(username, session_id, "download_file", &command, None)
             .await;
         if reply.get("status_code").and_then(serde_json::Value::as_i64)
             == Some(i64::from(ps::HASH_SHORT_EXIT))
@@ -4114,7 +4137,7 @@ impl WinrigServer {
                 local_hash,
             });
         }
-        Ok(DownloadDigests {
+        Ok(TransferDigests {
             host_hash,
             local_hash,
         })
@@ -4145,6 +4168,437 @@ impl WinrigServer {
             confirmation,
             status: "failed",
         });
+    }
+
+    #[tool(
+        name = "upload_file",
+        description = "Copy a file from the local transfer directory to the host. Pass one plain file name from WINRIG_TRANSFER_DIR, which has one subdirectory per user in HTTP mode. The tool hashes the local file and shows the resolved remote path, the size and the SHA-256 in one confirmation. It then sends the bytes in windows of 4 MiB through the standard input of a host command into a temporary file next to the target. The host hashes the temporary file, and the tool replaces the target only when the digest equals the confirmed one. A change of the local file after the confirmation fails the upload and leaves the target unchanged. WINRIG_MAX_TRANSFER_BYTES refuses a larger file before the read (256 MiB by default). The tool refuses a device volume path, an 8.3 name, a symbolic link or a junction, and an existing directory. An operator allowlist entry in WINRIG_WRITE_ALLOW_PATHS can permit a protected path; the confirmation then warns. It refuses an existing file unless overwrite is set. The server declares the tool only with WINRIG_ALLOW_FILE_UPLOAD."
+    )]
+    async fn upload_file(
+        &self,
+        Parameters(params): Parameters<UploadFileParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let identity = self.identity(&ctx)?;
+        // TR-XFER-01: the local name is validated before any host call.
+        let name_decision = crate::policy::decide_transfer_name(&params.name);
+        if !name_decision.allow {
+            self.audit_refusal(&identity, "upload_file", &name_decision);
+            return Ok(CallToolResult::structured(
+                json!({ "error": name_decision.reason }),
+            ));
+        }
+        // TR-XFER-04: a relative remote path is refused before the network.
+        let path_decision = crate::policy::decide_transfer_remote_path(&params.remote_path);
+        if !path_decision.allow {
+            self.audit_refusal(&identity, "upload_file", &path_decision);
+            return Ok(CallToolResult::structured(
+                json!({ "error": path_decision.reason }),
+            ));
+        }
+        // DR-6, ADR-0017 §9: the lexical refusal comes before any network access.
+        let decision = decide_write_path(&params.remote_path, &self.config.write_allow_paths);
+        if !decision.allow {
+            self.audit_refusal(&identity, "upload_file", &decision);
+            return Ok(CallToolResult::structured(
+                json!({ "error": decision.reason }),
+            ));
+        }
+        let root = match transfer_root(&self.config) {
+            Ok(root) => root,
+            Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
+        };
+        // DR-3: HTTP mode reads only from the subdirectory of the request user.
+        let isolated = self.local_identity.is_none();
+        let dir = transfer_user_dir(&root, &identity.username, isolated);
+        let local_path = dir.join(&params.name);
+        if let Err(error) = precheck_transfer_dir(&root, &dir, isolated) {
+            return Ok(CallToolResult::structured(json!({ "error": error })));
+        }
+        let (file, size) =
+            match open_upload_source_blocking(&root, &dir, &local_path, isolated).await {
+                Ok(opened) => opened,
+                Err(error) => return Ok(CallToolResult::structured(json!({ "error": error }))),
+            };
+        // TR-XFER-05: the limit is checked on the size of the opened file, before the
+        // read and before any host call.
+        let size_decision =
+            crate::policy::decide_transfer_size(size, self.config.max_transfer_bytes);
+        if !size_decision.allow {
+            self.audit_refusal(&identity, "upload_file", &size_decision);
+            return Ok(CallToolResult::structured(
+                json!({ "error": size_decision.reason }),
+            ));
+        }
+        if let Some(result) = self.missing_session(&identity, &params.session_id) {
+            return Ok(result);
+        }
+        // The host scan resolves the path as .NET and PowerShell do and reports the
+        // existing target, the link type and the host roots (TR-FS-03, TR-FS-06).
+        let raw = match self
+            .pre_scan(
+                &identity,
+                &params.session_id,
+                &ps::write_scan(&params.remote_path),
+                "upload_file",
+            )
+            .await
+        {
+            Ok(raw) => raw,
+            Err(result) => return Ok(result),
+        };
+        let scan = match Self::parse_refusal(WriteScan::from_json(&raw), "write", &raw) {
+            Ok(scan) => scan,
+            Err(result) => return Ok(result),
+        };
+        let scan_decision = decide_write_scan(
+            &scan,
+            &params.remote_path,
+            params.overwrite,
+            &self.config.write_allow_paths,
+        );
+        if !scan_decision.allow {
+            self.audit_refusal(&identity, "upload_file", &scan_decision);
+            return Ok(CallToolResult::structured(json!({
+                "error": scan_decision.reason,
+                "scan": raw,
+            })));
+        }
+        // The hash pass reads the file once; the prompt shows its digest, and the
+        // upload writes only bytes that hash to it (TR-XFER-04).
+        let sha256 = match tokio::task::spawn_blocking(move || hash_local_file(file, size)).await {
+            Ok(Ok(hash)) => hash,
+            Ok(Err(error)) => return Ok(CallToolResult::structured(json!({ "error": error }))),
+            Err(error) => {
+                return Ok(CallToolResult::structured(
+                    json!({ "error": format!("the hash of the local file did not finish: {error}") }),
+                ));
+            }
+        };
+        // The commands write to the .NET-resolved path (ADR-0017 §18). The temp name
+        // is random, so two calls to one target never share a temp file.
+        let target_path = scan.dotnet_full_name.clone();
+        let temp_path = format!("{target_path}.winrig-{}.part", random_suffix());
+        // Every command is built before the confirmation: a path too long for one
+        // WinRS command line refuses without leaving anything on the host.
+        for built in [
+            ps::upload_chunk(&temp_path, 0, 0),
+            ps::upload_commit(&temp_path, &target_path, size, &sha256, params.overwrite),
+            ps::upload_remove_temp(&temp_path),
+        ] {
+            if let Err(error) = built {
+                return Ok(CallToolResult::structured(json!({ "error": error })));
+            }
+        }
+        let mut confirmation = self
+            .confirmation(
+                &identity,
+                &params.session_id,
+                "upload_file",
+                if scan.exists {
+                    "UPLOAD AND OVERWRITE FILE"
+                } else {
+                    "UPLOAD FILE"
+                },
+            )
+            .path("Local source", &local_path.to_string_lossy())
+            .path("Remote path", &params.remote_path)
+            .path("Resolved remote", &scan.full_name)
+            .field("Size", &format!("{size} bytes"))
+            .field("SHA-256", &sha256)
+            .field("Overwrite", if params.overwrite { "yes" } else { "no" })
+            .field("Existing file", if scan.exists { "yes" } else { "no" });
+        // ADR-0017 §36: a protected target that the allowlist permits warns each time.
+        if let Some(class) = scan_decision.class {
+            confirmation = confirmation.field("Warning", class);
+        }
+        let confirmation_state = confirm_state!(
+            &self,
+            &ctx,
+            confirmation.effect(if scan.exists {
+                EFFECT_UPLOAD_REPLACE
+            } else {
+                EFFECT_UPLOAD_NEW
+            })
+        );
+        // ADR-0017 §39: the audit names the entry that permitted a protected path.
+        if let Some(entry) = &scan_decision.matched {
+            self.registry.audit_write_allow(
+                &identity.username,
+                "upload_file",
+                &scan.full_name,
+                entry,
+            );
+        }
+        self.perform_upload(
+            &identity,
+            &params.session_id,
+            &UploadPlan {
+                local_path: &local_path,
+                root: &root,
+                dir: &dir,
+                isolated,
+                remote_path: &scan.full_name,
+                target_path: &target_path,
+                temp_path: &temp_path,
+                size,
+                sha256: &sha256,
+                overwrite: params.overwrite,
+                existed: scan.exists,
+            },
+            confirmation_state,
+        )
+        .await
+    }
+
+    /// Sends the local file window by window into the host temp file, then lets the
+    /// host hash and place it (TR-XFER-04, ADR-0017 §26). Runs after the
+    /// confirmation.
+    ///
+    /// The server reads the file again and hashes the bytes as it sends them. The
+    /// digest must equal the confirmed one before the host places anything, and the
+    /// host checks the same digest on its side. A failure or a cancel removes the
+    /// host temp file.
+    async fn perform_upload(
+        &self,
+        identity: &RequestIdentity,
+        session_id: &str,
+        plan: &UploadPlan<'_>,
+        confirmation: &str,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let host = self
+            .registry
+            .session_host(&identity.username, session_id)
+            .unwrap_or_else(|| "(unknown)".to_owned());
+        let resolved_local = plan.local_path.to_string_lossy().into_owned();
+        let audit = |status: &str, host_hash: &str, local_hash: &str| {
+            self.registry.audit_transfer(AuditTransfer {
+                username: &identity.username,
+                tool: "upload_file",
+                host: &host,
+                remote_path: plan.remote_path,
+                local_path: &resolved_local,
+                size: plan.size,
+                host_hash,
+                local_hash,
+                confirmation,
+                status,
+            });
+        };
+        let mut guard = UploadGuard {
+            registry: Arc::clone(&self.registry),
+            username: identity.username.clone(),
+            session_id: session_id.to_owned(),
+            host: host.clone(),
+            remote_path: plan.remote_path.to_owned(),
+            local_path: resolved_local.clone(),
+            size: plan.size,
+            confirmation: confirmation.to_owned(),
+            temp_path: plan.temp_path.to_owned(),
+            state: UploadState::default(),
+            armed: true,
+        };
+        match self
+            .send_and_place(&identity.username, session_id, plan, &guard.state)
+            .await
+        {
+            Ok(digests) => {
+                guard.armed = false;
+                audit("uploaded", &digests.host_hash, &digests.local_hash);
+                Ok(CallToolResult::structured(json!({
+                    "status": "uploaded",
+                    "name": plan.local_path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default(),
+                    "remote_path": plan.remote_path,
+                    "size": plan.size,
+                    "sha256": digests.local_hash,
+                    "replaced": plan.existed,
+                })))
+            }
+            Err(failure) => {
+                let removed = remove_host_temp(
+                    &self.registry,
+                    &identity.username,
+                    session_id,
+                    plan.temp_path,
+                )
+                .await;
+                let unknown = guard.state.unknown.load(Ordering::SeqCst);
+                guard.armed = false;
+                audit(
+                    if unknown { "unknown" } else { "failed" },
+                    &failure.host_hash,
+                    &failure.local_hash,
+                );
+                let message = if removed {
+                    failure.message
+                } else {
+                    format!(
+                        "{} The temporary file {} may remain on the host.",
+                        failure.message, plan.temp_path
+                    )
+                };
+                Ok(CallToolResult::structured(json!({ "error": message })))
+            }
+        }
+    }
+
+    /// Reads the local file once, sends each window to the host and asks the host to
+    /// hash and place the temp file (TR-XFER-04).
+    ///
+    /// The local digest is compared with the confirmed one before the placement
+    /// command runs, so a file that changed after the confirmation never reaches the
+    /// target. `state` tells the cancel guard when the placement is in flight and when
+    /// its result is unknown.
+    async fn send_and_place(
+        &self,
+        username: &str,
+        session_id: &str,
+        plan: &UploadPlan<'_>,
+        state: &UploadState,
+    ) -> Result<TransferDigests, TransferFailure> {
+        let local_failure = |message: String| TransferFailure {
+            message,
+            host_hash: String::new(),
+            local_hash: String::new(),
+        };
+        let mut hasher = Sha256::new();
+        let (mut file, size) =
+            open_upload_source_blocking(plan.root, plan.dir, plan.local_path, plan.isolated)
+                .await
+                .map_err(local_failure)?;
+        if size != plan.size {
+            return Err(local_failure(format!(
+                "{LOCAL_FILE_CHANGED} The size is now {size} bytes."
+            )));
+        }
+        let window =
+            usize::try_from(ps::UPLOAD_WINDOW_BYTES.min(plan.size.max(1))).unwrap_or(usize::MAX);
+        let mut buffer = vec![0u8; window];
+        let mut offset = 0i64;
+        loop {
+            let length = ps::UPLOAD_WINDOW_BYTES.min(plan.size - offset);
+            let length_bytes = usize::try_from(length).unwrap_or(0);
+            (file, buffer, hasher) = read_window(file, buffer, length_bytes, hasher)
+                .await
+                .map_err(local_failure)?;
+            let bytes = &buffer[..length_bytes];
+            let command = ps::upload_chunk(plan.temp_path, offset, length)
+                .map_err(|message| TransferFailure::partial(message, &hasher))?;
+            let reply = self
+                .registry
+                .run_transfer_command(username, session_id, "upload_file", &command, Some(bytes))
+                .await;
+            let expected = offset + length;
+            let Some(stdout) = Self::successful_stdout(&reply) else {
+                return Err(TransferFailure::partial(
+                    format!(
+                        "The upload failed at offset {offset}: {}",
+                        reply_error(&reply)
+                    ),
+                    &hasher,
+                ));
+            };
+            let reported = stdout
+                .lines()
+                .map(str::trim)
+                .rfind(|line| !line.is_empty())
+                .and_then(|line| line.parse::<i64>().ok());
+            if reported != Some(expected) {
+                return Err(TransferFailure::partial(
+                    format!(
+                        "The host temp file has {} bytes after the window at offset {offset}; \
+                         expected {expected}.",
+                        reported
+                            .map_or_else(|| "an unknown number of".to_owned(), |n| n.to_string())
+                    ),
+                    &hasher,
+                ));
+            }
+            offset = expected;
+            if offset >= plan.size {
+                break;
+            }
+        }
+        if !at_end_of_file(file).await.map_err(local_failure)? {
+            return Err(TransferFailure::partial(
+                LOCAL_FILE_CHANGED.to_owned(),
+                &hasher,
+            ));
+        }
+        let local_hash = hex_sha256(&hasher.finalize());
+        let failure = |message: &str, host_hash: &str| TransferFailure {
+            message: message.to_owned(),
+            host_hash: host_hash.to_owned(),
+            local_hash: local_hash.clone(),
+        };
+        if !local_hash.eq_ignore_ascii_case(plan.sha256) {
+            return Err(failure(
+                &format!("{LOCAL_FILE_CHANGED} The tool did not place the file."),
+                "",
+            ));
+        }
+        let command = ps::upload_commit(
+            plan.temp_path,
+            plan.target_path,
+            plan.size,
+            plan.sha256,
+            plan.overwrite,
+        )
+        .map_err(|message| failure(&message, ""))?;
+        // From here a cancel or a lost answer may come after the replace: the target
+        // is not known to be unchanged.
+        state.placing.store(true, Ordering::SeqCst);
+        let reply = self
+            .registry
+            .run_transfer_command(username, session_id, "upload_file", &command, None)
+            .await;
+        let code = reply.get("status_code").and_then(serde_json::Value::as_i64);
+        if code.is_none() {
+            state.unknown.store(true, Ordering::SeqCst);
+            return Err(failure(
+                &format!(
+                    "The host gave no answer to the placement: {}. The target may have been replaced; check the file on the host.",
+                    reply_error(&reply)
+                ),
+                "",
+            ));
+        }
+        let stdout = reply
+            .get("stdout")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let host_hash = commit_digest(stdout).unwrap_or_default();
+        if code == Some(i64::from(ps::HASH_SHORT_EXIT)) {
+            return Err(failure(
+                "The host temp file has a different length than the local file. The tool did not place it.",
+                "",
+            ));
+        }
+        if code == Some(i64::from(ps::UPLOAD_MISMATCH_EXIT)) {
+            return Err(failure(
+                "The host SHA-256 of the temp file differs from the confirmed one. The tool did not place it.",
+                &host_hash,
+            ));
+        }
+        let placed = code == Some(0)
+            && reply.get("error").is_none()
+            && stdout.lines().any(|line| line.trim() == "placed");
+        if !placed {
+            return Err(failure(
+                &format!("The host did not place the file: {}", reply_error(&reply)),
+                &host_hash,
+            ));
+        }
+        if !host_hash.eq_ignore_ascii_case(&local_hash) {
+            return Err(failure(
+                "The host SHA-256 differs from the local one. The tool cannot trust the placed file.",
+                &host_hash,
+            ));
+        }
+        Ok(TransferDigests {
+            host_hash,
+            local_hash,
+        })
     }
 }
 
@@ -4489,7 +4943,7 @@ fn reply_error(reply: &serde_json::Value) -> String {
 }
 
 /// The two SHA-256 values of a finished transfer (TR-XFER-02).
-struct DownloadDigests {
+struct TransferDigests {
     host_hash: String,
     local_hash: String,
 }
@@ -4569,6 +5023,304 @@ impl Drop for TransferGuard<'_> {
             status: "cancelled",
         });
     }
+}
+
+/// What a confirmed upload needs, fixed before the confirmation (TR-XFER-04).
+struct UploadPlan<'a> {
+    local_path: &'a Path,
+    root: &'a Path,
+    dir: &'a Path,
+    isolated: bool,
+    /// The path as the host resolved it, for the reply and the audit.
+    remote_path: &'a str,
+    /// The .NET-resolved path that the host commands write to.
+    target_path: &'a str,
+    temp_path: &'a str,
+    size: i64,
+    /// Digest from the prompt; the upload writes only bytes that hash to it.
+    sha256: &'a str,
+    overwrite: bool,
+    existed: bool,
+}
+
+/// The reason of a failure that comes from a change of the local file.
+const LOCAL_FILE_CHANGED: &str = "The local file changed while the tool read it.";
+
+/// Where an upload stands, for the cancel guard (TR-XFER-04).
+#[derive(Default)]
+struct UploadState {
+    /// The placement command was sent; the target may already be replaced.
+    placing: AtomicBool,
+    /// The placement ended without an answer from the host.
+    unknown: AtomicBool,
+}
+
+/// Removes the host temp file and records the audit entry when the upload future is
+/// dropped before it ends (TR-XFER-04, ADR-0017 §38).
+///
+/// The entry is `cancelled` while the target is untouched, and `unknown` once the
+/// placement was in flight, because the replace may have happened. The removal runs
+/// as a task, because `drop` cannot wait. The transport terminates a stalled host
+/// command from its own task, so the removal retries on a schedule until the host
+/// proves that the file is gone.
+struct UploadGuard {
+    registry: Arc<SessionRegistry>,
+    username: String,
+    session_id: String,
+    host: String,
+    remote_path: String,
+    local_path: String,
+    size: i64,
+    confirmation: String,
+    temp_path: String,
+    state: UploadState,
+    armed: bool,
+}
+
+/// Waits before each removal attempt of a cancelled upload.
+const CANCEL_CLEANUP_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+    Duration::from_secs(10),
+];
+
+impl Drop for UploadGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.registry.audit_transfer(AuditTransfer {
+            username: &self.username,
+            tool: "upload_file",
+            host: &self.host,
+            remote_path: &self.remote_path,
+            local_path: &self.local_path,
+            size: self.size,
+            host_hash: "",
+            local_hash: "",
+            confirmation: &self.confirmation,
+            status: if self.state.placing.load(Ordering::SeqCst) {
+                "unknown"
+            } else {
+                "cancelled"
+            },
+        });
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let registry = Arc::clone(&self.registry);
+        let username = self.username.clone();
+        let session_id = self.session_id.clone();
+        let temp_path = self.temp_path.clone();
+        runtime.spawn(async move {
+            for delay in CANCEL_CLEANUP_DELAYS {
+                tokio::time::sleep(delay).await;
+                if remove_host_temp(&registry, &username, &session_id, &temp_path).await {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+/// Deletes the host temp file of an upload; true only when the host proved that the
+/// file is gone, by the exit code of the command (TR-XFER-04).
+async fn remove_host_temp(
+    registry: &SessionRegistry,
+    username: &str,
+    session_id: &str,
+    temp_path: &str,
+) -> bool {
+    let Ok(command) = ps::upload_remove_temp(temp_path) else {
+        return false;
+    };
+    let reply = registry
+        .run_transfer_command(username, session_id, "upload_file", &command, None)
+        .await;
+    reply.get("error").is_none()
+        && reply.get("status_code").and_then(serde_json::Value::as_i64) == Some(0)
+}
+
+/// Runs [`open_upload_source`] off the async workers (TR-XFER-04).
+async fn open_upload_source_blocking(
+    root: &Path,
+    dir: &Path,
+    path: &Path,
+    isolated: bool,
+) -> Result<(fs::File, i64), String> {
+    let (root, dir, path) = (root.to_path_buf(), dir.to_path_buf(), path.to_path_buf());
+    tokio::task::spawn_blocking(move || open_upload_source(&root, &dir, &path, isolated))
+        .await
+        .map_err(|error| format!("the local file check did not finish: {error}"))?
+}
+
+/// Fills `buffer` from the file and hashes it, off the async workers (TR-XFER-04).
+///
+/// A file that ends early changed after the size was confirmed.
+async fn read_window(
+    mut file: fs::File,
+    mut buffer: Vec<u8>,
+    length: usize,
+    mut hasher: Sha256,
+) -> Result<(fs::File, Vec<u8>, Sha256), String> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        file.read_exact(&mut buffer[..length]).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                LOCAL_FILE_CHANGED.to_owned()
+            } else {
+                format!("cannot read the local file: {error}")
+            }
+        })?;
+        hasher.update(&buffer[..length]);
+        Ok((file, buffer, hasher))
+    })
+    .await
+    .map_err(|error| format!("the local file read did not finish: {error}"))?
+}
+
+/// True when the file has no byte after the confirmed size (TR-XFER-04).
+async fn at_end_of_file(mut file: fs::File) -> Result<bool, String> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut probe = [0u8; 1];
+        file.read(&mut probe)
+            .map(|read| read == 0)
+            .map_err(|error| format!("cannot read the local file: {error}"))
+    })
+    .await
+    .map_err(|error| format!("the local file read did not finish: {error}"))?
+}
+
+/// The SHA-256 line of the upload commit output (TR-XFER-04).
+fn commit_digest(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| line.len() == 64 && line.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(str::to_owned)
+}
+
+/// Opens a regular file of the transfer directory for an upload and returns it with
+/// its size (TR-XFER-01, TR-XFER-04).
+///
+/// The path must not be a symbolic link, and the opened handle must be the same
+/// regular file that `symlink_metadata` saw, so a swap between the two steps is
+/// refused. On Unix the file and the directories must have one owner, no other user
+/// may write the file, and it must have one hard link.
+fn open_upload_source(
+    root: &Path,
+    dir: &Path,
+    path: &Path,
+    isolated: bool,
+) -> Result<(fs::File, i64), String> {
+    let before = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "the file {} does not exist; put it into the transfer directory first",
+                path.display()
+            ));
+        }
+        Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
+    };
+    if before.file_type().is_symlink() {
+        return Err(format!(
+            "{} is a symbolic link; the tool refuses to read through it",
+            path.display()
+        ));
+    }
+    if !before.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    let file =
+        fs::File::open(path).map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    let after = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    if !after.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.dev() != after.dev() || before.ino() != after.ino() {
+            return Err(format!(
+                "{} changed while the tool opened it; the tool refuses",
+                path.display()
+            ));
+        }
+        // A second hard link could be rewritten from outside the transfer directory.
+        if after.nlink() > 1 {
+            return Err(format!(
+                "{} has more than one hard link; the tool refuses",
+                path.display()
+            ));
+        }
+        let dirs: &[&Path] = if isolated { &[root, dir] } else { &[root] };
+        check_source_owner(dirs, &after, path)?;
+    }
+    #[cfg(not(unix))]
+    let _ = (root, dir, isolated);
+    let size = i64::try_from(after.len())
+        .map_err(|_| format!("{} is too large to transfer", path.display()))?;
+    Ok((file, size))
+}
+
+/// Requires the file to have the owner of the transfer directories and no write
+/// permission for group or other (TR-XFER-01).
+#[cfg(unix)]
+fn check_source_owner(dirs: &[&Path], meta: &std::fs::Metadata, path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    for dir in dirs {
+        let dir_meta = fs::symlink_metadata(dir)
+            .map_err(|error| format!("cannot inspect {}: {error}", dir.display()))?;
+        if dir_meta.uid() != meta.uid() {
+            return Err(format!(
+                "{} is not owned by the owner of {}; the tool refuses",
+                path.display(),
+                dir.display()
+            ));
+        }
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o022 != 0 {
+        return Err(format!(
+            "{} is writable by group or other (mode {mode:o}); set mode 0600",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// The SHA-256 of exactly `size` bytes of the file, read once (TR-XFER-04).
+///
+/// A file that is shorter or longer than the size that the open reported changed
+/// while it was read, and the pass fails.
+fn hash_local_file(mut file: fs::File, size: i64) -> Result<String, String> {
+    use std::io::Read;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut remaining = size;
+    while remaining > 0 {
+        let take = usize::try_from(remaining).map_or(buffer.len(), |left| left.min(buffer.len()));
+        let read = file
+            .read(&mut buffer[..take])
+            .map_err(|error| format!("cannot read the local file: {error}"))?;
+        if read == 0 {
+            return Err(LOCAL_FILE_CHANGED.to_owned());
+        }
+        hasher.update(&buffer[..read]);
+        remaining -= i64::try_from(read).unwrap_or(0);
+    }
+    let mut probe = [0u8; 1];
+    let extra = file
+        .read(&mut probe)
+        .map_err(|error| format!("cannot read the local file: {error}"))?;
+    if extra != 0 {
+        return Err(LOCAL_FILE_CHANGED.to_owned());
+    }
+    Ok(hex_sha256(&hasher.finalize()))
 }
 
 /// The service state as a plain string, so the prompt shows a word (`Running`,
@@ -4984,9 +5736,16 @@ mod tests {
             "download_file must not be advertised while disabled"
         );
         assert!(!off.tool_router.has_route("download_file"));
-        // `upload_file` is not implemented, so it is never declared.
-        assert!(!names.iter().any(|name| name == "upload_file"));
-        assert_eq!(names.len(), 43, "expected 43 tools without download_file");
+        assert!(
+            !names.iter().any(|name| name == "upload_file"),
+            "upload_file must not be advertised while disabled"
+        );
+        assert!(!off.tool_router.has_route("upload_file"));
+        assert_eq!(
+            names.len(),
+            43,
+            "expected 43 tools without the transfer tools"
+        );
 
         let on = server_with(&[("WINRIG_ALLOW_FILE_DOWNLOAD", "true")]);
         let names: Vec<String> = on
@@ -4997,7 +5756,30 @@ mod tests {
             .collect();
         assert!(names.iter().any(|name| name == "download_file"));
         assert!(on.tool_router.has_route("download_file"));
+        assert!(!names.iter().any(|name| name == "upload_file"));
         assert_eq!(names.len(), 44, "expected 44 tools with download_file");
+
+        let on = server_with(&[("WINRIG_ALLOW_FILE_UPLOAD", "true")]);
+        let names: Vec<String> = on
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert!(names.iter().any(|name| name == "upload_file"));
+        assert!(on.tool_router.has_route("upload_file"));
+        assert!(!names.iter().any(|name| name == "download_file"));
+        assert_eq!(names.len(), 44, "expected 44 tools with upload_file");
+
+        let both = server_with(&[
+            ("WINRIG_ALLOW_FILE_DOWNLOAD", "true"),
+            ("WINRIG_ALLOW_FILE_UPLOAD", "true"),
+        ]);
+        assert_eq!(
+            both.tool_router.list_all().len(),
+            45,
+            "expected 45 tools with both transfer tools"
+        );
     }
 
     /// TR-XFER-05, AC-XFER-03: a file above `WINRIG_MAX_TRANSFER_BYTES` is refused
@@ -5606,6 +6388,678 @@ mod tests {
         (server, identity)
     }
 
+    /// A fake host for the upload tests: it records every window that arrives on the
+    /// standard input, appends the bytes to a fake temp file and answers the commit
+    /// with the digest of what it received. It can report another digest and can hang
+    /// on a window to exercise the cancellation guard.
+    struct UploadTransport {
+        /// Offset, length and bytes of every chunk the fake got.
+        windows: Mutex<Vec<(i64, i64, Vec<u8>)>>,
+        /// All commands the fake saw, with or without standard input.
+        scripts: Mutex<Vec<String>>,
+        received: Mutex<Vec<u8>>,
+        /// When set, the commit reports this digest instead of the real one.
+        digest_override: Mutex<Option<String>>,
+        /// When set, a window at or above this offset never resolves.
+        hang_from: Mutex<Option<i64>>,
+        /// When true, the commit never resolves.
+        hang_commit: Mutex<bool>,
+        /// When true, the commit fails at the transport, with no answer.
+        commit_error: Mutex<bool>,
+        /// Exit code that the cleanup command reports.
+        remove_exit: Mutex<i32>,
+    }
+
+    impl UploadTransport {
+        fn new() -> Self {
+            Self {
+                windows: Mutex::new(Vec::new()),
+                scripts: Mutex::new(Vec::new()),
+                received: Mutex::new(Vec::new()),
+                digest_override: Mutex::new(None),
+                hang_from: Mutex::new(None),
+                hang_commit: Mutex::new(false),
+                commit_error: Mutex::new(false),
+                remove_exit: Mutex::new(0),
+            }
+        }
+
+        fn saw(&self, needle: &str) -> bool {
+            self.scripts
+                .lock()
+                .expect("lock")
+                .iter()
+                .any(|script| script.contains(needle))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WinRmTransport for UploadTransport {
+        async fn run_powershell(
+            &self,
+            _target: &SessionTarget,
+            script: &str,
+        ) -> Result<RemoteOutput, TransportError> {
+            self.scripts.lock().expect("lock").push(script.to_owned());
+            if !script.contains("TransformBlock") {
+                return Ok(RemoteOutput {
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                    exit_code: *self.remove_exit.lock().expect("lock"),
+                });
+            }
+            if *self.hang_commit.lock().expect("lock") {
+                std::future::pending::<()>().await;
+            }
+            if *self.commit_error.lock().expect("lock") {
+                return Err(TransportError::Other("connection lost".to_owned()));
+            }
+            let actual = self
+                .digest_override
+                .lock()
+                .expect("lock")
+                .clone()
+                .unwrap_or_else(|| {
+                    hex_sha256(&Sha256::digest(&*self.received.lock().expect("lock")))
+                });
+            let marker = "$actual -ne '";
+            let start = script.find(marker).expect("digest check") + marker.len();
+            let expected = &script[start..start + 64];
+            if actual.eq_ignore_ascii_case(expected) {
+                Ok(RemoteOutput {
+                    stdout: format!("progress 0\n{actual}\nplaced").into_bytes(),
+                    stderr: Vec::new(),
+                    exit_code: 0,
+                })
+            } else {
+                Ok(RemoteOutput {
+                    stdout: actual.into_bytes(),
+                    stderr: Vec::new(),
+                    exit_code: ps::UPLOAD_MISMATCH_EXIT,
+                })
+            }
+        }
+
+        async fn run_powershell_stdin(
+            &self,
+            _target: &SessionTarget,
+            script: &str,
+            stdin: &[u8],
+        ) -> Result<RemoteOutput, TransportError> {
+            self.scripts.lock().expect("lock").push(script.to_owned());
+            let offset = number_after(script, "$fs.Length -ne ").unwrap_or(0);
+            let length = number_after(script, "$got -ne ").unwrap_or(0);
+            let hang = *self.hang_from.lock().expect("lock");
+            if let Some(limit) = hang
+                && offset >= limit
+            {
+                std::future::pending::<()>().await;
+            }
+            self.windows
+                .lock()
+                .expect("lock")
+                .push((offset, length, stdin.to_vec()));
+            self.received.lock().expect("lock").extend_from_slice(stdin);
+            Ok(RemoteOutput {
+                stdout: (offset + stdin.len() as i64).to_string().into_bytes(),
+                stderr: Vec::new(),
+                exit_code: 0,
+            })
+        }
+    }
+
+    /// A server wired to the fake host, with one open session.
+    async fn upload_server(transport: Arc<UploadTransport>) -> (WinrigServer, RequestIdentity) {
+        let registry = Arc::new(SessionRegistry::new(
+            transport as Arc<dyn WinRmTransport>,
+            RegistryConfig::default(),
+        ));
+        let lookup: Box<crate::config::Env> = Box::new(|name: &str| match name {
+            "WINRIG_AUTH_TOKEN" => Some("token".to_owned()),
+            "WINRIG_ALLOWED_HOSTS" => Some("host1".to_owned()),
+            _ => None,
+        });
+        let config = crate::config::load_config_from(lookup.as_ref()).expect("config");
+        let server = WinrigServer::new(registry, Arc::new(config));
+        let identity = RequestIdentity {
+            username: "contoso\\alice".to_owned(),
+            password: Some("s3cret".to_owned().into()),
+            source: crate::identity::IdentitySource::Headers,
+        };
+        let user = WinrigServer::user(&identity);
+        server
+            .registry
+            .connect(&user, "host1", None, None, true)
+            .await;
+        (server, identity)
+    }
+
+    /// A local transfer directory that holds one file for an upload test.
+    fn upload_fixture(name: &str, content: &[u8]) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("winrig-upload-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let file = dir.join("db.bin");
+        fs::write(&file, content).expect("file");
+        private_mode(&file);
+        (dir, file)
+    }
+
+    /// Sets the mode `0600`, because the umask of the test host may leave a file
+    /// writable by its group.
+    fn private_mode(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("mode");
+        }
+        #[cfg(not(unix))]
+        let _ = path;
+    }
+
+    const UPLOAD_TEMP: &str = "C:\\Data\\db.bin.winrig-0000000000000000.part";
+
+    /// The plan for `content`, aimed at `C:\Data\db.bin`.
+    fn upload_plan<'a>(
+        dir: &'a Path,
+        file: &'a Path,
+        content: &[u8],
+        sha256: &'a str,
+        overwrite: bool,
+    ) -> UploadPlan<'a> {
+        UploadPlan {
+            local_path: file,
+            root: dir,
+            dir,
+            isolated: false,
+            remote_path: "C:\\Data\\db.bin",
+            target_path: "C:\\Data\\db.bin",
+            temp_path: UPLOAD_TEMP,
+            size: content.len() as i64,
+            sha256,
+            overwrite,
+            existed: false,
+        }
+    }
+
+    /// TR-XFER-04, AC-XFER-04: an upload writes the windows into the host temp file
+    /// and the commit places it. The SHA-256 of the reply is the confirmed one, the
+    /// host received exactly the file bytes, and the commit carries the same digest.
+    #[tokio::test]
+    async fn upload_hash_matches_on_both_sides() {
+        let transport = Arc::new(UploadTransport::new());
+        let (server, identity) = upload_server(Arc::clone(&transport)).await;
+        let content = pattern_bytes(4096);
+        let (dir, file) = upload_fixture("hash", &content);
+        let sha = hex_sha256(&Sha256::digest(&content));
+        let result = server
+            .perform_upload(
+                &identity,
+                "host1",
+                &upload_plan(&dir, &file, &content, &sha, false),
+                "confirmed",
+            )
+            .await
+            .expect("upload");
+        let value = result.structured_content.expect("structured");
+        assert_eq!(
+            value.get("error").and_then(serde_json::Value::as_str),
+            None,
+            "{value}"
+        );
+        assert_eq!(
+            value.get("status").and_then(serde_json::Value::as_str),
+            Some("uploaded")
+        );
+        assert_eq!(
+            value.get("sha256").and_then(serde_json::Value::as_str),
+            Some(sha.as_str())
+        );
+        assert_eq!(
+            value.get("size").and_then(serde_json::Value::as_i64),
+            Some(4096)
+        );
+        assert_eq!(*transport.received.lock().expect("lock"), content);
+        assert!(transport.saw(&format!("if ($actual -ne '{sha}')")));
+        assert!(
+            !transport.saw("Remove-Item"),
+            "a good upload leaves no cleanup"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TR-XFER-04: a file larger than one window goes window by window at the right
+    /// offsets, the last window is short, and the host gets the whole file in order.
+    #[tokio::test]
+    async fn upload_sends_each_window_at_its_offset() {
+        let transport = Arc::new(UploadTransport::new());
+        let (server, identity) = upload_server(Arc::clone(&transport)).await;
+        let content = pattern_bytes(ps::UPLOAD_WINDOW_BYTES + 4096);
+        let (dir, file) = upload_fixture("windows", &content);
+        let sha = hex_sha256(&Sha256::digest(&content));
+        let result = server
+            .perform_upload(
+                &identity,
+                "host1",
+                &upload_plan(&dir, &file, &content, &sha, true),
+                "confirmed",
+            )
+            .await
+            .expect("upload");
+        let value = result.structured_content.expect("structured");
+        assert_eq!(
+            value.get("error").and_then(serde_json::Value::as_str),
+            None,
+            "{value}"
+        );
+        let windows: Vec<(i64, i64)> = transport
+            .windows
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(offset, length, _)| (*offset, *length))
+            .collect();
+        assert_eq!(
+            windows,
+            vec![
+                (0, ps::UPLOAD_WINDOW_BYTES),
+                (ps::UPLOAD_WINDOW_BYTES, 4096)
+            ]
+        );
+        assert_eq!(*transport.received.lock().expect("lock"), content);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TR-XFER-04: an empty file still creates an empty temp file with one empty
+    /// window, and the commit places it.
+    #[tokio::test]
+    async fn upload_of_an_empty_file_sends_one_empty_window() {
+        let transport = Arc::new(UploadTransport::new());
+        let (server, identity) = upload_server(Arc::clone(&transport)).await;
+        let (dir, file) = upload_fixture("empty", b"");
+        let sha = hex_sha256(&Sha256::digest(b""));
+        let result = server
+            .perform_upload(
+                &identity,
+                "host1",
+                &upload_plan(&dir, &file, b"", &sha, false),
+                "confirmed",
+            )
+            .await
+            .expect("upload");
+        let value = result.structured_content.expect("structured");
+        assert_eq!(
+            value.get("error").and_then(serde_json::Value::as_str),
+            None,
+            "{value}"
+        );
+        let windows: Vec<(i64, i64)> = transport
+            .windows
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(offset, length, _)| (*offset, *length))
+            .collect();
+        assert_eq!(windows, vec![(0, 0)]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TR-XFER-04, AC-XFER-04, DR-6: a protected target is refused before any host
+    /// call, and an operator allowlist entry that covers it lifts the refusal.
+    #[test]
+    fn upload_refuses_a_protected_target() {
+        let path = "C:\\Windows\\System32\\drivers\\etc\\hosts";
+        let refused = decide_write_path(path, &[]);
+        assert!(!refused.allow, "{}", refused.reason);
+        let allowed = decide_write_path(path, &["C:\\Windows\\System32\\drivers\\etc".to_owned()]);
+        assert!(allowed.allow, "{}", allowed.reason);
+        for relative in ["hosts", "..\\hosts", "dir\\hosts"] {
+            assert!(
+                !crate::policy::decide_transfer_remote_path(relative).allow,
+                "{relative:?} must be refused as not absolute"
+            );
+        }
+        assert!(crate::policy::decide_transfer_remote_path("D:\\Data\\a.bin").allow);
+        assert!(crate::policy::decide_transfer_remote_path("\\\\srv\\share\\a.bin").allow);
+    }
+
+    /// TR-XFER-04: a local file that changed after the confirmation is never placed.
+    /// The digest of the bytes read for the upload differs from the confirmed one, so
+    /// the commit does not run and the host temp file is removed.
+    #[tokio::test]
+    async fn upload_refuses_a_file_that_changed_after_the_confirmation() {
+        let transport = Arc::new(UploadTransport::new());
+        let (server, identity) = upload_server(Arc::clone(&transport)).await;
+        let confirmed = pattern_bytes(2048);
+        let (dir, file) = upload_fixture("changed", &confirmed);
+        let sha = hex_sha256(&Sha256::digest(&confirmed));
+        let mut changed = confirmed.clone();
+        changed[100] ^= 0xff;
+        fs::write(&file, &changed).expect("change the file");
+        let result = server
+            .perform_upload(
+                &identity,
+                "host1",
+                &upload_plan(&dir, &file, &confirmed, &sha, false),
+                "confirmed",
+            )
+            .await
+            .expect("upload");
+        let value = result.structured_content.expect("structured");
+        let error = value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("a refusal");
+        assert!(error.contains("changed"), "{error}");
+        assert!(
+            !transport.saw("TransformBlock"),
+            "the commit ran for a changed file"
+        );
+        assert!(
+            transport.saw("Remove-Item"),
+            "the host temp file was not removed"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TR-XFER-04: a file that grew or shrank after the size was confirmed fails too.
+    #[tokio::test]
+    async fn upload_refuses_a_file_whose_size_changed() {
+        let transport = Arc::new(UploadTransport::new());
+        let (server, identity) = upload_server(Arc::clone(&transport)).await;
+        let confirmed = pattern_bytes(2048);
+        let (dir, file) = upload_fixture("size", &confirmed);
+        let sha = hex_sha256(&Sha256::digest(&confirmed));
+        let mut grown = confirmed.clone();
+        grown.push(1);
+        fs::write(&file, &grown).expect("grow the file");
+        let result = server
+            .perform_upload(
+                &identity,
+                "host1",
+                &upload_plan(&dir, &file, &confirmed, &sha, false),
+                "confirmed",
+            )
+            .await
+            .expect("upload");
+        let value = result.structured_content.expect("structured");
+        assert!(value.get("error").is_some(), "{value}");
+        assert!(!transport.saw("TransformBlock"));
+        assert!(
+            transport.windows.lock().expect("lock").is_empty(),
+            "bytes reached the host for a file of another size"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TR-XFER-04: when the host digest differs from the confirmed one, the host
+    /// refuses to place the file, and the tool removes the host temp file and reports
+    /// both digests in the audit.
+    #[tokio::test]
+    async fn upload_host_hash_mismatch_removes_the_temp() {
+        let transport = Arc::new(UploadTransport::new());
+        *transport.digest_override.lock().expect("lock") = Some("0".repeat(64));
+        let (server, identity) = upload_server(Arc::clone(&transport)).await;
+        let content = pattern_bytes(512);
+        let (dir, file) = upload_fixture("mismatch", &content);
+        let sha = hex_sha256(&Sha256::digest(&content));
+        let result = server
+            .perform_upload(
+                &identity,
+                "host1",
+                &upload_plan(&dir, &file, &content, &sha, false),
+                "confirmed",
+            )
+            .await
+            .expect("upload");
+        let value = result.structured_content.expect("structured");
+        let error = value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("a refusal");
+        assert!(error.contains("differs"), "{error}");
+        assert!(
+            transport.saw("Remove-Item"),
+            "the temp file stays on the host"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TR-XFER-04: a client disconnect drops the upload future, records a `cancelled`
+    /// audit entry and sends the removal of the host temp file.
+    #[tokio::test]
+    async fn upload_cancellation_removes_the_host_temp_and_audits() {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let buffer = Arc::clone(&buffer);
+                move || BufferWriter(Arc::clone(&buffer))
+            })
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        let transport = Arc::new(UploadTransport::new());
+        *transport.hang_from.lock().expect("lock") = Some(ps::UPLOAD_WINDOW_BYTES);
+        let (server, identity) = upload_server(Arc::clone(&transport)).await;
+        let content = pattern_bytes(ps::UPLOAD_WINDOW_BYTES + 4096);
+        let (dir, file) = upload_fixture("cancel", &content);
+        let sha = hex_sha256(&Sha256::digest(&content));
+        let plan = upload_plan(&dir, &file, &content, &sha, false);
+        let future = server.perform_upload(&identity, "host1", &plan, "confirmed");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), future).await;
+        // The removal runs as a task after the first delay of the schedule.
+        tokio::time::sleep(CANCEL_CLEANUP_DELAYS[0] + std::time::Duration::from_millis(500)).await;
+
+        drop(guard);
+        let text = String::from_utf8_lossy(&buffer.lock().expect("lock")).into_owned();
+        assert!(
+            transport.saw("Remove-Item"),
+            "the host temp file was not removed after the cancel"
+        );
+        assert!(
+            !transport.saw("TransformBlock"),
+            "a cancelled upload reached the commit"
+        );
+        assert!(
+            text.contains("FILE TRANSFER") && text.contains("cancelled"),
+            "the cancel is not audited: {text}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The audit text of one upload run that a hung or failing commit ends.
+    async fn audit_of_a_placement_that_goes_wrong(
+        configure: impl Fn(&UploadTransport),
+    ) -> (String, Arc<UploadTransport>, Option<String>) {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let buffer = Arc::clone(&buffer);
+                move || BufferWriter(Arc::clone(&buffer))
+            })
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        let transport = Arc::new(UploadTransport::new());
+        configure(&transport);
+        let (server, identity) = upload_server(Arc::clone(&transport)).await;
+        let content = pattern_bytes(1024);
+        let (dir, file) = upload_fixture("placing", &content);
+        let sha = hex_sha256(&Sha256::digest(&content));
+        let plan = upload_plan(&dir, &file, &content, &sha, true);
+        let future = server.perform_upload(&identity, "host1", &plan, "confirmed");
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), future).await;
+        let error = outcome.ok().and_then(|result| {
+            result
+                .ok()
+                .and_then(|reply| reply.structured_content)
+                .and_then(|value| {
+                    value
+                        .get("error")
+                        .and_then(|e| e.as_str().map(str::to_owned))
+                })
+        });
+        tokio::time::sleep(CANCEL_CLEANUP_DELAYS[0] + std::time::Duration::from_millis(500)).await;
+        drop(guard);
+        let text = String::from_utf8_lossy(&buffer.lock().expect("lock")).into_owned();
+        fs::remove_dir_all(&dir).ok();
+        (text, transport, error)
+    }
+
+    /// TR-XFER-04, ADR-0017 §38: a cancel while the placement command runs may come after
+    /// the replace, so the audit says `unknown`, not `cancelled`, and the temp file is
+    /// still removed.
+    #[tokio::test]
+    async fn upload_cancel_during_the_placement_is_audited_as_unknown() {
+        let (text, transport, _) =
+            audit_of_a_placement_that_goes_wrong(|t| *t.hang_commit.lock().expect("lock") = true)
+                .await;
+        assert!(text.contains("FILE TRANSFER"), "{text}");
+        assert!(
+            text.contains("status        : unknown"),
+            "the audit must not claim an unchanged target: {text}"
+        );
+        assert!(!text.contains("status        : cancelled"), "{text}");
+        assert!(
+            transport.saw("Remove-Item"),
+            "the temp file stays on the host"
+        );
+    }
+
+    /// TR-XFER-04: a placement that ends without an answer from the host is `unknown`
+    /// too, and the reply says that the target may have been replaced.
+    #[tokio::test]
+    async fn upload_placement_without_an_answer_is_unknown() {
+        let (text, _, error) =
+            audit_of_a_placement_that_goes_wrong(|t| *t.commit_error.lock().expect("lock") = true)
+                .await;
+        let error = error.expect("an error reply");
+        assert!(error.contains("may have been replaced"), "{error}");
+        assert!(text.contains("status        : unknown"), "{text}");
+    }
+
+    /// TR-XFER-04: the removal of the host temp file is trusted by the exit code of the
+    /// dedicated command, and a failed removal is named in the error.
+    #[tokio::test]
+    async fn upload_temp_removal_trusts_the_exit_code() {
+        let transport = Arc::new(UploadTransport::new());
+        let (server, identity) = upload_server(Arc::clone(&transport)).await;
+        assert!(remove_host_temp(&server.registry, &identity.username, "host1", UPLOAD_TEMP).await);
+        assert!(transport.saw("if (Test-Path -LiteralPath $p) { exit 1 }"));
+        *transport.remove_exit.lock().expect("lock") = 1;
+        assert!(
+            !remove_host_temp(&server.registry, &identity.username, "host1", UPLOAD_TEMP).await
+        );
+
+        // A failed upload whose cleanup fails names the temp file.
+        let confirmed = pattern_bytes(64);
+        let (dir, file) = upload_fixture("removal", &confirmed);
+        let sha = hex_sha256(&Sha256::digest(&confirmed));
+        let mut changed = confirmed.clone();
+        changed[3] ^= 1;
+        fs::write(&file, &changed).expect("change");
+        let result = server
+            .perform_upload(
+                &identity,
+                "host1",
+                &upload_plan(&dir, &file, &confirmed, &sha, false),
+                "confirmed",
+            )
+            .await
+            .expect("upload");
+        let value = result.structured_content.expect("structured");
+        let error = value.get("error").and_then(|e| e.as_str()).expect("error");
+        assert!(error.contains("may remain on the host"), "{error}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TR-XFER-01: a source with a second hard link is refused, because the content
+    /// could be rewritten from outside the transfer directory.
+    #[cfg(unix)]
+    #[test]
+    fn upload_source_with_a_second_hard_link_is_refused() {
+        let (dir, file) = upload_fixture("nlink", b"data");
+        let other = std::env::temp_dir().join(format!("winrig-upload-link-{}", std::process::id()));
+        let _ = fs::remove_file(&other);
+        fs::hard_link(&file, &other).expect("hard link");
+        let error = open_upload_source(&dir, &dir, &file, false).expect_err("must refuse");
+        assert!(error.contains("hard link"), "{error}");
+        fs::remove_file(&other).ok();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TR-XFER-01, DR-3: a user reads only from the own subdirectory, so the same name
+    /// in the directory of another user is a different file, and the other user's
+    /// directory is not visible.
+    #[test]
+    fn upload_reads_only_the_directory_of_the_user() {
+        let root = std::env::temp_dir().join(format!("winrig-upload-users-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let alice = transfer_user_dir(&root, "contoso\\alice", true);
+        let bob = transfer_user_dir(&root, "contoso\\bob", true);
+        assert_ne!(alice, bob);
+        fs::create_dir_all(&alice).expect("alice");
+        fs::write(alice.join("db.bin"), b"alice").expect("file");
+        private_mode(&alice.join("db.bin"));
+        let (_, size) = open_upload_source(&root, &alice, &alice.join("db.bin"), true)
+            .expect("alice reads the own file");
+        assert_eq!(size, 5);
+        let error = open_upload_source(&root, &bob, &bob.join("db.bin"), true)
+            .expect_err("bob has no such file");
+        assert!(error.contains("does not exist"), "{error}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// TR-XFER-01: a symbolic link as the source is refused, even when it points to
+    /// a file inside the transfer directory, and a directory is not a file.
+    #[cfg(unix)]
+    #[test]
+    fn upload_source_symlink_is_refused() {
+        let (dir, file) = upload_fixture("symlink", b"data");
+        let link = dir.join("link.bin");
+        std::os::unix::fs::symlink(&file, &link).expect("symlink");
+        let error = open_upload_source(&dir, &dir, &link, false).expect_err("must refuse");
+        assert!(error.contains("symbolic link"), "{error}");
+        let sub = dir.join("sub");
+        fs::create_dir(&sub).expect("sub");
+        let error = open_upload_source(&dir, &dir, &sub, false).expect_err("must refuse");
+        assert!(error.contains("not a regular file"), "{error}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TR-XFER-01: a source that another user can write is refused.
+    #[cfg(unix)]
+    #[test]
+    fn upload_source_writable_by_others_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, file) = upload_fixture("mode", b"data");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o666)).expect("mode");
+        let error = open_upload_source(&dir, &dir, &file, false).expect_err("must refuse");
+        assert!(error.contains("writable by group or other"), "{error}");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).expect("mode");
+        assert!(open_upload_source(&dir, &dir, &file, false).is_ok());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TR-XFER-04: the hash pass reads exactly the size that the open reported and
+    /// fails for a file that is shorter or longer.
+    #[test]
+    fn hash_local_file_detects_a_change_of_size() {
+        let (dir, file) = upload_fixture("hashpass", b"0123456789");
+        let open = || fs::File::open(&file).expect("open");
+        assert_eq!(
+            hash_local_file(open(), 10).expect("exact"),
+            hex_sha256(&Sha256::digest(b"0123456789"))
+        );
+        assert!(hash_local_file(open(), 11).is_err(), "a longer claim");
+        assert!(hash_local_file(open(), 9).is_err(), "a shorter claim");
+        fs::remove_dir_all(&dir).ok();
+    }
+
     /// AC-FS-10: the confirmation of a directory copy shows the file, directory
     /// and byte counts from the scan; a file copy shows the size.
     #[test]
@@ -6016,6 +7470,7 @@ mod tests {
         assert!(tools.iter().any(|tool| tool.name == "rename_file"));
         assert!(tools.iter().any(|tool| tool.name == "create_directory"));
         assert!(tools.iter().any(|tool| tool.name == "download_file"));
+        assert!(tools.iter().any(|tool| tool.name == "upload_file"));
         // An exact count: "at least 30" would catch neither a lost tool nor a
         // duplicate. These are all declared tools; the configuration decides
         // how many the agent sees (TR-FS-01, TR-FS-08, TR-EXE-01, TR-EXE-05), and
@@ -6023,11 +7478,11 @@ mod tests {
         // `file_ops_are_absent_until_the_operator_enables_them`,
         // `run_command_is_absent_until_the_operator_enables_it` and
         // `run_script_is_absent_until_the_operator_enables_it` check that.
-        assert_eq!(tools.len(), 51, "expected 51 declared tools");
+        assert_eq!(tools.len(), 52, "expected 52 declared tools");
         let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 51, "tool names must be unique");
+        assert_eq!(names.len(), 52, "tool names must be unique");
     }
 
     #[test]
@@ -6055,6 +7510,7 @@ mod tests {
             "set_service_start_type",
             "start_service",
             "stop_service",
+            "upload_file",
         ] {
             assert!(
                 names.binary_search(&expected).is_ok(),
@@ -6094,6 +7550,8 @@ mod tests {
             EFFECT_RENAME,
             EFFECT_CREATE_DIRECTORY,
             EFFECT_DOWNLOAD_FILE,
+            EFFECT_UPLOAD_NEW,
+            EFFECT_UPLOAD_REPLACE,
         ] {
             assert!(!effect.is_empty(), "an effect line is empty");
             assert!(

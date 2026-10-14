@@ -46,10 +46,22 @@ struct RecordingTransport {
     /// the name is the file the probe asked for. A test sets it to satisfy the
     /// staging-path validation.
     staging_dir: Mutex<Option<String>>,
+    /// The standard input of each call that carried one (upload windows).
+    stdin: Mutex<Vec<Vec<u8>>>,
 }
 
 #[async_trait::async_trait]
 impl WinRmTransport for RecordingTransport {
+    async fn run_powershell_stdin(
+        &self,
+        target: &SessionTarget,
+        script: &str,
+        stdin: &[u8],
+    ) -> Result<RemoteOutput, TransportError> {
+        self.stdin.lock().expect("lock").push(stdin.to_vec());
+        self.run_powershell(target, script).await
+    }
+
     async fn run_powershell(
         &self,
         _target: &SessionTarget,
@@ -264,6 +276,7 @@ async fn started(answer: Answer, overrides: &[(&str, &str)]) -> Harness {
         calls: Mutex::new(Vec::new()),
         responses: Mutex::new(Vec::new()),
         staging_dir: Mutex::new(None),
+        stdin: Mutex::new(Vec::new()),
     });
     let registry = Arc::new(SessionRegistry::new(
         Arc::clone(&transport) as Arc<dyn WinRmTransport>,
@@ -3810,6 +3823,420 @@ async fn download_audit_holds_the_path_and_hash_not_the_content() {
     assert!(
         !audit.contains(&payload),
         "the chunk base64 leaked into the audit: {audit}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ---------------------------------------------------------------------------
+// upload_file
+// ---------------------------------------------------------------------------
+
+/// One `upload_file` call in an open session.
+fn upload_call(name: &str, remote_path: &str, overwrite: bool) -> CallToolRequestParams {
+    CallToolRequestParams::new("upload_file").with_arguments(args(&serde_json::json!({
+        "session_id": HOST,
+        "name": name,
+        "remote_path": remote_path,
+        "overwrite": overwrite
+    })))
+}
+
+/// A private transfer directory that holds one file for an upload test.
+fn upload_source(label: &str, name: &str, content: &[u8]) -> std::path::PathBuf {
+    use std::io::Write;
+    let root = transfer_dir(&format!("upload-{label}"));
+    let _ = std::fs::remove_dir_all(&root);
+    winrig::private_fs::create_private_dir(&root).expect("private root");
+    let mut file =
+        winrig::private_fs::open_private_truncate(&root.join(name)).expect("private file");
+    file.write_all(content).expect("write the source");
+    root
+}
+
+/// The write scan the fake host returns for one upload target.
+fn upload_scan_json(full_name: &str, exists: bool) -> String {
+    let escaped = full_name.replace('\\', "\\\\");
+    format!(
+        r#"{{"FullName":"{escaped}","DotNetFullName":"{escaped}","Exists":{exists},"IsDirectory":false,"LinkType":null,"Roots":{{"SystemRoot":"C:\\Windows"}}}}"#
+    )
+}
+
+/// Arms the fake host for one upload of `content`: the scan, the window answer and
+/// the commit with the matching digest.
+fn arm_upload(harness: &Harness, full_name: &str, exists: bool, content: &[u8]) {
+    harness.transport.respond(
+        "GetUnresolvedProviderPathFromPSPath",
+        &upload_scan_json(full_name, exists),
+    );
+    harness
+        .transport
+        .respond("OpenStandardInput", &content.len().to_string());
+    harness.transport.respond(
+        "TransformBlock",
+        &format!("{}\nplaced", sha256_hex(content)),
+    );
+}
+
+/// TR-XFER-04, AC-XFER-04: a confirmed upload sends the file bytes in a window on the
+/// standard input, never in a command, writes the temp file and places it by a
+/// rename. The reply carries the name, the size and the hash.
+#[tokio::test]
+async fn upload_writes_chunks_and_renames() {
+    let content = b"hello from the transfer directory";
+    let root = upload_source("chunks", "app.cfg", content);
+    let root_str = root.to_string_lossy().into_owned();
+    let sha = sha256_hex(content);
+    let harness = connected(
+        Answer::Accept,
+        &[
+            ("WINRIG_ALLOW_FILE_UPLOAD", "true"),
+            ("WINRIG_TRANSFER_DIR", root_str.as_str()),
+        ],
+    )
+    .await;
+    arm_upload(&harness, "D:\\App\\app.cfg", false, content);
+    let result = harness
+        .call(upload_call("app.cfg", "D:\\App\\app.cfg", false))
+        .await;
+
+    assert_eq!(error_of(&result), None, "{:?}", result.structured_content);
+    assert_eq!(status_of(&result).as_deref(), Some("uploaded"));
+    assert_eq!(field(&result, "name").as_deref(), Some("app.cfg"));
+    assert_eq!(number(&result, "size"), Some(content.len() as i64));
+    assert_eq!(field(&result, "sha256").as_deref(), Some(sha.as_str()));
+    assert_eq!(
+        *harness.transport.stdin.lock().expect("lock"),
+        vec![content.to_vec()],
+        "the bytes must arrive on the standard input"
+    );
+    assert!(harness.transport.saw("[IO.FileMode]::CreateNew"));
+    assert!(
+        harness.transport.saw("[IO.File]::Move($src, $dst)"),
+        "the temp file is not renamed into place"
+    );
+    assert!(
+        harness.transport.saw(&format!("if ($actual -ne '{sha}')")),
+        "the commit does not carry the confirmed digest"
+    );
+    assert!(
+        harness.transport.saw(".winrig-") && harness.transport.saw(".part"),
+        "the write does not go through a temp file"
+    );
+    assert!(
+        !harness.transport.saw(&winrig::ps::encode_base64(content)),
+        "the content travelled in a command"
+    );
+    std::fs::remove_dir_all(&root).ok();
+    harness.client.cancel().await.ok();
+}
+
+/// TR-XFER-04, DR-5: every upload needs a confirmation. Without a channel the tool
+/// refuses and no byte reaches the host.
+#[tokio::test]
+async fn upload_without_channel_is_refused() {
+    let content = b"secret bytes";
+    let root = upload_source("nochannel", "db.bin", content);
+    let root_str = root.to_string_lossy().into_owned();
+    let harness = connected(
+        Answer::NoChannel,
+        &[
+            ("WINRIG_ALLOW_FILE_UPLOAD", "true"),
+            ("WINRIG_TRANSFER_DIR", root_str.as_str()),
+        ],
+    )
+    .await;
+    arm_upload(&harness, "D:\\Data\\db.bin", false, content);
+    let result = harness
+        .call(upload_call("db.bin", "D:\\Data\\db.bin", false))
+        .await;
+
+    assert!(
+        harness.transport.stdin.lock().expect("lock").is_empty(),
+        "bytes reached the host without a confirmation"
+    );
+    assert!(!harness.transport.saw("OpenStandardInput"));
+    assert!(!harness.transport.saw("TransformBlock"));
+    assert!(
+        error_of(&result).is_some_and(|error| error.contains("cannot ask for confirmation")),
+        "{:?}",
+        result.structured_content
+    );
+    std::fs::remove_dir_all(&root).ok();
+    harness.client.cancel().await.ok();
+}
+
+/// DR-5: after a refusal by the operator, no byte reaches the host.
+#[tokio::test]
+async fn upload_declined_writes_nothing() {
+    let content = b"bytes";
+    let root = upload_source("declined", "db.bin", content);
+    let root_str = root.to_string_lossy().into_owned();
+    let harness = connected(
+        Answer::Decline,
+        &[
+            ("WINRIG_ALLOW_FILE_UPLOAD", "true"),
+            ("WINRIG_TRANSFER_DIR", root_str.as_str()),
+        ],
+    )
+    .await;
+    arm_upload(&harness, "D:\\Data\\db.bin", false, content);
+    let result = harness
+        .call(upload_call("db.bin", "D:\\Data\\db.bin", false))
+        .await;
+
+    assert_eq!(status_of(&result).as_deref(), Some("cancelled"));
+    assert!(harness.transport.stdin.lock().expect("lock").is_empty());
+    assert!(!harness.transport.saw("OpenStandardInput"));
+    std::fs::remove_dir_all(&root).ok();
+    harness.client.cancel().await.ok();
+}
+
+/// TR-XFER-05: a file above `WINRIG_MAX_TRANSFER_BYTES` is refused on its size,
+/// before the read, the host call and the prompt.
+#[tokio::test]
+async fn upload_above_the_transfer_limit_reads_nothing() {
+    let content = [7u8; 64];
+    let root = upload_source("limit", "big.bin", &content);
+    let root_str = root.to_string_lossy().into_owned();
+    let harness = connected(
+        Answer::Accept,
+        &[
+            ("WINRIG_ALLOW_FILE_UPLOAD", "true"),
+            ("WINRIG_TRANSFER_DIR", root_str.as_str()),
+            ("WINRIG_MAX_TRANSFER_BYTES", "16"),
+        ],
+    )
+    .await;
+    let before = harness.transport.calls.lock().expect("lock").len();
+    let result = harness
+        .call(upload_call("big.bin", "D:\\Data\\big.bin", false))
+        .await;
+
+    let error = error_of(&result).expect("a refusal");
+    assert!(error.contains("16"), "the limit is not named: {error}");
+    assert!(error.contains("64"), "the size is not named: {error}");
+    assert_eq!(
+        harness.transport.calls.lock().expect("lock").len(),
+        before,
+        "a host call followed an over-limit file"
+    );
+    assert_eq!(harness.elicitations(), 0);
+    std::fs::remove_dir_all(&root).ok();
+    harness.client.cancel().await.ok();
+}
+
+/// TR-XFER-01: a name that is not a plain name, or a file that is not in the transfer
+/// directory, is refused before the host.
+#[tokio::test]
+async fn upload_refuses_a_bad_or_missing_source() {
+    let root = upload_source("source", "db.bin", b"x");
+    let root_str = root.to_string_lossy().into_owned();
+    let harness = connected(
+        Answer::Accept,
+        &[
+            ("WINRIG_ALLOW_FILE_UPLOAD", "true"),
+            ("WINRIG_TRANSFER_DIR", root_str.as_str()),
+        ],
+    )
+    .await;
+    let before = harness.transport.calls.lock().expect("lock").len();
+    for name in ["../db.bin", "dir/db.bin", ".hidden", "missing.bin"] {
+        let result = harness
+            .call(upload_call(name, "D:\\Data\\db.bin", false))
+            .await;
+        assert!(
+            error_of(&result).is_some(),
+            "{name:?}: {:?}",
+            result.structured_content
+        );
+    }
+    assert_eq!(
+        harness.transport.calls.lock().expect("lock").len(),
+        before,
+        "a refused source reached the host"
+    );
+    assert_eq!(harness.elicitations(), 0);
+    std::fs::remove_dir_all(&root).ok();
+    harness.client.cancel().await.ok();
+}
+
+/// TR-XFER-04, DR-6: an upload into a system directory is refused before the network
+/// when no allowlist entry covers it.
+#[tokio::test]
+async fn upload_into_a_system_directory_needs_the_allowlist() {
+    let content = b"127.0.0.1 localhost";
+    let root = upload_source("protected", "hosts", content);
+    let root_str = root.to_string_lossy().into_owned();
+    let path = "C:\\Windows\\System32\\drivers\\etc\\hosts";
+    let harness = connected(
+        Answer::Accept,
+        &[
+            ("WINRIG_ALLOW_FILE_UPLOAD", "true"),
+            ("WINRIG_TRANSFER_DIR", root_str.as_str()),
+        ],
+    )
+    .await;
+    arm_upload(&harness, path, true, content);
+    let before = harness.transport.calls.lock().expect("lock").len();
+    let result = harness.call(upload_call("hosts", path, true)).await;
+
+    assert!(
+        error_of(&result).is_some_and(|error| error.contains("protected")),
+        "{:?}",
+        result.structured_content
+    );
+    assert_eq!(
+        harness.transport.calls.lock().expect("lock").len(),
+        before,
+        "a refused target reached the host"
+    );
+    assert_eq!(harness.elicitations(), 0);
+    harness.client.cancel().await.ok();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// AC-SEC21-1, TR-XFER-04: the confirmation names the host, the user and the tool, the
+/// local source, the resolved remote path, the size, the SHA-256, the overwrite state
+/// and the effect line. An allowlisted system directory adds the warning line, and the
+/// upload reaches the host.
+#[tokio::test]
+async fn upload_confirmation_holds_the_w32_fields() {
+    let content = b"127.0.0.1 localhost";
+    let root = upload_source("confirm", "hosts", content);
+    let root_str = root.to_string_lossy().into_owned();
+    let path = "C:\\Windows\\System32\\drivers\\etc\\hosts";
+    let harness = connected(
+        Answer::Accept,
+        &[
+            ("WINRIG_ALLOW_FILE_UPLOAD", "true"),
+            ("WINRIG_TRANSFER_DIR", root_str.as_str()),
+            (
+                "WINRIG_WRITE_ALLOW_PATHS",
+                "C:\\Windows\\System32\\drivers\\etc",
+            ),
+        ],
+    )
+    .await;
+    arm_upload(&harness, path, true, content);
+    let result = harness.call(upload_call("hosts", path, true)).await;
+
+    let message = harness.last_confirmation();
+    assert_header(&message, "upload_file");
+    assert!(message.contains("Local source: "), "{message}");
+    assert!(message.contains("hosts"), "{message}");
+    assert!(
+        message.contains(&format!("Resolved remote: {path}")),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("Size: {} bytes", content.len())),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("SHA-256: {}", sha256_hex(content))),
+        "{message}"
+    );
+    assert!(message.contains("Overwrite: yes"), "{message}");
+    assert!(message.contains("Existing file: yes"), "{message}");
+    assert!(
+        message.contains("Warning: the target lies in a system directory"),
+        "{message}"
+    );
+    assert!(
+        message.contains("This replaces the whole file on the host"),
+        "{message}"
+    );
+    assert_eq!(error_of(&result), None, "{:?}", result.structured_content);
+    assert_eq!(
+        *harness.transport.stdin.lock().expect("lock"),
+        vec![content.to_vec()],
+        "the allowlisted upload never reached the host"
+    );
+    assert!(
+        harness
+            .transport
+            .saw("[IO.File]::Replace($src, $dst, [NullString]::Value)"),
+        "an overwrite must use the atomic replace"
+    );
+    std::fs::remove_dir_all(&root).ok();
+    harness.client.cancel().await.ok();
+}
+
+/// TR-XFER-04: without `overwrite` an existing target is refused before the prompt.
+#[tokio::test]
+async fn upload_refuses_an_existing_target_without_overwrite() {
+    let content = b"new";
+    let root = upload_source("exists", "db.bin", content);
+    let root_str = root.to_string_lossy().into_owned();
+    let harness = connected(
+        Answer::Accept,
+        &[
+            ("WINRIG_ALLOW_FILE_UPLOAD", "true"),
+            ("WINRIG_TRANSFER_DIR", root_str.as_str()),
+        ],
+    )
+    .await;
+    arm_upload(&harness, "D:\\Data\\db.bin", true, content);
+    let result = harness
+        .call(upload_call("db.bin", "D:\\Data\\db.bin", false))
+        .await;
+
+    assert!(
+        error_of(&result).is_some_and(|error| error.contains("overwrite=true")),
+        "{:?}",
+        result.structured_content
+    );
+    assert_eq!(harness.elicitations(), 0);
+    assert!(harness.transport.stdin.lock().expect("lock").is_empty());
+    std::fs::remove_dir_all(&root).ok();
+    harness.client.cancel().await.ok();
+}
+
+/// TR-XFER-04, ADR-0017 §38, DR-4: the audit records the local and the remote path, the
+/// size, both hashes and the confirmation state, and never the content or its base64.
+#[tokio::test]
+async fn upload_audit_holds_the_paths_and_hash_not_the_content() {
+    let content = b"hello world";
+    let root = upload_source("audit", "db.bin", content);
+    let root_str = root.to_string_lossy().into_owned();
+    let sha = sha256_hex(content);
+    let payload = winrig::ps::encode_base64(content);
+    let buffer = capture();
+    let harness = connected(
+        Answer::Accept,
+        &[
+            ("WINRIG_ALLOW_FILE_UPLOAD", "true"),
+            ("WINRIG_TRANSFER_DIR", root_str.as_str()),
+        ],
+    )
+    .await;
+    arm_upload(&harness, "D:\\Data\\db.bin", false, content);
+    harness
+        .call(upload_call("db.bin", "D:\\Data\\db.bin", false))
+        .await;
+    harness.client.cancel().await.ok();
+
+    let audit = take_audit(&buffer);
+    assert!(audit.contains("FILE TRANSFER"), "{audit}");
+    assert!(audit.contains("upload_file"), "{audit}");
+    assert!(audit.contains("D:\\Data\\db.bin"), "{audit}");
+    assert!(audit.contains("db.bin"), "{audit}");
+    assert!(
+        audit.contains(&format!("sha256_local  : {sha}")),
+        "the local hash is missing: {audit}"
+    );
+    assert!(
+        audit.contains(&format!("sha256_host   : {sha}")),
+        "the host hash is missing: {audit}"
+    );
+    assert!(
+        audit.contains("confirmation  : confirmed"),
+        "the confirmation state is missing: {audit}"
+    );
+    assert!(audit.contains("status        : uploaded"), "{audit}");
+    assert!(
+        !audit.contains(&payload) && !audit.contains("hello world"),
+        "the content leaked into the audit: {audit}"
     );
     std::fs::remove_dir_all(&root).ok();
 }

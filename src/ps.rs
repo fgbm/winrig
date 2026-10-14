@@ -802,6 +802,171 @@ pub fn transfer_window_fits() -> bool {
     base64 + line_overhead + 4096 <= WINRM_MAX_OUTPUT_BYTES
 }
 
+/// Size of the chunk that one host command receives on its standard input
+/// (TR-XFER-04, ADR-0017 §26).
+///
+/// One window is one host command whose standard input carries the bytes, so the
+/// WinRS command line does not bound it. The call overhead (one NTLM handshake, one
+/// shell) is paid once per window, which is why the window is large.
+pub const UPLOAD_WINDOW_BYTES: i64 = 4 * 1024 * 1024;
+
+/// The most parent directories the upload commit inspects for a link (TR-XFER-04).
+///
+/// A deeper path is refused, so the loop is bounded and fails closed.
+pub const UPLOAD_PARENT_DEPTH: i32 = 128;
+
+/// The exit code of the upload commit when the host SHA-256 differs from the
+/// confirmed one (TR-XFER-04).
+pub const UPLOAD_MISMATCH_EXIT: i32 = 4;
+
+/// One upload window from the standard input into the host temp file (TR-XFER-04,
+/// ADR-0017 §26).
+///
+/// The first window (`offset` 0) creates the temp file with `CreateNew`, so an
+/// existing file or a link at the temp path refuses. Every later window opens the
+/// file and requires its length to equal `offset`, so a repeated or a lost window
+/// fails instead of corrupting the content. The file is opened with `FileShare.Delete`,
+/// so the cleanup delete can succeed while a stalled window still holds the handle.
+/// The script prints the new length of the file; the caller compares it with
+/// `offset + length`. The bytes arrive on the standard input and never enter the
+/// command text.
+///
+/// # Errors
+///
+/// An error text when the command cannot fit one WinRS command line.
+pub fn upload_chunk(temp_path: &str, offset: i64, length: i64) -> Result<String, String> {
+    let safe = escape(temp_path);
+    fit_or_error(format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $mode = if ({offset} -eq 0) {{ [IO.FileMode]::CreateNew }} else {{ [IO.FileMode]::Open }}; \
+         $fs = [IO.File]::Open('{safe}', $mode, [IO.FileAccess]::Write, [IO.FileShare]::Delete); \
+         try {{ \
+         if ($fs.Length -ne {offset}) {{ throw 'the host temp file is not the length the tool expects' }}; \
+         $null = $fs.Seek(0, [IO.SeekOrigin]::End); \
+         $stdin = [Console]::OpenStandardInput(); \
+         $buf = [byte[]]::new({read}); \
+         $got = 0; \
+         while ($true) {{ \
+         $n = $stdin.Read($buf, 0, $buf.Length); \
+         if ($n -le 0) {{ break }}; \
+         $fs.Write($buf, 0, $n); \
+         $got += $n \
+         }}; \
+         $fs.Flush(); \
+         if ($got -ne {length}) {{ throw 'the host received a different number of bytes than the tool sent' }}; \
+         Write-Output ([string]$fs.Length) \
+         }} finally {{ $fs.Close() }}",
+        read = TRANSFER_HASH_READ_BYTES
+    ))
+}
+
+/// The final step of an upload: the host hash of the temp file, the target re-check
+/// and the placement (TR-XFER-04, ADR-0017 §26).
+///
+/// The temp file opens with `FileShare.Read`, so nothing writes to it while it is
+/// hashed. A length other than `size` prints `short` and exits with
+/// [`HASH_SHORT_EXIT`]; a digest other than `sha256` prints the digest and exits with
+/// [`UPLOAD_MISMATCH_EXIT`], and in both cases the target stays untouched. The
+/// command repeats the target checks of the scan: an existing directory or a name
+/// surrogate refuses, and an existing file needs `overwrite`. Without `overwrite` the
+/// placement is `[IO.File]::Move`, which refuses a target that appeared after the
+/// check. Before it places anything, the command requires the target to be its own full
+/// path and every parent directory up to the root to be free of a symbolic link or a
+/// junction. With `overwrite` it is the atomic `[IO.File]::Replace`. Each path enters the
+/// command once, so a long path still fits the command line. The output is the digest
+/// line, then `placed`.
+///
+/// # Errors
+///
+/// An error text when `sha256` is not 64 hexadecimal characters, or when the command
+/// cannot fit one WinRS command line.
+pub fn upload_commit(
+    temp_path: &str,
+    target_path: &str,
+    size: i64,
+    sha256: &str,
+    overwrite: bool,
+) -> Result<String, String> {
+    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("the SHA-256 is not 64 hexadecimal characters".to_owned());
+    }
+    let safe_temp = escape(temp_path);
+    let safe_target = escape(target_path);
+    let safe_hash = escape(sha256);
+    let ow = ps_bool(overwrite);
+    // `[NullString]::Value` keeps the backup name a typed null (see
+    // `replace_target_command`).
+    let place = if overwrite {
+        "if ([IO.File]::Exists($dst)) { [IO.File]::Replace($src, $dst, [NullString]::Value) } \
+         else { [IO.File]::Move($src, $dst) }"
+    } else {
+        "[IO.File]::Move($src, $dst)"
+    };
+    fit_or_error(format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $src = '{safe_temp}'; $dst = '{safe_target}'; \
+         $fs = [IO.File]::Open($src, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read); \
+         try {{ \
+         $h = [Security.Cryptography.SHA256]::Create(); \
+         try {{ \
+         if ($fs.Length -ne {size}) {{ Write-Output 'short'; exit {short} }}; \
+         $buf = [byte[]]::new({read}); \
+         $done = 0; $mark = 0; \
+         while ($true) {{ \
+         $n = $fs.Read($buf, 0, $buf.Length); \
+         if ($n -le 0) {{ break }}; \
+         $null = $h.TransformBlock($buf, 0, $n, $null, 0); \
+         $done += $n; \
+         if (($done - $mark) -ge {progress}) {{ $mark = $done; Write-Output ('progress ' + $done) }} \
+         }}; \
+         $null = $h.TransformFinalBlock([byte[]]::new(0), 0, 0); \
+         $actual = [BitConverter]::ToString($h.Hash).Replace('-','').ToLowerInvariant() \
+         }} finally {{ $h.Dispose() }} \
+         }} finally {{ $fs.Close() }}; \
+         Write-Output $actual; \
+         if ($actual -ne '{safe_hash}') {{ exit {mismatch} }}; \
+         if ([IO.Path]::GetFullPath($dst) -ne $dst) {{ throw 'the target path is not the path the scan resolved' }}; \
+         $d = [IO.Path]::GetDirectoryName($dst); $n = 0; \
+         while ($d -and [IO.Path]::GetDirectoryName($d) -and ($n -lt {depth})) {{ \
+         $di = Get-Item -LiteralPath $d -Force -ErrorAction Stop; \
+         if (($di.Attributes -band [IO.FileAttributes]::ReparsePoint) -and ($di.LinkType -in 'SymbolicLink','Junction')) {{ throw 'a parent directory of the target is a symbolic link or a junction; the tool refuses' }}; \
+         $d = [IO.Path]::GetDirectoryName($d); $n++ \
+         }}; \
+         if ($n -ge {depth}) {{ throw 'the target path is too deep to check' }}; \
+         $t = $null; if (Test-Path -LiteralPath $dst) {{ $t = Get-Item -LiteralPath $dst -Force -ErrorAction Stop }}; \
+         if ($t) {{ \
+         if ($t.PSIsContainer) {{ throw 'the target is an existing directory; delete it first with delete_directory' }}; \
+         if ($t.LinkType -in 'SymbolicLink','Junction') {{ throw 'the target is a symbolic link or a junction; the tool refuses' }}; \
+         if (-not {ow}) {{ throw 'the target already exists; pass overwrite=true to replace it' }} \
+         }}; \
+         {place}; \
+         Write-Output 'placed'",
+        read = TRANSFER_HASH_READ_BYTES,
+        progress = TRANSFER_HASH_PROGRESS_BYTES,
+        depth = UPLOAD_PARENT_DEPTH,
+        short = HASH_SHORT_EXIT,
+        mismatch = UPLOAD_MISMATCH_EXIT
+    ))
+}
+
+/// Removes the host temp file of an upload and proves it (TR-XFER-04).
+///
+/// The exit code is 0 only when the file is gone afterwards, so the caller trusts the
+/// code and not the absence of an error text.
+///
+/// # Errors
+///
+/// An error text when the command cannot fit one WinRS command line.
+pub fn upload_remove_temp(temp_path: &str) -> Result<String, String> {
+    let safe = escape(temp_path);
+    fit_or_error(format!(
+        "$p = '{safe}'; \
+         Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue; \
+         if (Test-Path -LiteralPath $p) {{ exit 1 }}; \
+         exit 0"
+    ))
+}
+
 /// The PowerShell boolean literal for a confirmation flag.
 fn ps_bool(value: bool) -> &'static str {
     if value { "$true" } else { "$false" }
@@ -5425,6 +5590,11 @@ mod tests {
             download_scan(text),
             download_chunk(text, 0, TRANSFER_WINDOW_BYTES),
             download_hash(text, TRANSFER_WINDOW_BYTES),
+            upload_chunk(text, 0, UPLOAD_WINDOW_BYTES).expect("valid"),
+            upload_chunk(text, UPLOAD_WINDOW_BYTES, 7).expect("valid"),
+            upload_commit(text, text, 10, &"ab".repeat(32), false).expect("valid"),
+            upload_commit(text, text, 10, &"ab".repeat(32), true).expect("valid"),
+            upload_remove_temp(text).expect("valid"),
             copy_command(text, text, false, false).expect("valid"),
             copy_command(text, text, true, true).expect("valid"),
             move_rename_command(text, text, false, false).expect("valid"),
@@ -6051,6 +6221,210 @@ mod tests {
         }
         let over = format!("C:\\{}", "d".repeat(3_500));
         assert!(copy_command(&over, &over, false, false).is_err());
+    }
+
+    /// TR-XFER-04: the window command takes its bytes from the standard input, so the
+    /// bytes never enter the command text. The first window creates the temp file with
+    /// `CreateNew`, and a later window requires the length it expects.
+    #[test]
+    fn upload_chunk_reads_the_standard_input_into_the_temp_file() {
+        let first = upload_chunk("C:\\Data\\db.bin.part", 0, UPLOAD_WINDOW_BYTES).expect("valid");
+        assert!(first.contains("OpenStandardInput()"), "{first}");
+        assert!(first.contains("[IO.FileMode]::CreateNew"), "{first}");
+        assert!(first.contains("[IO.FileShare]::Delete)"), "{first}");
+        assert!(!first.contains("[IO.FileShare]::None"), "{first}");
+        assert!(first.contains("if ($fs.Length -ne 0)"), "{first}");
+        assert!(
+            first.contains(&format!("if ($got -ne {UPLOAD_WINDOW_BYTES})")),
+            "{first}"
+        );
+        assert!(
+            !first.contains("FromBase64String"),
+            "the bytes must not travel in the command: {first}"
+        );
+        assert!(!first.contains("WriteAllBytes"), "{first}");
+        let later = upload_chunk("C:\\Data\\db.bin.part", 4194304, 7).expect("valid");
+        assert!(later.contains("if ($fs.Length -ne 4194304)"), "{later}");
+        assert!(later.contains("if ($got -ne 7)"), "{later}");
+        assert!(later.contains("$mode = if (4194304 -eq 0)"), "{later}");
+        assert!(
+            later.contains("$fs.Seek(0, [IO.SeekOrigin]::End)"),
+            "{later}"
+        );
+    }
+
+    /// TR-XFER-04: the commit hashes the temp file with a lock that stops writers,
+    /// compares the confirmed digest before it touches the target, repeats the target
+    /// checks and places the file without a wildcard-aware parameter.
+    #[test]
+    fn upload_commit_verifies_the_digest_before_it_places_the_file() {
+        let sha = "0123456789abcdef".repeat(4);
+        let plain = upload_commit(
+            "C:\\Data\\db.bin.part",
+            "C:\\Data\\db.bin",
+            1234,
+            &sha,
+            false,
+        )
+        .expect("valid");
+        assert!(plain.contains("[IO.FileShare]::Read)"), "{plain}");
+        assert!(plain.contains("if ($fs.Length -ne 1234)"), "{plain}");
+        assert!(plain.contains("exit 3"), "{plain}");
+        assert!(
+            plain.contains(&format!("if ($actual -ne '{sha}') {{ exit 4 }}")),
+            "{plain}"
+        );
+        let digest_check = plain.find("exit 4").expect("digest check");
+        let placement = plain.find("[IO.File]::Move(").expect("placement");
+        assert!(
+            digest_check < placement,
+            "the placement must follow the digest check: {plain}"
+        );
+        assert!(plain.contains("if (-not $false)"), "{plain}");
+        assert!(plain.contains("$t.PSIsContainer"), "{plain}");
+        assert!(plain.contains("$t.LinkType"), "{plain}");
+        assert!(plain.contains("[IO.File]::Move($src, $dst)"), "{plain}");
+        assert!(
+            !plain.contains("[IO.File]::Replace"),
+            "a replace without overwrite could take a file that appeared late: {plain}"
+        );
+        assert!(plain.ends_with("Write-Output 'placed'"), "{plain}");
+        let over = upload_commit(
+            "C:\\Data\\db.bin.part",
+            "C:\\Data\\db.bin",
+            1234,
+            &sha,
+            true,
+        )
+        .expect("valid");
+        assert!(
+            over.contains("[IO.File]::Replace($src, $dst, [NullString]::Value)"),
+            "{over}"
+        );
+        assert!(over.contains("[NullString]::Value"), "{over}");
+        assert!(over.contains("if (-not $true)"), "{over}");
+        assert!(
+            !over.contains("Move-Item") && !over.contains("-Destination"),
+            "{over}"
+        );
+        // A digest that is not 64 hexadecimal characters never enters a command.
+        assert!(upload_commit("t", "p", 1, "abc", false).is_err());
+        assert!(upload_commit("t", "p", 1, &"g".repeat(64), false).is_err());
+        assert!(upload_commit("t", "p", 1, &format!("{}' ; x", "a".repeat(60)), false).is_err());
+    }
+
+    /// TR-XFER-04: the commit applies the same link rule as the scan (a name surrogate
+    /// only), so a reparse point that is not a link, such as a OneDrive placeholder, is
+    /// not refused as a link.
+    #[test]
+    fn upload_commit_refuses_only_a_name_surrogate_at_the_target() {
+        let sha = "ab".repeat(32);
+        let command = upload_commit("C:\\D\\t.part", "C:\\D\\t", 1, &sha, true).expect("valid");
+        assert!(
+            command.contains("if ($t.LinkType -in 'SymbolicLink','Junction')"),
+            "{command}"
+        );
+        assert!(
+            !command.contains("if ($t.LinkType)"),
+            "a bare LinkType test refuses a reparse point that is not a link: {command}"
+        );
+    }
+
+    /// TR-XFER-04: the commit re-checks the parents. The target must be its own full
+    /// path, every parent up to the root is read, a link in a parent refuses, and the
+    /// loop is bounded and fails closed.
+    #[test]
+    fn upload_commit_rechecks_the_parent_directories() {
+        let sha = "ab".repeat(32);
+        let command = upload_commit("C:\\D\\t.part", "C:\\D\\t", 1, &sha, false).expect("valid");
+        assert!(
+            command.contains("if ([IO.Path]::GetFullPath($dst) -ne $dst)"),
+            "{command}"
+        );
+        assert!(
+            command.contains("$d = [IO.Path]::GetDirectoryName($dst)"),
+            "{command}"
+        );
+        assert!(
+            command.contains(&format!("($n -lt {UPLOAD_PARENT_DEPTH})")),
+            "{command}"
+        );
+        assert!(
+            command.contains("$di.LinkType -in 'SymbolicLink','Junction'"),
+            "{command}"
+        );
+        assert!(
+            command.contains("[IO.FileAttributes]::ReparsePoint"),
+            "{command}"
+        );
+        assert!(
+            command.contains(&format!("if ($n -ge {UPLOAD_PARENT_DEPTH}) {{ throw")),
+            "the bound must fail closed: {command}"
+        );
+        let check = command.find("GetFullPath($dst)").expect("path check");
+        let placement = command.find("[IO.File]::Move(").expect("placement");
+        assert!(
+            check < placement,
+            "the parent check must precede the placement"
+        );
+    }
+
+    /// TR-XFER-04: the cleanup command proves the removal with its exit code, and a
+    /// stalled window cannot block it because the window opens the temp with
+    /// `FileShare.Delete`.
+    #[test]
+    fn upload_remove_temp_proves_the_removal_by_its_exit_code() {
+        let command = upload_remove_temp("C:\\D\\t.part").expect("valid");
+        assert!(
+            command.contains("Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue"),
+            "{command}"
+        );
+        assert!(
+            command.contains("if (Test-Path -LiteralPath $p) { exit 1 }"),
+            "{command}"
+        );
+        assert!(command.ends_with("exit 0"), "{command}");
+        let chunk = upload_chunk("C:\\D\\t.part", 0, 1).expect("valid");
+        assert!(chunk.contains("[IO.FileShare]::Delete)"), "{chunk}");
+    }
+
+    /// TR-XFER-04: the standard input of a host command belongs to the upload window.
+    /// `$input` would read it as pipeline input, so no upload command and no preamble
+    /// may name it.
+    #[test]
+    fn upload_commands_and_the_preamble_never_use_the_pipeline_input() {
+        let sha = "ab".repeat(32);
+        for text in [
+            crate::session::PREAMBLE.to_owned(),
+            upload_chunk("C:\\D\\t.part", 0, 1).expect("valid"),
+            upload_commit("C:\\D\\t.part", "C:\\D\\t", 1, &sha, true).expect("valid"),
+            upload_remove_temp("C:\\D\\t.part").expect("valid"),
+        ] {
+            assert!(!text.to_lowercase().contains("$input"), "{text}");
+        }
+    }
+
+    /// TR-XFER-04: the upload commands fit one WinRS command line for a long path, and
+    /// a path too long for the line is refused before the transport.
+    #[test]
+    fn upload_commands_fit_the_winrs_line() {
+        let sha = "ab".repeat(32);
+        let target = format!("C:\\{}", "d".repeat(200));
+        let temp = format!("{target}.winrig-0000000000000000.part");
+        for command in [
+            upload_chunk(&temp, UPLOAD_WINDOW_BYTES, UPLOAD_WINDOW_BYTES).expect("valid"),
+            upload_commit(&temp, &target, i64::MAX, &sha, true).expect("valid"),
+            upload_commit(&temp, &target, i64::MAX, &sha, false).expect("valid"),
+        ] {
+            assert!(
+                command_line_chars(&command) < WINRS_COMMAND_LINE_LIMIT,
+                "{}",
+                command_line_chars(&command)
+            );
+        }
+        let over = format!("C:\\{}", "d".repeat(3_500));
+        assert!(upload_chunk(&over, 0, 1).is_err());
+        assert!(upload_commit(&over, &over, 1, &sha, true).is_err());
     }
 
     /// ADR-0017 §18: a user path never reaches a wildcard-aware parameter. Only

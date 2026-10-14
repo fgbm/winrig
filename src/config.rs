@@ -199,6 +199,8 @@ pub struct AppConfig {
     pub allow_file_ops: bool,
     /// Whether the tool `download_file` exists (TR-XFER-02, ADR-0017 §24).
     pub allow_file_download: bool,
+    /// Whether the tool `upload_file` exists (TR-XFER-04, ADR-0017 §26).
+    pub allow_file_upload: bool,
     /// The local endpoint of the file transfer; `None` means the transfer
     /// subdirectory of the state directory (TR-XFER-01, ADR-0017 §21).
     pub transfer_dir: Option<String>,
@@ -246,6 +248,7 @@ impl fmt::Debug for AppConfig {
             .field("allow_script_exec", &self.allow_script_exec)
             .field("allow_file_ops", &self.allow_file_ops)
             .field("allow_file_download", &self.allow_file_download)
+            .field("allow_file_upload", &self.allow_file_upload)
             .field("transfer_dir", &self.transfer_dir)
             .field("max_transfer_bytes", &self.max_transfer_bytes)
             .field("confirm_fallback", &self.confirm_fallback)
@@ -592,6 +595,7 @@ pub fn load_config_from(env: &Env) -> Result<AppConfig, ConfigError> {
         allow_script_exec: read_bool(env, "WINRIG_ALLOW_SCRIPT_EXEC", false)?,
         allow_file_ops: read_bool(env, "WINRIG_ALLOW_FILE_OPS", false)?,
         allow_file_download: read_bool(env, "WINRIG_ALLOW_FILE_DOWNLOAD", false)?,
+        allow_file_upload: read_bool(env, "WINRIG_ALLOW_FILE_UPLOAD", false)?,
         transfer_dir: read_transfer_dir(env)?,
         // The lower bound is one byte: even the smallest limit still allows an
         // empty file, so the variable never means "a tool that always refuses".
@@ -707,6 +711,10 @@ pub fn setting_pairs(config: &AppConfig) -> Vec<(&'static str, Option<String>)> 
         (
             "WINRIG_ALLOW_FILE_DOWNLOAD",
             Some(config.allow_file_download.to_string()),
+        ),
+        (
+            "WINRIG_ALLOW_FILE_UPLOAD",
+            Some(config.allow_file_upload.to_string()),
         ),
         ("WINRIG_TRANSFER_DIR", config.transfer_dir.clone()),
         (
@@ -826,6 +834,8 @@ mod tests {
         assert!(!config.allow_file_ops);
         // TR-XFER-02: a download is off until the operator turns it on.
         assert!(!config.allow_file_download);
+        // TR-XFER-04: an upload is off until the operator turns it on.
+        assert!(!config.allow_file_upload);
         // TR-XFER-01: no explicit transfer directory by default; the state
         // directory is the endpoint.
         assert_eq!(config.transfer_dir, None);
@@ -853,6 +863,19 @@ mod tests {
         assert!(load_config_from(&env).expect("valid").allow_file_download);
         let env = source(&with(&[("WINRIG_ALLOW_FILE_DOWNLOAD", "off")]));
         assert!(!load_config_from(&env).expect("valid").allow_file_download);
+    }
+
+    /// TR-XFER-04: the upload flag is switched by the usual boolean values, and a bad
+    /// value refuses the start with the variable name (DR-8).
+    #[test]
+    fn file_upload_is_switched_by_the_operator() {
+        let env = source(&with(&[("WINRIG_ALLOW_FILE_UPLOAD", "true")]));
+        assert!(load_config_from(&env).expect("valid").allow_file_upload);
+        let env = source(&with(&[("WINRIG_ALLOW_FILE_UPLOAD", "off")]));
+        assert!(!load_config_from(&env).expect("valid").allow_file_upload);
+        let env = source(&with(&[("WINRIG_ALLOW_FILE_UPLOAD", "maybe")]));
+        let error = load_config_from(&env).expect_err("must fail").to_string();
+        assert!(error.contains("WINRIG_ALLOW_FILE_UPLOAD"), "{error}");
     }
 
     /// TR-FS-08: the setting is switched by the usual boolean values, and a bad

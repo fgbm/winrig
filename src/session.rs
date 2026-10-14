@@ -103,18 +103,18 @@ pub struct AuditTransfer<'a> {
     pub tool: &'a str,
     /// WinRM target of the session, for the audit record.
     pub host: &'a str,
-    /// Source location as the Windows host resolved it.
+    /// The file on the Windows host, as the host resolved it.
     pub remote_path: &'a str,
-    /// Destination on this computer, as the server resolved it.
+    /// The file on this computer, as the server resolved it.
     pub local_path: &'a str,
     pub size: i64,
-    /// Digest of the source from the separate pass; empty until it returns.
+    /// Digest the host computed; empty until it returns.
     pub host_hash: &'a str,
-    /// The SHA-256 the server computed while it read; empty until then.
+    /// The SHA-256 the server computed while it transferred; empty until then.
     pub local_hash: &'a str,
     /// `confirmed`, `unsupported` or `cancelled`.
     pub confirmation: &'a str,
-    /// `downloaded`, `failed` or `cancelled`.
+    /// `downloaded`, `uploaded`, `failed` or `cancelled`.
     pub status: &'a str,
 }
 
@@ -174,6 +174,26 @@ pub trait WinRmTransport: Send + Sync {
         target: &SessionTarget,
         script: &str,
     ) -> Result<RemoteOutput, TransportError>;
+
+    /// Runs the script with `stdin` as its standard input (TR-XFER-04, ADR-0017 §26).
+    ///
+    /// The bytes do not count against the WinRS command line, so one call carries a
+    /// whole upload window.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError`] if the connection or the authentication fails, or if the
+    /// transport cannot send standard input.
+    async fn run_powershell_stdin(
+        &self,
+        _target: &SessionTarget,
+        _script: &str,
+        _stdin: &[u8],
+    ) -> Result<RemoteOutput, TransportError> {
+        Err(TransportError::Other(
+            "this transport cannot send standard input".to_owned(),
+        ))
+    }
 }
 
 /// Splits `DOMAIN\user` for NTLM, matching `spnego`.
@@ -215,16 +235,7 @@ impl WinRmTransport for WinrmTransportImpl {
         target: &SessionTarget,
         script: &str,
     ) -> Result<RemoteOutput, TransportError> {
-        use winrm_rs::{WinrmClient, WinrmConfig};
-
-        let config = WinrmConfig {
-            port: target.port,
-            use_tls: target.use_tls,
-            accept_invalid_certs: !target.verify_cert,
-            ..WinrmConfig::default()
-        };
-        let credentials = credentials_for(target);
-        let client = WinrmClient::new(config, credentials).map_err(map_error)?;
+        let client = winrm_client(target)?;
         let output = client
             .run_powershell(&target.host, script)
             .await
@@ -235,6 +246,270 @@ impl WinRmTransport for WinrmTransportImpl {
             exit_code: output.exit_code,
         })
     }
+
+    async fn run_powershell_stdin(
+        &self,
+        target: &SessionTarget,
+        script: &str,
+        stdin: &[u8],
+    ) -> Result<RemoteOutput, TransportError> {
+        let client = Arc::new(winrm_client(target)?);
+        let shell = client.open_shell(&target.host).await.map_err(map_error)?;
+        // A dropped future (a client disconnect) leaves the host command blocked on
+        // its standard input. The guard terminates the command and closes the shell
+        // from a task (TR-XFER-04).
+        let mut guard = CallGuard {
+            cleanup: Arc::new(ClientCleanup {
+                client: Arc::clone(&client),
+                host: target.host.clone(),
+                shell_id: shell.shell_id().to_owned(),
+            }),
+            command_id: None,
+            armed: true,
+        };
+        let result = tokio::time::timeout(
+            STDIN_CALL_TIMEOUT,
+            drive_stdin_call(
+                &ShellCall(&shell),
+                script,
+                stdin,
+                &mut guard,
+                SEND_ERROR_DRAIN,
+            ),
+        )
+        .await;
+        match result {
+            Ok(Ok(output)) => {
+                guard.armed = false;
+                shell.close().await.ok();
+                Ok(output)
+            }
+            Ok(Err(error)) => {
+                guard.run_cleanup().await;
+                Err(map_error(error))
+            }
+            Err(_) => {
+                guard.run_cleanup().await;
+                Err(TransportError::Other(format!(
+                    "the host call with standard input did not finish in {} seconds",
+                    STDIN_CALL_TIMEOUT.as_secs()
+                )))
+            }
+        }
+    }
+}
+
+/// Bytes of standard input in one WS-Man `Send` message, before base64.
+///
+/// The base64 form of this size stays well under the 153 600-byte envelope that
+/// `winrm-rs` declares (TR-XFER-04).
+const STDIN_SEND_BYTES: usize = 64 * 1024;
+
+/// Time limit of one call with standard input, for the whole window.
+const STDIN_CALL_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Output cap of one call with standard input; the upload scripts print one line.
+const STDIN_OUTPUT_CAP: usize = 1024 * 1024;
+
+fn winrm_client(target: &SessionTarget) -> Result<winrm_rs::WinrmClient, TransportError> {
+    let config = winrm_rs::WinrmConfig {
+        port: target.port,
+        use_tls: target.use_tls,
+        accept_invalid_certs: !target.verify_cert,
+        ..winrm_rs::WinrmConfig::default()
+    };
+    winrm_rs::WinrmClient::new(config, credentials_for(target)).map_err(map_error)
+}
+
+/// How long the output is drained after a failed `Send`, to read the exit code and
+/// the error text of a command that already ended (TR-XFER-04).
+const SEND_ERROR_DRAIN: Duration = Duration::from_secs(10);
+
+/// Answer of one receive request for a running host command.
+struct Poll {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    exit_code: Option<i32>,
+    done: bool,
+}
+
+/// The steps of a host command with standard input, as the transport needs them.
+#[async_trait::async_trait]
+trait StdinCall: Send + Sync {
+    async fn start(&self, script: &str) -> Result<String, winrm_rs::WinrmError>;
+    async fn send(
+        &self,
+        command_id: &str,
+        data: &[u8],
+        end_of_stream: bool,
+    ) -> Result<(), winrm_rs::WinrmError>;
+    async fn receive(&self, command_id: &str) -> Result<Poll, winrm_rs::WinrmError>;
+}
+
+struct ShellCall<'a>(&'a winrm_rs::Shell<'a>);
+
+#[async_trait::async_trait]
+impl StdinCall for ShellCall<'_> {
+    async fn start(&self, script: &str) -> Result<String, winrm_rs::WinrmError> {
+        let encoded = winrm_rs::encode_powershell_command(script);
+        self.0
+            .start_command("powershell.exe", &["-EncodedCommand", &encoded])
+            .await
+    }
+
+    async fn send(
+        &self,
+        command_id: &str,
+        data: &[u8],
+        end_of_stream: bool,
+    ) -> Result<(), winrm_rs::WinrmError> {
+        self.0.send_input(command_id, data, end_of_stream).await
+    }
+
+    async fn receive(&self, command_id: &str) -> Result<Poll, winrm_rs::WinrmError> {
+        let output = self.0.receive_next(command_id).await?;
+        Ok(Poll {
+            stdout: output.stdout,
+            stderr: output.stderr,
+            exit_code: output.exit_code,
+            done: output.done,
+        })
+    }
+}
+
+/// Best-effort release of a host command and its shell.
+#[async_trait::async_trait]
+trait ShellCleanup: Send + Sync {
+    async fn terminate(&self, command_id: &str);
+    async fn delete(&self);
+}
+
+struct ClientCleanup {
+    client: Arc<winrm_rs::WinrmClient>,
+    host: String,
+    shell_id: String,
+}
+
+#[async_trait::async_trait]
+impl ShellCleanup for ClientCleanup {
+    async fn terminate(&self, command_id: &str) {
+        let _ = self
+            .client
+            .signal_terminate(&self.host, &self.shell_id, command_id)
+            .await;
+    }
+
+    async fn delete(&self) {
+        let _ = self.client.delete_shell(&self.host, &self.shell_id).await;
+    }
+}
+
+/// Terminates the command and deletes the shell when the call future is dropped
+/// before it ends (TR-XFER-04).
+///
+/// The host command blocks on its standard input and holds the temp file open until
+/// then. `drop` cannot wait, so a task sends the signal first and then deletes the
+/// shell.
+struct CallGuard {
+    cleanup: Arc<dyn ShellCleanup>,
+    command_id: Option<String>,
+    armed: bool,
+}
+
+impl CallGuard {
+    async fn run_cleanup(&mut self) {
+        self.armed = false;
+        if let Some(command_id) = &self.command_id {
+            self.cleanup.terminate(command_id).await;
+        }
+        self.cleanup.delete().await;
+    }
+}
+
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let cleanup = Arc::clone(&self.cleanup);
+        let command_id = self.command_id.clone();
+        runtime.spawn(async move {
+            if let Some(command_id) = command_id {
+                cleanup.terminate(&command_id).await;
+            }
+            cleanup.delete().await;
+        });
+    }
+}
+
+/// Starts the script, feeds `stdin` in `Send` messages, closes the stream and
+/// collects the output (TR-XFER-04).
+///
+/// A failed `Send` does not end the call at once: a command that already ended
+/// still has an exit code and an error text, which tell more than the broken pipe.
+/// The output is drained for `drain`, and the send error stands only when the
+/// command has not finished by then.
+async fn drive_stdin_call(
+    call: &dyn StdinCall,
+    script: &str,
+    stdin: &[u8],
+    guard: &mut CallGuard,
+    drain: Duration,
+) -> Result<RemoteOutput, winrm_rs::WinrmError> {
+    let command_id = call.start(script).await?;
+    guard.command_id = Some(command_id.clone());
+    let mut send_error = None;
+    let mut parts = stdin.chunks(STDIN_SEND_BYTES).peekable();
+    if parts.peek().is_none() {
+        send_error = call.send(&command_id, &[], true).await.err();
+    }
+    while send_error.is_none()
+        && let Some(part) = parts.next()
+    {
+        send_error = call
+            .send(&command_id, part, parts.peek().is_none())
+            .await
+            .err();
+    }
+    let Some(send_error) = send_error else {
+        return collect_output(call, &command_id).await;
+    };
+    match tokio::time::timeout(drain, collect_output(call, &command_id)).await {
+        Ok(Ok(output)) if output.exit_code != -1 => Ok(output),
+        _ => Err(send_error),
+    }
+}
+
+/// Polls until the command is done and returns its output and exit code.
+async fn collect_output(
+    call: &dyn StdinCall,
+    command_id: &str,
+) -> Result<RemoteOutput, winrm_rs::WinrmError> {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut exit_code = None;
+    loop {
+        let poll = call.receive(command_id).await?;
+        stdout.extend_from_slice(&poll.stdout);
+        stderr.extend_from_slice(&poll.stderr);
+        if stdout.len() + stderr.len() > STDIN_OUTPUT_CAP {
+            return Err(winrm_rs::WinrmError::Transfer(format!(
+                "command output exceeded {STDIN_OUTPUT_CAP} bytes"
+            )));
+        }
+        exit_code = poll.exit_code.or(exit_code);
+        if poll.done {
+            break;
+        }
+    }
+    Ok(RemoteOutput {
+        stdout,
+        stderr,
+        exit_code: exit_code.unwrap_or(-1),
+    })
 }
 
 /// The listener rejected an unencrypted message when it answers HTTP 500 with an empty body.
@@ -920,17 +1195,20 @@ impl SessionRegistry {
         }
     }
 
-    /// Runs one host command of a download and returns its base64 payload without an
+    /// Runs one host command of a file transfer and returns its output without an
     /// audit record (DR-4).
     ///
-    /// The reply carries the raw base64 of the chunk. The audit records nothing here
-    /// because the payload may be personal data; the caller writes one summary record
-    /// with the path, the size and the hash (ADR-0017 §38).
-    pub async fn read_transfer_chunk(
+    /// A download reply carries the raw base64 of a chunk, and an upload sends the
+    /// window as `stdin`. The audit records nothing here because the payload may be
+    /// personal data; the caller writes one summary record with the paths, the size
+    /// and the hash (ADR-0017 §38). `tool` names the caller in a refusal record.
+    pub async fn run_transfer_command(
         &self,
         username: &str,
         session_id: &str,
+        tool: &str,
         command: &str,
+        stdin: Option<&[u8]>,
     ) -> Value {
         let target = {
             let mut sessions = lock(&self.sessions);
@@ -952,7 +1230,7 @@ impl SessionRegistry {
                 &[
                     ("user", username.to_owned()),
                     ("session", session_id.to_owned()),
-                    ("tool", "download_file".to_owned()),
+                    ("tool", tool.to_owned()),
                     ("chars", command_chars.to_string()),
                     ("limit", crate::ps::WINRS_COMMAND_LINE_LIMIT.to_string()),
                 ],
@@ -968,11 +1246,16 @@ impl SessionRegistry {
         }
 
         let session_password = target.password.expose_secret().to_owned();
-        match self
-            .transport
-            .run_powershell(&target, &format!("{PREAMBLE}{command}"))
-            .await
-        {
+        let script = format!("{PREAMBLE}{command}");
+        let result = match stdin {
+            Some(bytes) => {
+                self.transport
+                    .run_powershell_stdin(&target, &script, bytes)
+                    .await
+            }
+            None => self.transport.run_powershell(&target, &script).await,
+        };
+        match result {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
                 let stderr = strip_clixml(&String::from_utf8_lossy(&output.stderr), false);
@@ -988,7 +1271,7 @@ impl SessionRegistry {
                     &[session_password],
                     self.config.secret_redact_min_length,
                 );
-                tracing::error!(session = %sanitize_log_value(session_id), error = %message, "read_transfer_chunk failed");
+                tracing::error!(session = %sanitize_log_value(session_id), error = %message, "run_transfer_command failed");
                 json!({ "error": message, "session_id": session_id })
             }
         }
@@ -3090,5 +3373,172 @@ Get-Item : the path under super_x000D__x000A_secretvalue123 was not found._x000D
         );
         emit_probe();
         assert!(captured.text().contains("PROBE"), "{}", captured.text());
+    }
+
+    /// A host command with a scripted behaviour for the standard input tests.
+    struct FakeCall {
+        send_fails: bool,
+        /// Source of the scripted answer; a function keeps the fake `Sync`.
+        poll: fn() -> Poll,
+    }
+
+    #[async_trait::async_trait]
+    impl StdinCall for FakeCall {
+        async fn start(&self, _script: &str) -> Result<String, winrm_rs::WinrmError> {
+            Ok("cmd-1".to_owned())
+        }
+
+        async fn send(
+            &self,
+            _command_id: &str,
+            _data: &[u8],
+            _end_of_stream: bool,
+        ) -> Result<(), winrm_rs::WinrmError> {
+            if self.send_fails {
+                Err(winrm_rs::WinrmError::Transfer("broken pipe".to_owned()))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn receive(&self, _command_id: &str) -> Result<Poll, winrm_rs::WinrmError> {
+            tokio::task::yield_now().await;
+            Ok((self.poll)())
+        }
+    }
+
+    /// Records the cleanup calls. The delete of the shell is refused while the command
+    /// still runs, as on the host: the open handle stays until the terminate signal.
+    struct FakeCleanup {
+        events: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ShellCleanup for FakeCleanup {
+        async fn terminate(&self, command_id: &str) {
+            self.events
+                .lock()
+                .expect("lock")
+                .push(format!("terminate:{command_id}"));
+        }
+
+        async fn delete(&self) {
+            let mut events = self.events.lock().expect("lock");
+            let terminated = events.iter().any(|event| event.starts_with("terminate:"));
+            events.push(
+                if terminated {
+                    "delete"
+                } else {
+                    "delete-blocked"
+                }
+                .to_owned(),
+            );
+        }
+    }
+
+    fn finished_with_error() -> Poll {
+        Poll {
+            stdout: Vec::new(),
+            stderr: b"boom".to_vec(),
+            exit_code: Some(1),
+            done: true,
+        }
+    }
+
+    fn still_running() -> Poll {
+        Poll {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            exit_code: None,
+            done: false,
+        }
+    }
+
+    fn idle_guard() -> (Arc<FakeCleanup>, CallGuard) {
+        let cleanup = Arc::new(FakeCleanup {
+            events: Mutex::new(Vec::new()),
+        });
+        let guard = CallGuard {
+            cleanup: Arc::clone(&cleanup) as Arc<dyn ShellCleanup>,
+            command_id: None,
+            armed: true,
+        };
+        (cleanup, guard)
+    }
+
+    /// TR-XFER-04: a failed `Send` after the command ended still returns the exit code
+    /// and the error text of the command, not the broken pipe.
+    #[tokio::test]
+    async fn send_error_still_collects_the_exit_code_and_stderr() {
+        let (_, mut guard) = idle_guard();
+        let call = FakeCall {
+            send_fails: true,
+            poll: finished_with_error,
+        };
+        let output = drive_stdin_call(
+            &call,
+            "script",
+            b"bytes",
+            &mut guard,
+            Duration::from_millis(200),
+        )
+        .await
+        .expect("the output of the ended command");
+        assert_eq!(output.exit_code, 1);
+        assert_eq!(output.stderr, b"boom");
+        guard.armed = false;
+    }
+
+    /// TR-XFER-04: a failed `Send` while the command still runs stays an error.
+    #[tokio::test]
+    async fn send_error_with_a_running_command_is_the_error() {
+        let (_, mut guard) = idle_guard();
+        let call = FakeCall {
+            send_fails: true,
+            poll: still_running,
+        };
+        let error = drive_stdin_call(
+            &call,
+            "script",
+            b"bytes",
+            &mut guard,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("the send error");
+        assert!(error.to_string().contains("broken pipe"), "{error}");
+        assert_eq!(guard.command_id.as_deref(), Some("cmd-1"));
+        guard.armed = false;
+    }
+
+    /// TR-XFER-04: a dropped call terminates the command first and deletes the shell
+    /// after it, so the delete is not blocked by the open handle on the host.
+    #[tokio::test]
+    async fn dropped_call_terminates_the_command_before_it_deletes_the_shell() {
+        let (cleanup, mut guard) = idle_guard();
+        guard.command_id = Some("cmd-1".to_owned());
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            *cleanup.events.lock().expect("lock"),
+            vec!["terminate:cmd-1".to_owned(), "delete".to_owned()]
+        );
+    }
+
+    /// TR-XFER-04: a finished call leaves nothing to clean up, and a call that never
+    /// started a command only deletes the shell.
+    #[tokio::test]
+    async fn disarmed_guard_does_nothing_and_an_unstarted_call_only_deletes() {
+        let (cleanup, mut guard) = idle_guard();
+        guard.armed = false;
+        drop(guard);
+        let (second, guard) = idle_guard();
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(cleanup.events.lock().expect("lock").is_empty());
+        assert_eq!(
+            *second.events.lock().expect("lock"),
+            vec!["delete-blocked".to_owned()]
+        );
     }
 }

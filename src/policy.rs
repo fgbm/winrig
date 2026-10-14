@@ -1050,12 +1050,13 @@ pub fn is_absolute_windows_path(path: &str) -> bool {
         || path.starts_with("\\\\")
 }
 
-/// Verdict on the remote path of a download, before any host call (TR-XFER-02).
+/// Verdict on the remote path of a download or an upload, before any host call
+/// (TR-XFER-02, TR-XFER-04).
 ///
 /// A relative path is refused before the network, so the host resolves only an
 /// explicit absolute path.
 #[must_use]
-pub fn decide_download_remote_path(path: &str) -> PolicyDecision {
+pub fn decide_transfer_remote_path(path: &str) -> PolicyDecision {
     if !is_absolute_windows_path(path.trim()) {
         return PolicyDecision::deny(
             format!(
